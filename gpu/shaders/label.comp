@@ -1,0 +1,26 @@
+#version 450
+// A label in the picture (SetPictureLabel): a small RGBA image (straight alpha) blended over the finished picture in
+// a rectangle given in the picture's own fractions - a port's line in the game's menu (ZOE US: RECOMP OPTIONS in the
+// OPTIONS screen), scaled with the render resolution, before the picture is scaled to the window.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;     // the picture
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+layout(set = 0, binding = 2) uniform sampler2D label;      // the label, bilinear
+layout(push_constant) uniform Params {
+    vec4 rect;          // x0, y0, x1, y1 of the label in the picture (0..1)
+    ivec2 size;         // the picture's (and the target's) size
+} p;
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= p.size.x || at.y >= p.size.y) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(p.size);
+    vec4 c = textureLod(source, uv, 0.0);
+    if (uv.x >= p.rect.x && uv.x < p.rect.z && uv.y >= p.rect.y && uv.y < p.rect.w) {
+        const vec2 luv = (uv - p.rect.xy) / (p.rect.zw - p.rect.xy);
+        const vec4 l = textureLod(label, luv, 0.0);
+        c.rgb = mix(c.rgb, l.rgb, l.a);
+    }
+    imageStore(target, at, vec4(c.rgb, 1.0));
+}

@@ -1,0 +1,29 @@
+# Never commit copyrighted material: disc images, BIOS dumps, extracted game
+# files, or anything derived from them that contains a game's code or assets.
+*.iso
+*.ISO
+extracted/
+asm/
+build/
+bios/
+# A BIOS dump anywhere, by its usual names (maintainer 2026-11-06: never in a repo).
+SCPH*
+scph*
+*.rom
+*.ROM
+*.rom0
+*.erom
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

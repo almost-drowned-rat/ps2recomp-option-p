@@ -1,0 +1,64 @@
+#version 450
+// BLOOM (porting guide 4b, a PC enhancement, off by default): the finished picture's bright parts spread as a
+// soft glow, in its own pass after the frame (before it is scaled to the window) - the game's own glow left as
+// it draws it. Four modes, one dispatch each:
+//   0  bright pass: the picture's parts above a threshold (a soft knee), averaged down to a quarter each way;
+//   1  blur across (9 taps, Gaussian), quarter size;
+//   2  blur down, quarter size;
+//   3  the glow added to the picture: out = picture + glow * strength (BLOOM STRENGTH 1-10).
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(set = 0, binding = 0) uniform sampler2D source;     // modes 0, 3: the picture; 1, 2: the glow
+layout(set = 0, binding = 1, rgba8) uniform writeonly image2D target;
+layout(set = 0, binding = 2) uniform sampler2D glow;       // mode 3: the blurred glow
+layout(push_constant) uniform Params {
+    vec2 texel;         // a texel of `source`, in its coordinates
+    ivec2 size;         // `target`'s
+    int mode;
+    float strength;     // mode 3
+} p;
+
+// PS2 pictures are darker than PC games' (ZOE US's hangar: half of it below 0.15, 1 % above 0.52, its brightest
+// 0.87): the glow starts where about the brightest percent does.
+const float kThreshold = 0.45;      // brightness where the glow starts
+const float kKnee = 0.15;           // softened over this much below it
+const float kWeights[5] = float[](0.2270270270, 0.1945945946, 0.1216216216, 0.0540540541, 0.0162162162);
+
+float Luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
+
+vec3 Bright(vec3 c) {
+    const float l = Luma(c);
+    const float soft = clamp(l - kThreshold + kKnee, 0.0, 2.0 * kKnee);
+    const float knee = soft * soft / (4.0 * kKnee + 1e-5);
+    const float weight = max(knee, l - kThreshold) / max(l, 1e-5);
+    return c * weight;
+}
+
+void main() {
+    const ivec2 at = ivec2(gl_GlobalInvocationID.xy);
+    if (at.x >= p.size.x || at.y >= p.size.y) return;
+    const vec2 uv = (vec2(at) + 0.5) / vec2(p.size);
+    vec3 c = vec3(0.0);
+    if (p.mode == 0) {
+        // A 4x4 block of the picture, by four bilinear taps (each the mean of 2x2).
+        const vec2 t = p.texel;
+        c = Bright(textureLod(source, uv + vec2(-t.x, -t.y), 0.0).rgb) +
+            Bright(textureLod(source, uv + vec2(t.x, -t.y), 0.0).rgb) +
+            Bright(textureLod(source, uv + vec2(-t.x, t.y), 0.0).rgb) +
+            Bright(textureLod(source, uv + vec2(t.x, t.y), 0.0).rgb);
+        c *= 0.25;
+    } else if (p.mode == 1 || p.mode == 2) {
+        const vec2 step = p.mode == 1 ? vec2(p.texel.x, 0.0) : vec2(0.0, p.texel.y);
+        c = textureLod(source, uv, 0.0).rgb * kWeights[0];
+        for (int i = 1; i < 5; ++i) {
+            c += textureLod(source, uv + step * float(i), 0.0).rgb * kWeights[i];
+            c += textureLod(source, uv - step * float(i), 0.0).rgb * kWeights[i];
+        }
+    } else {
+        const vec3 picture = textureLod(source, uv, 0.0).rgb;
+        const vec3 g = textureLod(glow, uv, 0.0).rgb;
+        // Added, the picture's own brightness kept (no tone change where nothing glows).
+        c = picture + g * (p.strength * 0.25);      // 5 (the default): the glow at 1.25 of its brightness
+    }
+    imageStore(target, at, vec4(clamp(c, 0.0, 1.0), 1.0));
+}
