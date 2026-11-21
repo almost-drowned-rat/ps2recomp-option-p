@@ -495,28 +495,26 @@ static void paint(XrSetupUi *ui)
     pline(ui, X(ui, 10), X(ui, 104 + down), X(ui, cw - 10), X(ui, 104 + down), K_SHADOW);
     pline(ui, X(ui, 10), X(ui, 104 + down) + 1, X(ui, cw - 10), X(ui, 104 + down) + 1, K_LIGHT);
     /* the step's text and the progress bar: a sunken groove with navy blocks spread over its whole width */
-    text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down, ui->status, K_TEXT);
+    /* the step's text, and under it how far the build is ("47% done") - as Windows 2000's own setups showed it */
+    if (ui->building) {
+        char done[16];
+        snprintf(done, sizeof done, "%d%% done", ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress);
+        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down - line_height(&ui->font), ui->status, K_TEXT);
+        text(ui, &ui->font, 14, 146 + down - line_height(&ui->font), done, K_TEXT);
+    } else {
+        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down, ui->status, K_TEXT);
+    }
     {
-        /* the progress bar: a sunken groove filled smoothly in navy from the left, the percentage centred in it -
-           navy over the empty part, white over the filled one (as the setups of the time drew it) */
-        const int gl = 14, gt = 152 + down, gr = cw - 14, gb = 172 + down;
+        /* the progress bar (Windows 2000's): a one-pixel sunken edge - the shadow over the highlight - filled
+           smoothly in navy from the left, a pixel inside it */
         const int pct = ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress;
-        int il, it, ir, ib, split;
-        fill(ui, gl, gt, gr, gb, K_FACE);
-        bevel(ui, gl, gt, gr, gb, 0);
-        il = X(ui, gl) + 2, it = X(ui, gt) + 2, ir = X(ui, gr) - 2, ib = X(ui, gb) - 2;
-        split = il + (ir - il) * pct / 100;
-        prect(ui, il, it, split, ib, K_PROGRESS);
-        if (ui->building) {
-            char label[8];
-            int w, tx, ty;
-            snprintf(label, sizeof label, "%d%%", pct);
-            w = text_width(&ui->font, label);
-            tx = gl + (gr - gl - w) / 2;
-            ty = gt + (gb - gt - line_height(&ui->font)) / 2;
-            text_n(ui, &ui->font, tx, ty, label, strlen(label), K_PROGRESS, split, 100000);
-            text_n(ui, &ui->font, tx, ty, label, strlen(label), K_LIGHT, -100000, split);
-        }
+        const int l = X(ui, 14), t = X(ui, 154 + down), r = X(ui, cw - 14), b = X(ui, 168 + down);
+        fill(ui, 14, 154 + down, cw - 14, 168 + down, K_FACE);
+        prect(ui, l, t, r, t + 1, K_SHADOW);
+        prect(ui, l, t, l + 1, b, K_SHADOW);
+        prect(ui, l, b - 1, r, b, K_LIGHT);
+        prect(ui, r - 1, t, r, b, K_LIGHT);
+        prect(ui, l + 2, t + 2, l + 2 + (r - l - 4) * pct / 100, b - 2, K_PROGRESS);
     }
     for (i = 0; i < ui->nctl; ++i) {
         Ctl *c = &ui->ctl[i];
