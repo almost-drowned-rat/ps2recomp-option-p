@@ -2687,8 +2687,12 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             fps_since_ = now;
         }
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
-    else if (!Check(r, "vkQueuePresentKHR")) return false;
+    // SUBOPTIMAL from a swapchain sized by the window (a turned panel, IDENTITY rather than the surface's own
+    // transform: CreateSwapchain) is what it is made as - it said so at every present, and a new swapchain each frame
+    // (a vkDeviceWaitIdle under the queue's lock each time) held the renderer's thread ~70 % of the time on an Odin 2
+    // (agent L, 2026-11-21). A new window size is seen by BeginPresent's check and the resize event.
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !extent_from_window_)) stale_ = true;
+    else if (r != VK_SUBOPTIMAL_KHR && !Check(r, "vkQueuePresentKHR")) return false;
     return true;
 }
 
