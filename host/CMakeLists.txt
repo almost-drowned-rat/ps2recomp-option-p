@@ -303,11 +303,22 @@ function(ps2_add_port target)
         message(FATAL_ERROR "ps2_add_port(${target}): no dispatch.cpp in GENERATED '${PORT_GENERATED}' "
                             "(PS2_GENERATED_DIR '${PS2_GENERATED_DIR}'; ${CMAKE_CURRENT_LIST_DIR}) - run engine/tools/port.py")
     endif()
+    if(ANDROID)
+        # Android: the game a library SDL's activity loads (libmain.so, main() as SDL_main)
+        add_library(${target} SHARED
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/main.cpp
+            ${generated}
+            ${translated}
+            ${PORT_SOURCES})
+        set_target_properties(${target} PROPERTIES OUTPUT_NAME main)
+        target_link_options(${target} PRIVATE -Wl,-z,max-page-size=16384)
+    else()
     add_executable(${target}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/main.cpp
         ${generated}
         ${translated}
         ${PORT_SOURCES})
+    endif()
     if(MSVC)
         target_link_libraries(${target} PRIVATE ps2_cpu_check)
     endif()

@@ -346,6 +346,15 @@ bool HoldToCores(std::uint64_t mask) {
 
 // ---- Files and the process.
 std::filesystem::path ExePath() {
+#ifdef __ANDROID__
+    // No executable of the game's own (the app's process): its folder is the app's external files dir (saves,
+    // settings, logs, the unpacked discs - reachable by adb and file managers), the name the game library's
+    static std::filesystem::path path = [] {
+        const char* dir = SDL_GetAndroidExternalStoragePath();
+        return std::filesystem::path(dir && *dir ? dir : "/sdcard") / "zoe_us";
+    }();
+    return path;
+#endif
     char exe[4096] = {};
     const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) return {};

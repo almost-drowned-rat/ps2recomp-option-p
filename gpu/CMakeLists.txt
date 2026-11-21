@@ -27,8 +27,13 @@ FetchContent_Declare(sdl3
     GIT_TAG release-3.4.18
     GIT_SHALLOW TRUE)
 
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-set(SDL_STATIC ON CACHE BOOL "" FORCE)
+if(ANDROID)                     # (SDL's Java side loads libSDL3.so: one SDL for the activity and the game)
+    set(SDL_SHARED ON CACHE BOOL "" FORCE)
+    set(SDL_STATIC OFF CACHE BOOL "" FORCE)
+else()
+    set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+    set(SDL_STATIC ON CACHE BOOL "" FORCE)
+endif()
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "" FORCE)
 set(VOLK_PULL_IN_VULKAN ON CACHE BOOL "" FORCE)
@@ -36,6 +41,9 @@ FetchContent_MakeAvailable(vulkan_headers)
 set(VOLK_HEADERS_ONLY OFF CACHE BOOL "" FORCE)
 set(VULKAN_HEADERS_INSTALL_DIR "${vulkan_headers_SOURCE_DIR}" CACHE PATH "" FORCE)
 FetchContent_MakeAvailable(volk sdl3)
+if(ANDROID AND NOT TARGET SDL3::SDL3-static)
+    add_library(SDL3::SDL3-static ALIAS SDL3-shared)   # (the engine's targets name the static one)
+endif()
 
 # Shaders: GLSL compiled to SPIR-V at build time by glslang, from its release
 # like the others, and embedded as arrays (glslang --vn).

@@ -17,6 +17,10 @@
 #include "ps2host/vif.h"
 #include "ps2platform/platform.h"
 
+#ifdef __ANDROID__
+#include <SDL3/SDL_main.h>     // main() is SDL_main: SDL's activity calls it
+#endif
+
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
 #include <intrin.h>
 #endif
