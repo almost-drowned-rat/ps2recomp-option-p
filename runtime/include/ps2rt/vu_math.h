@@ -24,13 +24,25 @@
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #define PS2RT_VU_SSE 1
+#define PS2RT_VU_SSE2NEON 0
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && !defined(PS2RT_NO_SSE2NEON)
+/* AArch64 (Android, agent L 2026-11-21): the same four-lane paths, their SSE intrinsics as NEON by sse2neon (MIT,
+   v1.8.0, include/sse2neon - LICENSES/sse2neon-MIT.txt). The scalar forms were ~30 % of VU1's and the EE's time on
+   an Odin 2 (Snapdragon 8 Gen 2). The rounding: the callers set it by ps2rt/fp_mode.h (FPCR: toward zero, FZ - FZ
+   flushes operands and results, as DAZ + FTZ), not by sse2neon's _mm_setcsr (the rounding only). */
+#include "sse2neon/sse2neon.h"
+#define PS2RT_VU_SSE 1
+#define PS2RT_VU_SSE2NEON 1
 #else
 #define PS2RT_VU_SSE 0
+#define PS2RT_VU_SSE2NEON 0
 #endif
 /* SSE4.1 (pminud): every x86-64 processor a Vulkan port runs on has it; MSVC
    takes its intrinsics without /arch, and other compilers say so with
    __SSE4_1__. */
-#if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
+#if PS2RT_VU_SSE2NEON
+#define PS2RT_VU_SSE41 1            /* (sse2neon has _mm_min_epu32 and the rest) */
+#elif PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
 #include <smmintrin.h>
 #define PS2RT_VU_SSE41 1
 #else

@@ -194,6 +194,7 @@ void StartVu1(Context& c, u32 address);
 }  // namespace lifted
 
 #include "ps2rt/vu_math.h"
+#include "ps2rt/fp_mode.h"
 
 namespace lifted {
 
@@ -293,8 +294,8 @@ inline __m128i MacroLanes(__m128i a, __m128i b, __m128i acc) { return LanesSse<O
 inline void MacroFmac(Context& c, u32 word, FmacForm f) {
     const u32 fd = (word >> 6) & 0x1F, fs = (word >> 11) & 0x1F, ft = (word >> 16) & 0x1F;
     const u32 dest = (word >> 21) & 0xF;
-    const unsigned saved = _mm_getcsr();
-    if (!kMacroNearest) _mm_setcsr((saved & ~0x6000u) | 0x6000u | 0x8000u | 0x0040u);
+    const ps2rt::FpMode saved = ps2rt::GetFpMode();     // (x86: MXCSR; AArch64: FPCR - fp_mode.h)
+    if (!kMacroNearest) ps2rt::SetFpMode(ps2rt::VuFpMode(saved));
     const __m128i a = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[fs]));
     __m128i b;
     if (f.operand == 6) b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(c.vf[ft]));
@@ -317,7 +318,7 @@ inline void MacroFmac(Context& c, u32 word, FmacForm f) {
         for (int lane = 0; lane < 4; ++lane)
             if (dest & (8u >> lane)) to[lane] = out[lane];
     if (f.op != kMax_ && f.op != kMini) MacroFlags(c, out, dest);     // MAX and MINI leave the flags
-    if (!kMacroNearest) _mm_setcsr(saved);
+    if (!kMacroNearest) ps2rt::SetFpMode(saved);
 }
 #endif
 

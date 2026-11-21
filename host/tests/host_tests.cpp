@@ -1530,7 +1530,27 @@ void VuCompiledIsTheInterpreter() {
             const u64 a = interpreted->Run(program.entry, limit), b = ahead->Run(program.entry, limit);
             ++runs;
             if (ahead->compiled_pairs()) ++entered;
-            if (a != b || !interpreted->SameState(*ahead)) ++wrong;
+            if (a != b || !interpreted->SameState(*ahead)) {
+                if (wrong < 12) {       // (the first few: where)
+                    std::fprintf(stderr, "  program %zu trial %d: cycles %llu / %llu", i, trial,
+                                 (unsigned long long)a, (unsigned long long)b);
+                    for (int r = 0; r < 32; ++r)
+                        for (int l = 0; l < 4; ++l)
+                            if (interpreted->regs.vf[r][l] != ahead->regs.vf[r][l])
+                                std::fprintf(stderr, " vf%d.%d %08X/%08X", r, l, unsigned(interpreted->regs.vf[r][l]),
+                                             unsigned(ahead->regs.vf[r][l]));
+                    for (int l = 0; l < 4; ++l)
+                        if (interpreted->regs.vacc[l] != ahead->regs.vacc[l])
+                            std::fprintf(stderr, " acc.%d %08X/%08X", l, unsigned(interpreted->regs.vacc[l]),
+                                         unsigned(ahead->regs.vacc[l]));
+                    for (int r = 0; r < 32; ++r)
+                        if (interpreted->regs.vc[r] != ahead->regs.vc[r])
+                            std::fprintf(stderr, " vc%d %08X/%08X", r, unsigned(interpreted->regs.vc[r]),
+                                         unsigned(ahead->regs.vc[r]));
+                    std::fprintf(stderr, "\n");
+                }
+                ++wrong;
+            }
         }
     }
     char what[128];

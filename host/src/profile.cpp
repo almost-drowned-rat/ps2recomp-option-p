@@ -54,6 +54,14 @@ using Clock = std::chrono::steady_clock;
 std::uint64_t Ticks() {
 #if defined(_MSC_VER)
     return __rdtsc();
+#elif defined(__aarch64__)
+    // ARM's generic timer, read from user space in one instruction (the vDSO's clock_gettime around it was ~12 %
+    // of the EE, VIF1 and GS threads on the Odin 2: two reads a section, millions of sections)
+    std::uint64_t ticks;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+#elif defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
 #else
     return std::uint64_t(Clock::now().time_since_epoch().count());
 #endif
