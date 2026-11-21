@@ -312,6 +312,14 @@ function(ps2_add_port target)
             ${PORT_SOURCES})
         set_target_properties(${target} PROPERTIES OUTPUT_NAME main)
         target_link_options(${target} PRIVATE -Wl,-z,max-page-size=16384)
+        # Hidden visibility in the game library and the engine's libraries (only SDL_main, SDL_DECLSPEC, leaves):
+        # their calls to each other direct and inlinable rather than through the PLT (Odin 2 profile, agent L)
+        foreach(t ${target} ps2host ps2rt ps2gpu ps2platform)
+            if(TARGET ${t})
+                set_target_properties(${t} PROPERTIES CXX_VISIBILITY_PRESET hidden C_VISIBILITY_PRESET hidden
+                                                      VISIBILITY_INLINES_HIDDEN ON)
+            endif()
+        endforeach()
     else()
     add_executable(${target}
         ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/src/main.cpp

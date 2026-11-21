@@ -26,6 +26,15 @@
 #endif
 #if defined(__SSE4_1__) || defined(__AVX2__)
 #include <smmintrin.h>
+#define PS2HOST_GS_SSE41 1
+#endif
+#if (defined(__aarch64__) || defined(_M_ARM64)) && !defined(PS2RT_NO_SSE2NEON)
+// AArch64 (agent L, 2026-11-21): the same SSE2 / SSE4.1 run stores, their intrinsics as NEON by sse2neon (as the VU's
+// lanes, ps2rt/vu_math.h). The per-pixel stores were the GS thread's largest part on an Odin 2 (WriteRun 16 %: the
+// game's texture uploads), the thread that held the whole frame back there.
+#include "sse2neon/sse2neon.h"
+#define PS2HOST_GS_SSE2 1
+#define PS2HOST_GS_SSE41 1
 #endif
 #include <cstdint>
 #include <vector>
@@ -349,7 +358,7 @@ void StoreRun(u8* bytes, const PageTable& t, u32 bp, u32 bw, u32 x, u32 y, const
         const u32 page = Page(bp, page_bw, px / t.width, page_y);
         const u32 in_page = std::min(count - i, t.width - px % t.width);
         u32 k = 0, wx = px % t.width;
-#if defined(__SSE4_1__) || defined(__AVX2__)
+#if defined(PS2HOST_GS_SSE41)
         if constexpr (Psm == PSMCT16) {
             // Sixteen at a time where they lie so (PageTable::pairs16): the
             // values packed to halfwords, each eight interleaved with the

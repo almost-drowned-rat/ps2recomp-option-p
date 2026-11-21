@@ -113,7 +113,14 @@ const char* const kSectionNames[] = {"GS drawing", "GS image transfers", "VU1", 
                                      "GPU bookkeeping", "GPU drawing", "GPU and memory in step",
                                      "DMA and VIF", "IOP", "SPU2", "waiting for the GS thread"};
 
-Timed::Timed(Section section) : section_(section) {
+#ifdef __ANDROID__
+extern const bool g_timed = std::getenv("PS2HOST_PROFILE") != nullptr || std::getenv("PS2HOST_TIMED") != nullptr;
+#else
+extern const bool g_timed = true;
+#endif
+
+void Timed::Enter() {
+    const Section section = section_;
     ThreadTicks& t = t_ticks;
     const std::uint64_t now = Ticks();
     if (t.depth > 0) t.ticks[int(t.stack[t.depth - 1])] += now - t.since;
@@ -123,7 +130,7 @@ Timed::Timed(Section section) : section_(section) {
     t.since = now;
 }
 
-Timed::~Timed() {
+void Timed::Leave() {
     ThreadTicks& t = t_ticks;
     const std::uint64_t now = Ticks();
     t.ticks[int(section_)] += now - t.since;
