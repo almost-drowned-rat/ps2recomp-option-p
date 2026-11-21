@@ -1631,8 +1631,10 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         xr_setup_ui_file_line(l.ui, cfg->extra_file_label, cfg->extra_file_filter_name, cfg->extra_file_filter, file,
                               sizeof file);
     }
+#ifndef _WIN32                      /* (the Windows window keeps its own layout: the line comes with its first page) */
     if (cfg->extra_disc_label && cfg->extra_disc_key)   /* its line on every page, not only the first one's */
         xr_setup_ui_extra_line(l.ui, cfg->extra_disc_label);
+#endif
     if (go && found_image) {        /* the choices made on the setup page of the exe this one was copied from */
         adopt_game_folder(&l, extra, sizeof extra, file, sizeof file);
         if (cfg->extra_disc_key)
