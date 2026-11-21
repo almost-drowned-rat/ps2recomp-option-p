@@ -14,6 +14,7 @@ set(PS2_LAUNCHER_OUTPUT "launcher" CACHE STRING "the launcher's exe name (withou
 set(PS2_LAUNCHER_SDL3 "" CACHE PATH "an SDL3 source folder (empty: fetched as the engine's gpu/ does)")
 set(PS2_LAUNCHER_EXTRA_DISC "" CACHE STRING "an optional second disc's line label on the setup page")
 set(PS2_LAUNCHER_EXTRA_KEY "" CACHE STRING "its pc_settings.ini key")
+set(PS2_LAUNCHER_ICON "" CACHE FILEPATH "a BMP (32-bit with alpha, 64x64) for the setup window's icon (empty: none)")
 
 if(PS2_LAUNCHER_SDL3)
     set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -107,6 +108,14 @@ if(PS2_LAUNCHER_FILE_LABEL AND PS2_LAUNCHER_FILE_NAME)
     list(APPEND defs PS2_LAUNCHER_FILE_LABEL="${PS2_LAUNCHER_FILE_LABEL}"
          PS2_LAUNCHER_FILE_FILTER_NAME="${PS2_LAUNCHER_FILE_FILTER_NAME}" PS2_LAUNCHER_FILE_FILTER="${PS2_LAUNCHER_FILE_FILTER}"
          PS2_LAUNCHER_FILE_NAME="${PS2_LAUNCHER_FILE_NAME}")
+endif()
+# The setup window's icon (title bar, task bar): the BMP built in as launcher_icon.inc
+if(PS2_LAUNCHER_ICON)
+    set(icon_inc ${CMAKE_CURRENT_BINARY_DIR}/launcher_icon.inc)
+    file(READ ${PS2_LAUNCHER_ICON} icon_hex HEX)
+    string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," icon_bytes "${icon_hex}")
+    file(WRITE ${icon_inc} "// From ${PS2_LAUNCHER_ICON} (engine/launcher): generated.\n${icon_bytes}\n")
+    list(APPEND defs PS2_LAUNCHER_ICON_INC=1)
 endif()
 target_compile_definitions(ps2_launcher PRIVATE ${defs})
 set_target_properties(ps2_launcher PROPERTIES OUTPUT_NAME ${PS2_LAUNCHER_OUTPUT})

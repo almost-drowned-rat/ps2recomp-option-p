@@ -41,7 +41,7 @@ static const Rgb K_FACE = {212, 208, 200}, K_LIGHT = {255, 255, 255}, K_SHADOW =
                  K_TEXT = {0, 0, 0}, K_FRAME = {0, 0, 0}, K_PROGRESS = {10, 36, 106}, K_WINDOW = {255, 255, 255};
 
 #define UI_W          520
-#define UI_H          214               /* with one disc line; a second one adds UI_ROW */
+#define UI_H          227               /* with one disc line; a second one adds UI_ROW */
 #define UI_TOP        13                /* a third line for the intro (Liberation Sans is wider than MS Sans Serif) */
 #define UI_ROW        34
 #define UI_TITLE_H    18
@@ -990,7 +990,7 @@ static int ui_show(XrSetupUi *ui)
             SDL_SetWindowIcon(ui->win, bmp);
             ui->icon = SDL_CreateTextureFromSurface(ui->ren, bmp);
             if (ui->icon)
-                SDL_SetTextureScaleMode(ui->icon, SDL_SCALEMODE_NEAREST);
+                SDL_SetTextureScaleMode(ui->icon, SDL_SCALEMODE_LINEAR);     /* a 64x64 BMP drawn at 16x16 and up */
             SDL_DestroySurface(bmp);
         }
     }
@@ -1160,6 +1160,14 @@ void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_
     snprintf(ui->file_filter, sizeof ui->file_filter, "%s", filter && *filter ? filter : "*.*");
     ui->file_path = path;
     ui->file_n = n;
+}
+
+void xr_setup_ui_extra_line(XrSetupUi *ui, const char *label)
+{
+    if (!ui || ui->win || !label || !*label)
+        return;                         /* (before the window is made) */
+    snprintf(ui->extra_label, sizeof ui->extra_label, "%s", label);
+    ui->has_extra = 1;
 }
 
 int xr_setup_ui_cancelled(void *p)

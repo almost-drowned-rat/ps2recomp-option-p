@@ -38,6 +38,9 @@ int  xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n,
  * Windows 95 window has it. */
 void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_name, const char *filter, char *path,
                            size_t n);
+/* The optional second disc's line on the first page (its label), before the window is made: shown on every page,
+ * also when the launcher goes straight to building (a rebuild, a repair) without the first page. */
+void xr_setup_ui_extra_line(XrSetupUi *ui, const char *label);
 int  xr_setup_ui_cancelled(void *ui);
 void xr_setup_ui_close(XrSetupUi *ui);
 
