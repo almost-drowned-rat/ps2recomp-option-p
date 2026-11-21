@@ -142,6 +142,47 @@ void DiscFindsFilesByPath() {
     Check(!disc.Read(30, 1, sector), "reading past the end");
     Check(disc.IsCd(), "a small .iso counts as a CD");
 
+    // Unpacked into a folder (disc.h Unpack, 2026-11-21): every sector read back as the image's; only some.
+    {
+        image[18 * kSectorSize + 5] = 0x5A;             // a sector in no file, not zero: kept too
+        disc.Use(image);
+        const std::filesystem::path folder = std::filesystem::temp_directory_path() / "ps2host_unpacked";
+        std::error_code error;
+        std::filesystem::remove_all(folder, error);
+        Check(disc.Unpack(folder.string(), nullptr), "unpack: the whole disc written");
+        Check(std::filesystem::exists(folder / "FILE.BIN") && std::filesystem::exists(folder / "DIR" / "INNER.DAT"),
+              "unpack: the files under their paths");
+        ps2host::Disc folder_disc;
+        Check(folder_disc.Open(folder.string()) && folder_disc.IsUnpacked() && folder_disc.Sectors() == 24,
+              "unpack: the folder opens as the disc");
+        std::vector<u8> all(image.size());
+        Check(folder_disc.Read(0, 24, all.data()) && all == image, "unpack: every sector as the image's");
+        Check(folder_disc.Find("/dir/inner.dat", &file) && file.lsn == 23, "unpack: its files found");
+        Check(folder_disc.IsCd(), "unpack: a CD stays a CD");
+        // only what was read: the file system and FILE.BIN
+        ps2host::Disc rec;
+        rec.Use(image);
+        rec.Record(true);
+        rec.Find("\\FILE.BIN;1", &file);
+        rec.Read(21, 1, sector);
+        rec.Record(false);
+        const std::filesystem::path part = folder.string() + "_part";
+        std::filesystem::remove_all(part, error);
+        Check(rec.Unpack(part.string(), &rec.Recorded()), "unpack: only the recorded sectors");
+        ps2host::Disc part_disc;
+        Check(part_disc.Open((part / "disc.idx").string()) && part_disc.Find("\\FILE.BIN;1", &file) &&
+                  part_disc.Read(21, 1, sector) && std::memcmp(sector, "hello", 5) == 0,
+              "unpack: the recorded file read from the part");
+        Check(part_disc.Read(23, 1, sector) && sector[0] == 0 && !std::filesystem::exists(part / "DIR" / "INNER.DAT"),
+              "unpack: what was not read is not there (zeros)");
+        folder_disc.Open("?");                          // (the folders' files closed before removing them)
+        part_disc.Open("?");
+        std::filesystem::remove_all(folder, error);
+        std::filesystem::remove_all(part, error);
+        image[18 * kSectorSize + 5] = 0;
+        disc.Use(image);
+    }
+
     // The same disc as a raw CD image: Mode 2 sectors, data after the subheader.
     std::vector<u8> raw(image.size() / kSectorSize * ps2host::kRawSectorSize, 0);
     for (std::size_t i = 0; i < image.size() / kSectorSize; ++i) {

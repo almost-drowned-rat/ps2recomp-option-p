@@ -55,6 +55,8 @@ def main(argv=None) -> int:
     parser.add_argument("--update", action="store_true", help="record this run's pictures as expected")
     parser.add_argument("--keep", help="keep the pictures in this directory")
     parser.add_argument("--exe", help="the port's executable to run (default: the one port.py builds)")
+    parser.add_argument("--disc", help="the disc to play (default: game.json's image) - an image or an unpacked "
+                                       "disc's folder")
     parser.add_argument("--frame-times", type=int, default=0, metavar="N",
                         help="print the wall-clock frame rate every N frames (the run's --frame-times)")
     args = parser.parse_args(argv)
@@ -68,7 +70,7 @@ def main(argv=None) -> int:
     executable = args.exe or game.path(os.path.join(game.build, "port", "cmake", os.path.basename(
         os.path.normpath(game.directory)) + ".exe"))
     elf = game.path(os.path.join(game.extracted, game.executable))
-    disc = game.path(game.iso) if game.iso else ""
+    disc = args.disc or (game.path(game.iso) if game.iso else "")
     renderer = "gpu" if args.gpu else "soft"
     pictures = args.keep or tempfile.mkdtemp(prefix="regress_")
     os.makedirs(pictures, exist_ok=True)

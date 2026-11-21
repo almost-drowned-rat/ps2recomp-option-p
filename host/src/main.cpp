@@ -92,10 +92,18 @@ std::vector<std::string> PlayArguments(const char* self) {
     std::string disc = ps2host::Setting("disc");
     // None chosen yet, or gone (moved): an image of the game's disc beside the executable or in its "game"
     // folder (the launcher's, as option-c's) is taken without asking.
+    // (The launcher's unpacked disc first: game\disc - the images are needed only to unpack it.)
+    if (!IsGameDisc(disc) && IsGameDisc((here / "game" / "disc").string())) disc = (here / "game" / "disc").string();
     if (!IsGameDisc(disc)) {
         for (const std::filesystem::path& folder : {here, here / "game"}) {
             std::error_code error;
             for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+                std::error_code is_dir;
+                if (entry.is_directory(is_dir) && std::filesystem::exists(entry.path() / "disc.idx", is_dir) &&
+                    IsGameDisc(entry.path().string())) {
+                    disc = entry.path().string();
+                    break;
+                }
                 std::string ext = entry.path().extension().string();
                 for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
                 if ((ext == ".iso" || ext == ".chd" || ext == ".bin" || ext == ".cue") &&
@@ -156,6 +164,38 @@ int main(int argc, char** argv) {
     // A crashed run's report (ps2host/crash_report.h: this program started again by the crash's filter).
     if (ps2host::IsCrashReportHelper(argc, argv)) return ps2host::CrashReportHelper(argc, argv, report);
 #endif
+    // The launcher's unpacking (the maintainer 2026-11-21: the discs unpacked into the game's folder once, read
+    // from there after): `--unpack-disc <image> <folder>` - the whole disc, nothing lost; `--unpack-extra <image>
+    // <folder> --disc <its own disc>` - a second disc, only what the port reads of it. Progress in
+    // "<folder>.progress". Exit 0: written.
+    if (argc >= 4 && (std::string(argv[1]) == "--unpack-disc" || std::string(argv[1]) == "--unpack-extra")) {
+        const std::string image = argv[2], folder = argv[3];
+        std::string progress = folder + ".progress";
+        std::error_code error;
+        std::filesystem::remove_all(folder, error);
+        if (std::string(argv[1]) == "--unpack-disc") {
+            ps2host::Disc disc;
+            if (!disc.Open(image)) {
+                std::fprintf(stderr, "[unpack] cannot open %s\n", image.c_str());
+                return 2;
+            }
+            const bool ok = disc.Unpack(folder, nullptr, ps2host::WriteUnpackProgress, &progress);
+            std::fprintf(stderr, "[unpack] %s -> %s: %s\n", image.c_str(), folder.c_str(), ok ? "done" : "FAILED");
+            return ok ? 0 : 1;
+        }
+        const std::filesystem::path here = ps2platform::ExePath().parent_path();
+        ps2host::LoadSettings((here / "pc_settings.ini").string());
+        for (int i = 4; i + 1 < argc; ++i)
+            if (std::string(argv[i]) == "--disc" && !ps2host::GuestDisc().Open(argv[i + 1])) {
+                std::fprintf(stderr, "[unpack] cannot open the game's disc %s\n", argv[i + 1]);
+                return 2;
+            }
+        RegisterGameOverrides();
+        const ps2host::ExtraDiscUnpacker unpack = ps2host::GetExtraDiscUnpacker();
+        const bool ok = unpack && unpack(image, folder);
+        std::fprintf(stderr, "[unpack] %s -> %s: %s\n", image.c_str(), folder.c_str(), ok ? "done" : "FAILED");
+        return ok ? 0 : 1;
+    }
     std::vector<std::string> play;
     std::vector<char*> play_argv;
     if (argc == 1) {

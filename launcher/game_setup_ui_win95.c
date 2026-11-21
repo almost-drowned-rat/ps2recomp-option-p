@@ -154,7 +154,7 @@ static void paint(XrSetupUi *ui)
         DrawTextW(dc, ui->intro, -1, &rect, DT_WORDBREAK);
         SelectObject(dc, old);
     }
-    text(dc, 14, 70, L"Disc image (.iso, .chd):", ui->font, K_TEXT);
+    text(dc, 14, 70, L"Disc image or game folder:", ui->font, K_TEXT);
     if (ui->has_extra)
         text(dc, 14, 70 + UI_ROW, ui->extra_label, ui->font, K_TEXT);
     if (ui->file_path)
@@ -298,7 +298,8 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             memset(&ofn, 0, sizeof ofn);
             ofn.lStructSize = sizeof ofn;
             ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = L"PS2 disc images (*.iso, *.chd)\0*.iso;*.chd\0All files (*.*)\0*.*\0";
+            ofn.lpstrFilter = L"PS2 disc images (*.iso, *.chd), a game folder's disc.idx\0*.iso;*.chd;disc.idx\0"
+                              L"All files (*.*)\0*.*\0";
             ofn.lpstrFile = path;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
@@ -388,7 +389,7 @@ static int ui_show(XrSetupUi *ui)
     wc.lpszClassName = L"Ps2RecompSetup";
     RegisterClassExW(&wc);
     ui->rows = 1 + (ui->has_extra ? 1 : 0) + (ui->file_path ? 1 : 0);
-    ui->lines = ui->rows + 2;
+    ui->lines = ui->rows + 1;
     x = (GetSystemMetrics(SM_CXSCREEN) - UI_W) / 2;
     y = (GetSystemMetrics(SM_CYSCREEN) - (UI_H + UI_ROW * (ui->lines - 1))) / 2;
     /* WS_CLIPCHILDREN: the face painted around the buttons and the field, not over them (a repaint of the window
@@ -412,14 +413,12 @@ static int ui_show(XrSetupUi *ui)
         ui->edit_file = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, y, 250, 21, ID_FILE);
         child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, y, 76, 22, ID_BROWSE_FILE);
     }
-    /* the target folder (issue 12: everything of the game in one folder of the player's choice) and the copy box
-       (issue 17: the disc images copied into its game\ folder - the game stays whole when the images move) */
+    /* the target folder (issue 12: everything of the game in one folder of the player's choice); the discs are
+       unpacked into its game\ folder after the build (2026-11-21: no copy box any more - the images needed once) */
     ui->target = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, 67 + UI_ROW * ui->rows, 250,
                        21, ID_TARGET);
     child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, 67 + UI_ROW * ui->rows, 76, 22,
           ID_BROWSE_TARGET);
-    ui->copy = child(ui, L"BUTTON", L"Copy the disc image into the target folder (game\\)",
-                     BS_AUTOCHECKBOX | WS_TABSTOP, 0, 170, 68 + UI_ROW * (ui->rows + 1), 334, 18, ID_COPY);
     {
         const int bottom = UI_H + UI_ROW * (ui->lines - 1) - 46;
         child(ui, L"BUTTON", L"Go", BS_OWNERDRAW | WS_TABSTOP, 0, UI_W - 184, bottom, 80, 24, ID_GO);
@@ -454,7 +453,8 @@ static void enable_page(XrSetupUi *ui, BOOL on)
     }
     EnableWindow(ui->target, on);
     EnableWindow(GetDlgItem(ui->win, ID_BROWSE_TARGET), on);
-    EnableWindow(ui->copy, on);
+    if (ui->copy)
+        EnableWindow(ui->copy, on);
     EnableWindow(GetDlgItem(ui->win, ID_GO), on);
 }
 
@@ -472,8 +472,9 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
         return -1;
     widen(disc_name, disc, 160);
     widen(note, noted, 300);
-    _snwprintf(ui->intro, 400, L"%ls%lsChoose your %ls disc image, then Go. The game is built from it once, here on "
-               L"your PC (it is read where it is and never changed).", noted, noted[0] ? L" " : L"", disc);
+    _snwprintf(ui->intro, 400, L"%ls%lsChoose your %ls disc image (or a game folder you kept), then Go. The game is "
+               L"built from it once and the disc unpacked into the game folder (the image is only read).", noted,
+               noted[0] ? L" " : L"", disc);
     ui->intro[399] = 0;
     wcscpy(ui->status, L"");
     ui->progress = 0;
@@ -490,7 +491,6 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
     }
     widen(target, folder, MAX_PATH * 2);
     SetWindowTextW(ui->target, folder);
-    SendMessageW(ui->copy, BM_SETCHECK, copy && *copy ? BST_CHECKED : BST_UNCHECKED, 0);
     enable_page(ui, TRUE);
     SetFocus(GetDlgItem(ui->win, ID_GO));
     InvalidateRect(ui->win, NULL, FALSE);
@@ -501,8 +501,8 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
         if (ui->form_result == 1) {
             GetWindowTextW(ui->edit, path, MAX_PATH * 2);
             if (!path[0] || GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-                MessageBoxW(ui->win, L"Please choose your disc image (.iso, .chd) with Browse...", ui->title,
-                            MB_OK | MB_ICONSTOP);
+                MessageBoxW(ui->win, L"Please choose your disc image (.iso, .chd) or a game folder with Browse...",
+                            ui->title, MB_OK | MB_ICONSTOP);
                 ui->form_result = -1;
                 continue;
             }
@@ -550,7 +550,7 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
     if (target && target_n && !WideCharToMultiByte(CP_UTF8, 0, folder, -1, target, (int)target_n, NULL, NULL))
         target[0] = 0;
     if (copy)
-        *copy = SendMessageW(ui->copy, BM_GETCHECK, 0, 0) == BST_CHECKED;
+        *copy = 1;                      /* (the discs are always unpacked into game\) */
     enable_page(ui, FALSE);
     _snwprintf(ui->intro, 400, L"The game is being built from your %ls disc - this happens only once.", disc);
     ui->intro[399] = 0;
