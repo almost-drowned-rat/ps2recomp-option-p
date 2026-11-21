@@ -75,6 +75,17 @@ void xr_setup_ui_icon(XrSetupUi *ui, const void *bmp, size_t n)
     }
 }
 
+/* The optional second disc's line on every page (agent L's call, game_setup_ui.h) - before the window is made. Before
+   2026-11-21 it came only with the first page's xr_setup_ui_form: the page shown again after a failed disc check (in
+   the target folder's copy, started with --go) had no Japanese-disc line. The same row as the first page's. */
+void xr_setup_ui_extra_line(XrSetupUi *ui, const char *label)
+{
+    if (!ui || ui->win || !label || !*label)
+        return;
+    widen(label, ui->extra_label, 120);
+    ui->has_extra = 1;
+}
+
 XrSetupUi *xr_setup_ui_open(const char *title)
 {
     XrSetupUi *ui = (XrSetupUi *)calloc(1, sizeof *ui);
