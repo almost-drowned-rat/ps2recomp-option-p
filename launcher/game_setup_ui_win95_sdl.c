@@ -41,7 +41,8 @@ static const Rgb K_FACE = {212, 208, 200}, K_LIGHT = {255, 255, 255}, K_SHADOW =
                  K_TEXT = {0, 0, 0}, K_FRAME = {0, 0, 0}, K_PROGRESS = {10, 36, 106}, K_WINDOW = {255, 255, 255};
 
 #define UI_W          520
-#define UI_H          236               /* with one disc line; a second one adds UI_ROW */
+#define UI_H          214               /* with one disc line; a second one adds UI_ROW */
+#define UI_TOP        13                /* a third line for the intro (Liberation Sans is wider than MS Sans Serif) */
 #define UI_ROW        34
 #define UI_TITLE_H    18
 #define FONT_PX       11.0f             /* 8 pt at 96 dpi: Windows' -MulDiv(8, 96, 72) = an 11-pixel em */
@@ -488,33 +489,33 @@ static void paint(XrSetupUi *ui)
         close_cross(ui, l + 4 + pressed, t + 3 + pressed);
     }
     /* the page: what to do, the disc image's line */
-    text_wrapped(ui, &ui->font, 14, 30, cw - 14, 58, ui->intro, K_TEXT);
-    text(ui, &ui->font, 14, 70, "Disc image or game folder:", K_TEXT);
+    text_wrapped(ui, &ui->font, 14, 30, cw - 14, 58 + UI_TOP, ui->intro, K_TEXT);
+    text(ui, &ui->font, 14, 70 + UI_TOP, "Disc image or game folder:", K_TEXT);
     if (ui->has_extra)
-        text(ui, &ui->font, 14, 70 + UI_ROW, ui->extra_label, K_TEXT);
+        text(ui, &ui->font, 14, 70 + UI_TOP + UI_ROW, ui->extra_label, K_TEXT);
     if (ui->file_path)
-        text(ui, &ui->font, 14, 70 + UI_ROW * (ui->rows - 1), ui->file_label, K_TEXT);
-    text(ui, &ui->font, 14, 70 + UI_ROW * ui->rows, "Target folder:", K_TEXT);
+        text(ui, &ui->font, 14, 70 + UI_TOP + UI_ROW * (ui->rows - 1), ui->file_label, K_TEXT);
+    text(ui, &ui->font, 14, 70 + UI_TOP + UI_ROW * ui->rows, "Target folder:", K_TEXT);
     /* an etched line above the progress area */
-    pline(ui, X(ui, 10), X(ui, 104 + down), X(ui, cw - 10), X(ui, 104 + down), K_SHADOW);
-    pline(ui, X(ui, 10), X(ui, 104 + down) + 1, X(ui, cw - 10), X(ui, 104 + down) + 1, K_LIGHT);
-    /* the step's text, and right of it how far the build is */
+    pline(ui, X(ui, 10), X(ui, 104 + UI_TOP + down), X(ui, cw - 10), X(ui, 104 + UI_TOP + down), K_SHADOW);
+    pline(ui, X(ui, 10), X(ui, 104 + UI_TOP + down) + 1, X(ui, cw - 10), X(ui, 104 + UI_TOP + down) + 1, K_LIGHT);
+    /* under the bar (drawn below): the step's text, and right of it how far the build is */
     if (ui->building) {
         /* the percentage right-aligned on the step's line; the step's text wraps short of it */
         char done[8];
         snprintf(done, sizeof done, "%d%%", ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress);
-        text(ui, &ui->font, cw - 14 - text_width(&ui->font, done), 114 + down, done, K_TEXT);
-        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14 - text_width(&ui->font, "100%") - 12, 146 + down,
+        text(ui, &ui->font, cw - 14 - text_width(&ui->font, done), 134 + UI_TOP + down, done, K_TEXT);
+        text_wrapped(ui, &ui->font, 14, 134 + UI_TOP + down, cw - 14 - text_width(&ui->font, "100%") - 12, 147 + UI_TOP + down,
                      ui->status, K_TEXT);
     } else {
-        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down, ui->status, K_TEXT);
+        text_wrapped(ui, &ui->font, 14, 134 + UI_TOP + down, cw - 14, 147 + UI_TOP + down, ui->status, K_TEXT);
     }
     {
         /* the progress bar (Windows 2000's): a one-pixel sunken edge - the shadow over the highlight - filled
            smoothly in navy from the left, a pixel inside it */
         const int pct = ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress;
-        const int l = X(ui, 14), t = X(ui, 154 + down), r = X(ui, cw - 14), b = X(ui, 168 + down);
-        fill(ui, 14, 154 + down, cw - 14, 168 + down, K_FACE);
+        const int l = X(ui, 14), t = X(ui, 114 + UI_TOP + down), r = X(ui, cw - 14), b = X(ui, 128 + UI_TOP + down);
+        fill(ui, 14, 114 + UI_TOP + down, cw - 14, 128 + UI_TOP + down, K_FACE);
         prect(ui, l, t, r, t + 1, K_SHADOW);
         prect(ui, l, t, l + 1, b, K_SHADOW);
         prect(ui, l, b - 1, r, b, K_LIGHT);
@@ -994,19 +995,19 @@ static int ui_show(XrSetupUi *ui)
         }
     }
     /* sunken white fields, Browse..., Go, Quit - the Windows window's places */
-    child(ui, 0, "", 170, 67, 250, 21, ID_ISO);
-    child(ui, 1, "Browse...", 428, 67, 76, 22, ID_BROWSE);
+    child(ui, 0, "", 170, 67 + UI_TOP, 250, 21, ID_ISO);
+    child(ui, 1, "Browse...", 428, 67 + UI_TOP, 76, 22, ID_BROWSE);
     if (ui->has_extra) {
-        child(ui, 0, "", 170, 67 + UI_ROW, 250, 21, ID_ISO2);
-        child(ui, 1, "Browse...", 428, 67 + UI_ROW, 76, 22, ID_BROWSE2);
+        child(ui, 0, "", 170, 67 + UI_TOP + UI_ROW, 250, 21, ID_ISO2);
+        child(ui, 1, "Browse...", 428, 67 + UI_TOP + UI_ROW, 76, 22, ID_BROWSE2);
     }
     if (ui->file_path) {
-        const int y = 67 + UI_ROW * (ui->rows - 1);
+        const int y = 67 + UI_TOP + UI_ROW * (ui->rows - 1);
         child(ui, 0, "", 170, y, 250, 21, ID_FILE);
         child(ui, 1, "Browse...", 428, y, 76, 22, ID_BROWSE_FILE);
     }
-    child(ui, 0, "", 170, 67 + UI_ROW * ui->rows, 250, 21, ID_TARGET);
-    child(ui, 1, "Browse...", 428, 67 + UI_ROW * ui->rows, 76, 22, ID_BROWSE_TARGET);
+    child(ui, 0, "", 170, 67 + UI_TOP + UI_ROW * ui->rows, 250, 21, ID_TARGET);
+    child(ui, 1, "Browse...", 428, 67 + UI_TOP + UI_ROW * ui->rows, 76, 22, ID_BROWSE_TARGET);
     {
         const int bottom = height - 46;
         child(ui, 1, "Go", UI_W - 184, bottom, 80, 24, ID_GO);
