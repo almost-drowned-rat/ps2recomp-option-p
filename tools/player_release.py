@@ -16,6 +16,19 @@ The payload (a zip appended to the launcher, the Xbox launcher's trailer) holds 
 * lift.txt build.txt toolchain.txt release.txt, LICENSES/.
 The compile and link lines are read from the build's build.ninja (the port's target), its paths mapped into the
 payload. Nothing is downloaded.
+
+Linux (agent L, 2026-11-21: the same release, the same launcher - its Windows 95 window drawn with SDL3):
+
+    python engine/tools/player_release.py --linux --game games/zoe_us --release v0.1.0 --launcher <the AppImage>
+        --out <folder> --tree <the port's release build (tools/linux/release_toolchain.cmake)>
+        --llvm-bundle <make_toolchain_bundle.sh's out folder: llvm/ + python/> [--package-from <a game/ package>]
+        [--steps ...] [--script ...] [--game-exe Zone_of_the_Enders-x86_64.AppImage]
+
+The payload is appended to the AppImage as to the Windows exe (the launcher reads it from $APPIMAGE); the compiler
+goes in as bundle/llvm-linux.zip (unpacked at the first start, removed after the build as llvm-mingw is), Python as
+a folder (python/bin/python3.12). The release build's paths into the LLVM release and the sysroot become the
+bundle's ({TOOLS}/llvm/...). --package-from: the game's player package (game/) taken as it is - a Windows release's
+payload of the same version holds it - when this machine has no developer's lift to make it from.
 """
 
 from __future__ import annotations
@@ -25,6 +38,7 @@ import glob
 import hashlib
 import os
 import re
+import shlex
 import shutil
 import struct
 import subprocess
@@ -40,11 +54,13 @@ from ps2decomp import game as game_config  # noqa: E402
 TRAILER_MAGIC = b"XRPAYLD1"
 
 
-def ninja_block(text: str, marker: str) -> dict:
-    """The variables of the first build statement whose outputs contain marker."""
+def ninja_block(text: str, marker: str, exact: bool = False) -> dict:
+    """The variables of the first build statement whose outputs contain marker (exact: one output is marker - a
+    Linux executable has no .exe to tell it from the objects' folder names)."""
     flat = re.sub(r"\$\r?\n\s*", "", text)
     for match in re.finditer(r"^build ([^\n]*)\n((?:  [^\n]*\n)*)", flat, re.M):
-        if marker in match.group(1).split(":")[0]:
+        outputs = match.group(1).split(":")[0]
+        if (marker in outputs.split()) if exact else (marker in outputs):
             values = {}
             for line in match.group(2).splitlines():
                 key, _, value = line.strip().partition(" = ")
@@ -76,16 +92,37 @@ def ninja_split(value: str) -> list:
     return out
 
 
+def linux_path(args, item: str) -> str:
+    """A Linux release build's path (or a flag holding one) into the LLVM release or the sysroot it was built with,
+    as the shipped bundle's: {TOOLS}/llvm/... (the bundle keeps the LLVM release's layout; clang++ is its driver)."""
+    for root in (args.llvm_root, args.sysroot):
+        if root:
+            item = item.replace(root.rstrip("/") + "/", "{TOOLS}/llvm/sysroot/" if root == args.sysroot else "{TOOLS}/llvm/")
+            item = item.replace(root.rstrip("/"), "{TOOLS}/llvm/sysroot" if root == args.sysroot else "{TOOLS}/llvm")
+    return item
+
+
 def make_payload(args, game, stage: str) -> None:
     tree = os.path.abspath(args.tree or game.path(os.path.join(game.build, "port", "cmake-mingw")))
     target = os.path.basename(os.path.normpath(game.directory))
     ninja = open(os.path.join(tree, "build.ninja"), encoding="utf-8").read()
-    compile_vars = ninja_block(ninja, "/generated/dispatch.cpp.obj")
-    link_vars = ninja_block(ninja, target + ".exe")
+    linux = args.linux
+    split = shlex.split if linux else ninja_split
+    obj_ext = ".cpp.o" if linux else ".cpp.obj"
+    exe_name = target if linux else target + ".exe"
+    compile_vars = ninja_block(ninja, "/generated/dispatch" + obj_ext)
+    link_vars = ninja_block(ninja, exe_name, exact=linux)
 
     # headers: each include folder of the compile line, copied (headers only) to include/<n>
-    cc = ninja_split(compile_vars["FLAGS"]) + ninja_split(compile_vars["DEFINES"])
-    for n, inc in enumerate(ninja_split(compile_vars.get("INCLUDES", ""))):
+    cc = split(compile_vars["FLAGS"]) + split(compile_vars["DEFINES"])
+    if linux:
+        # the target and the sysroot as the release build had them (CMAKE_*_COMPILER_TARGET, CMAKE_SYSROOT)
+        cc = [linux_path(args, item) for item in cc if item not in ("-g",)]
+        if not any(item.startswith("--sysroot") for item in cc):
+            cc.append("--sysroot={TOOLS}/llvm/sysroot")
+        if not any(item.startswith("--target") for item in cc):
+            cc.append("--target=x86_64-unknown-linux-gnu")
+    for n, inc in enumerate(split(compile_vars.get("INCLUDES", ""))):
         source = inc[2:] if inc.startswith("-I") else inc
         dest = os.path.join(stage, "include", str(n))
         for path in glob.glob(os.path.join(source, "**", "*"), recursive=True):
@@ -98,25 +135,43 @@ def make_payload(args, game, stage: str) -> None:
     # the prebuilt part: the port target's own objects that are not translated or generated code, the libraries
     lib = os.path.join(stage, "lib")
     os.makedirs(lib, exist_ok=True)
-    statement = re.search(r"^build %s\.exe: \S+ ([^\n|]*)" % re.escape(target), re.sub(r"\$\r?\n\s*", "", ninja), re.M)
+    statement = re.search(r"^build %s: \S+ ([^\n|]*)" % re.escape(exe_name), re.sub(r"\$\r?\n\s*", "", ninja), re.M)
     objects = []
     for obj in statement.group(1).split():
         obj = obj.replace("$:", ":")
         if "/generated/" in obj or "/src/lifted/" in obj:
             continue
-        name = os.path.basename(obj).replace(".cpp.obj", ".o")
+        name = os.path.basename(obj).replace(obj_ext, ".o")
         shutil.copyfile(os.path.join(tree, obj), os.path.join(lib, name))
         objects.append(name)
-    link = ninja_split(link_vars.get("FLAGS", "")) + ninja_split(link_vars.get("LINK_FLAGS", "")) + ["{OBJECTS}"]
-    for item in ninja_split(link_vars["LINK_LIBRARIES"]):
-        if item.endswith(".a") and not item.startswith("-"):
+    link = split(link_vars.get("FLAGS", "")) + split(link_vars.get("LINK_FLAGS", "")) + ["{OBJECTS}"]
+    for item in split(link_vars["LINK_LIBRARIES"]):
+        if linux and (item.startswith(args.llvm_root) or item.startswith(args.sysroot)):
+            link.append(linux_path(args, item))         # libc++.a & co: the bundle's own copies
+        elif item.endswith(".a") and not item.startswith("-"):
             shutil.copyfile(os.path.join(tree, item), os.path.join(lib, os.path.basename(item)))
             link.append("{TOOLS}/lib/" + os.path.basename(item))
         else:
-            link.append(item)
+            link.append(linux_path(args, item) if linux else item)
+    if linux:
+        # (CMake's own: "-Xlinker --dependency-file=<the build folder's>" - the pair left out)
+        kept = []
+        for item in link:
+            if "--dependency-file" in item:
+                if kept and kept[-1] == "-Xlinker":
+                    kept.pop()
+                continue
+            if item != "-g":
+                kept.append(item)
+        link = kept
+        if not any(item.startswith("--sysroot") for item in link):
+            link.insert(0, "--sysroot={TOOLS}/llvm/sysroot")
+        if not any(item.startswith("--target") for item in link):
+            link.insert(0, "--target=x86_64-unknown-linux-gnu")
     link += ["-o", "{OUT}"]
     with open(os.path.join(stage, "build.txt"), "w", encoding="utf-8", newline="\n") as handle:
-        handle.write("# the port's compile and link, from its llvm-mingw build (player_release.py)\n")
+        handle.write("# the port's compile and link, from its %s build (player_release.py)\n"
+                     % ("Linux release" if linux else "llvm-mingw"))
         handle.write("\t".join(["cc"] + cc) + "\n")
         handle.write("glob\t{WORK}/game/src/lifted\t.cpp\n")
         handle.write("glob\t{WORK}/game/build/port/generated\t.cpp\n")
@@ -128,8 +183,12 @@ def make_payload(args, game, stage: str) -> None:
     for part in ("ps2decomp", "tools"):
         shutil.copytree(os.path.join(ENGINE, part), os.path.join(stage, "engine", part),
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    import player_package
-    player_package.main(["--game", game.directory, "--out", stage] + (["--steps", args.steps] if args.steps else []))
+    if args.package_from:
+        # a ready package (a Windows release payload's game/ of the same version): taken as it is
+        shutil.copytree(args.package_from, os.path.join(stage, "game"))
+    else:
+        import player_package
+        player_package.main(["--game", game.directory, "--out", stage] + (["--steps", args.steps] if args.steps else []))
     root = os.path.dirname(os.path.dirname(os.path.abspath(game.directory)))     # the project (games/<name>/..)
     for script in args.script:
         os.makedirs(os.path.dirname(os.path.join(stage, script)), exist_ok=True)
@@ -141,6 +200,9 @@ def make_payload(args, game, stage: str) -> None:
         handle.write("translate\t{TOOLS}/engine/tools/player_build.py\t--package\t{TOOLS}/game\t--iso\t{ISO}\t"
                      "--work\t{WORK}\t--jobs\t{JOBS}\n")
 
+    if linux:
+        linux_tools(args, stage)
+        return
     # Python and the compiler
     with zipfile.ZipFile(args.python) as z:
         z.extractall(os.path.join(stage, "python"))
@@ -165,19 +227,60 @@ def make_payload(args, game, stage: str) -> None:
     print("payload staged in %s (python ._pth: %s)" % (stage, [os.path.basename(p) for p in pth]))
 
 
+def linux_tools(args, stage: str) -> None:
+    """Linux: Python as a folder, the compiler as bundle/llvm-linux.zip (unpacked once at the first start)."""
+    bundle = os.path.abspath(args.llvm_bundle)
+    shutil.copytree(os.path.join(bundle, "python"), os.path.join(stage, "python"), symlinks=False)
+    python = sorted(glob.glob(os.path.join(stage, "python", "bin", "python3.1[0-9]")))
+    if not python:
+        raise SystemExit("--llvm-bundle: no python/bin/python3.1x")
+    os.makedirs(os.path.join(stage, "bundle"), exist_ok=True)
+    zip_path = os.path.join(stage, "bundle", "llvm-linux.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for path in sorted(glob.glob(os.path.join(bundle, "llvm", "**", "*"), recursive=True)):
+            if os.path.isfile(path):
+                z.write(path, os.path.relpath(path, bundle).replace(os.sep, "/"))   # (its mode kept: the programs)
+    digest = hashlib.sha256(open(zip_path, "rb").read()).hexdigest()
+    with open(os.path.join(stage, "toolchain.txt"), "w", encoding="utf-8", newline="\n") as handle:
+        handle.write("format\t2\n")
+        handle.write("clang\tllvm/bin/clang++\n")
+        handle.write("python\tpython/bin/%s\n" % os.path.basename(python[0]))
+        handle.write("bundle\tbundle/llvm-linux.zip\t%s\t%d\tllvm\tllvm\n" % (digest, os.path.getsize(zip_path)))
+    with open(os.path.join(stage, "release.txt"), "w", encoding="utf-8") as handle:
+        handle.write(args.release)
+    licences = os.path.join(ENGINE, "LICENSES")
+    if os.path.isdir(licences):
+        shutil.copytree(licences, os.path.join(stage, "LICENSES"))
+    for part in ("llvm", "python"):
+        src = os.path.join(bundle, part, "LICENSES")
+        if os.path.isdir(src):
+            shutil.copytree(src, os.path.join(stage, "LICENSES", part), dirs_exist_ok=True)
+    print("payload staged in %s (Linux: python %s, compiler zip %.0f MB)"
+          % (stage, os.path.basename(python[0]), os.path.getsize(zip_path) / 2 ** 20))
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     game_config.add_argument(parser)
     parser.add_argument("--release", required=True)
     parser.add_argument("--launcher", required=True, help="the built launcher exe (launcher/CMakeLists.txt)")
     parser.add_argument("--out", required=True, help="the release folder (written anew)")
-    parser.add_argument("--mingw", required=True, help="the slim llvm-mingw zip the player compiles with")
-    parser.add_argument("--python", required=True, help="the embeddable Python zip")
+    parser.add_argument("--mingw", help="the slim llvm-mingw zip the player compiles with (Windows)")
+    parser.add_argument("--python", help="the embeddable Python zip (Windows)")
+    parser.add_argument("--linux", action="store_true", help="a Linux release (the AppImage as --launcher)")
+    parser.add_argument("--llvm-bundle", help="Linux: make_toolchain_bundle.sh's out folder (llvm/ + python/)")
+    parser.add_argument("--llvm-root", default="", help="Linux: the LLVM release the release build used")
+    parser.add_argument("--sysroot", default="", help="Linux: the sysroot the release build used")
+    parser.add_argument("--package-from", help="the game's player package (a game/ folder) taken as it is")
     parser.add_argument("--tree", help="the port's llvm-mingw build folder (default build/port/cmake-mingw)")
     parser.add_argument("--steps", help="the game's player steps (player_package.py --steps)")
     parser.add_argument("--script", action="append", default=[], help="a port script its steps run (repeat)")
     parser.add_argument("--game-exe", help="the launcher's exe name in the release (default <game>.exe)")
     args = parser.parse_args(argv)
+    if args.linux and not (args.llvm_bundle and args.llvm_root and args.sysroot):
+        parser.error("--linux needs --llvm-bundle, --llvm-root and --sysroot")
+    if not args.linux and not (args.mingw and args.python):
+        parser.error("--mingw and --python are needed (or --linux)")
     if len(args.release.encode()) > 32:
         parser.error("--release: at most 32 bytes")
     game = game_config.from_args(args)
@@ -193,6 +296,8 @@ def main(argv=None) -> int:
                 rel = os.path.relpath(path, stage).replace("\\", "/")
                 # the compiler zip is already compressed
                 z.write(path, rel, zipfile.ZIP_STORED if rel.startswith("bundle/") else zipfile.ZIP_DEFLATED)
+    if args.linux:
+        os.chmod(payload, 0o644)
     exe = os.path.join(args.out, args.game_exe or "launcher.exe")
     with open(exe, "wb") as out:
         out.write(open(args.launcher, "rb").read())
@@ -200,6 +305,8 @@ def main(argv=None) -> int:
         with open(payload, "rb") as handle:
             shutil.copyfileobj(handle, out, 1 << 20)
         out.write(TRAILER_MAGIC + struct.pack("<Q", offset) + args.release.encode().ljust(32, b"\0"))
+    if args.linux:
+        os.chmod(exe, 0o755)
     shutil.rmtree(stage)
     os.remove(payload)
     print("release %s: %s, %.1f MB" % (args.release, exe, os.path.getsize(exe) / 2 ** 20))

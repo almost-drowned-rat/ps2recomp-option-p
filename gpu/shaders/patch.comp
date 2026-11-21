@@ -11,7 +11,24 @@ layout(std430, binding = 0) buffer Memory { uint mem[]; };     // 4 MB
 
 layout(push_constant) uniform Patch { uvec4 words[8]; } patch_words;
 
+// Each invocation's word picked with constant indices only: indexed by
+// gl_LocalInvocationID, Mesa's RADV (26.2, Radeon 880M, Linux and Wine alike)
+// gave every invocation but the first a wrong one - their words never landed
+// (ZOE's subtitles and menus garbled; AMD's Windows driver was right).
+uvec4 Word(uint i) {
+    switch (i) {
+        case 0u: return patch_words.words[0];
+        case 1u: return patch_words.words[1];
+        case 2u: return patch_words.words[2];
+        case 3u: return patch_words.words[3];
+        case 4u: return patch_words.words[4];
+        case 5u: return patch_words.words[5];
+        case 6u: return patch_words.words[6];
+        default: return patch_words.words[7];
+    }
+}
+
 void main() {
-    const uvec4 w = patch_words.words[gl_LocalInvocationID.x];
+    const uvec4 w = Word(gl_LocalInvocationID.x);
     if (w.z != 0u) mem[w.x] = (mem[w.x] & ~w.z) | (w.y & w.z);
 }

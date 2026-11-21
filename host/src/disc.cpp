@@ -10,6 +10,12 @@
 #include <mutex>
 #include <string>
 
+#ifndef _WIN32
+// MSVC's 64-bit seeks: POSIX's fseeko / ftello (off_t is 64 bits on every 64-bit system).
+#define _fseeki64 fseeko
+#define _ftelli64 ftello
+#endif
+
 namespace ps2host {
 
 namespace {

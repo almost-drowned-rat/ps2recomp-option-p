@@ -18,6 +18,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 #define LP 1024
@@ -211,13 +213,38 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_NULL);
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, SDL_PROCESS_STDIO_NULL);
     }
-    SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);
+#ifdef _WIN32
+    SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);   /* (no console window) */
+#endif
+    /* (not in the background elsewhere: SDL gives a background process's exit code as 0 - a failed compile and the
+       wrong disc's code 3 would pass unseen; on Windows the background flag stays for "no console window" and the
+       code is read from our own handle below) */
     proc = SDL_CreateProcessWithProperties(p);
     SDL_DestroyProperties(p);
     if (!proc) {
         lg(l, "cannot start %s: %s", argv[0], SDL_GetError());
     } else {
+#ifdef _WIN32
+        /* SDL gives a background process's exit code as 0 on Windows too (SDL_process.c SDL_WaitProcess: found
+           2026-11-21 by a forced failure - a crashed translation passed as "done"). The real code from our own handle:
+           the pid stays valid while SDL keeps its handle, until SDL_DestroyProcess. */
+        HANDLE own = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE,
+                                 (DWORD)SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0));
         SDL_WaitProcess(proc, true, &code);
+        if (own) {
+            DWORD rc;
+            if (WaitForSingleObject(own, INFINITE) == WAIT_OBJECT_0 && GetExitCodeProcess(own, &rc))
+                code = (int)rc;
+            else
+                code = -1;
+            CloseHandle(own);
+        } else {
+            lg(l, "%s: no handle for its exit code (error %lu)", argv[0], (unsigned long)GetLastError());
+            code = -1;
+        }
+#else
+        SDL_WaitProcess(proc, true, &code);
+#endif
         SDL_DestroyProcess(proc);
     }
     if (out)
@@ -620,7 +647,7 @@ static int no_game_dialog(L *l, const char *why)
 static void open_folder(L *l, const char *dir)
 {
     char url[LP + 16], *s;
-    snprintf(url, sizeof url, "file:///%s", dir);
+    snprintf(url, sizeof url, "file://%s%s", dir[0] == '/' ? "" : "/", dir);
     for (s = url; *s; s++)
         if (*s == '\\')
             *s = '/';
@@ -716,6 +743,11 @@ static int unzip_into(L *l, const char *zp, const char *dest, Prog *prog, const 
                 lg(l, "%s: %s: %s", what, e->name, err);
                 bad = 1;
             }
+#ifndef _WIN32
+            /* Linux: a program in the zip (the compiler, Python) runnable again - its Unix mode kept */
+            else if (e->mode & 0111)
+                chmod(dst, 0755);
+#endif
         }
         SDL_AddAtomicInt(&prog->done_n, 1);
     }
@@ -1488,6 +1520,9 @@ static int move_to_target(L *l, const char *target, const char *extra, const cha
         xr_setup_ui_message(l->ui, 1, "The game cannot be copied into the target folder - see data\\launcher.log.");
         return 0;
     }
+#ifndef _WIN32
+    chmod(exe_to, 0755);                /* (the copy a program again: the AppImage) */
+#endif
     argv[k++] = exe_to;
     argv[k++] = "--go";
     argv[k++] = "--image";
@@ -1553,7 +1588,21 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         if (k > 0 && k < LP)
             WideCharToMultiByte(CP_UTF8, 0, w, -1, self, (int)sizeof self, NULL, NULL);
 #else
-        snprintf(self, sizeof self, "/proc/self/exe");
+        /* Linux: the AppImage is the one file the player has (the payload appended to it, as to the Windows exe) and
+         * its folder is the game's - the launcher itself runs from the AppImage's read-only mount */
+        const char *appimage = SDL_getenv("APPIMAGE");
+        if (appimage && *appimage) {
+            char *slash;
+            snprintf(self, sizeof self, "%s", appimage);
+            snprintf(l.root, sizeof l.root, "%s", appimage);
+            slash = strrchr(l.root, '/');
+            if (slash)
+                slash[1] = 0;
+            else
+                snprintf(l.root, sizeof l.root, "./");
+        } else {
+            snprintf(self, sizeof self, "/proc/self/exe");
+        }
 #endif
         snprintf(l.exe, sizeof l.exe, "%s", exe_name && *exe_name ? exe_name : self);
     }
@@ -1603,6 +1652,10 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         xr_setup_ui_file_line(l.ui, cfg->extra_file_label, cfg->extra_file_filter_name, cfg->extra_file_filter, file,
                               sizeof file);
     }
+#ifndef _WIN32                      /* (the Windows window keeps its own layout: the line comes with its first page) */
+    if (cfg->extra_disc_label && cfg->extra_disc_key)   /* its line on every page, not only the first one's */
+        xr_setup_ui_extra_line(l.ui, cfg->extra_disc_label);
+#endif
     if (go && found_image) {        /* the choices made on the setup page of the exe this one was copied from */
         adopt_game_folder(&l, extra, sizeof extra, file, sizeof file);
         if (cfg->extra_disc_key)

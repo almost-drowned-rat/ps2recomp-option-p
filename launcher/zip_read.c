@@ -103,6 +103,8 @@ ZipFile *zip_open(const char *path, char *err, size_t n)
             fail(err, n, "broken central directory entry");
             goto bad;
         }
+        e->made_by = rd16(cd + pos + 4);
+        e->mode = (e->made_by >> 8) == 3 ? rd32(cd + pos + 38) >> 16 : 0;
         e->flags = rd16(cd + pos + 8);
         e->method = rd16(cd + pos + 10);
         e->crc = rd32(cd + pos + 16);
