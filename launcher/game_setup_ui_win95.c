@@ -36,14 +36,20 @@
 #define UI_ROW        34
 #define UI_TITLE_H    18
 
-enum { ID_ISO = 100, ID_ISO2, ID_TARGET, ID_BROWSE = 200, ID_BROWSE2, ID_BROWSE_TARGET, ID_COPY, ID_GO = 300, ID_QUIT };
+enum { ID_ISO = 100, ID_ISO2, ID_TARGET, ID_FILE, ID_BROWSE = 200, ID_BROWSE2, ID_BROWSE_TARGET, ID_COPY, ID_BROWSE_FILE,
+       ID_GO = 300, ID_QUIT };
 
 struct XrSetupUi {
     wchar_t  title[160];
     wchar_t  extra_label[120];          /* the second disc's line ("" none) */
-    int      rows;                      /* disc lines: 1 or 2 */
-    int      lines;                     /* all lines: the discs', the target folder's, the copy box's */
-    HWND     win, edit, edit2, target, copy;
+    int      rows;                      /* path lines above the target folder's: the discs' (1 or 2) and the file's */
+    int      lines;                     /* all lines: those, the target folder's, the copy box's */
+    int      has_extra;                 /* a second disc's line (row 1) */
+    wchar_t  file_label[120];           /* an optional file's line (the last of the rows; "" none) */
+    wchar_t  file_filter[200];          /* its dialog's filter: name, pattern, "All files", "*.*" (each 0-ended) */
+    char    *file_path;
+    size_t   file_n;
+    HWND     win, edit, edit2, edit_file, target, copy;
     HFONT    font, bold, marlett;
     HBRUSH   face;
     HICON    icon;
@@ -149,8 +155,10 @@ static void paint(XrSetupUi *ui)
         SelectObject(dc, old);
     }
     text(dc, 14, 70, L"Disc image (.iso, .chd):", ui->font, K_TEXT);
-    if (ui->rows > 1)
+    if (ui->has_extra)
         text(dc, 14, 70 + UI_ROW, ui->extra_label, ui->font, K_TEXT);
+    if (ui->file_path)
+        text(dc, 14, 70 + UI_ROW * (ui->rows - 1), ui->file_label, ui->font, K_TEXT);
     text(dc, 14, 70 + UI_ROW * ui->rows, L"Target folder:", ui->font, K_TEXT);
     /* an etched line above the progress area */
     {
@@ -298,6 +306,20 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetWindowTextW(LOWORD(wp) == ID_BROWSE2 ? ui->edit2 : ui->edit, path);
             return 0;
         }
+        case ID_BROWSE_FILE: {
+            wchar_t path[MAX_PATH] = L"";
+            OPENFILENAMEW ofn;
+            memset(&ofn, 0, sizeof ofn);
+            ofn.lStructSize = sizeof ofn;
+            ofn.hwndOwner = hwnd;
+            ofn.lpstrFilter = ui->file_filter;
+            ofn.lpstrFile = path;
+            ofn.nMaxFile = MAX_PATH;
+            ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
+            if (GetOpenFileNameW(&ofn))
+                SetWindowTextW(ui->edit_file, path);
+            return 0;
+        }
         case ID_BROWSE_TARGET: {
             wchar_t path[MAX_PATH] = L"";
             BROWSEINFOW bi;
@@ -365,8 +387,7 @@ static int ui_show(XrSetupUi *ui)
     wc.hbrBackground = ui->face;
     wc.lpszClassName = L"Ps2RecompSetup";
     RegisterClassExW(&wc);
-    if (ui->rows < 1)
-        ui->rows = 1;
+    ui->rows = 1 + (ui->has_extra ? 1 : 0) + (ui->file_path ? 1 : 0);
     ui->lines = ui->rows + 2;
     x = (GetSystemMetrics(SM_CXSCREEN) - UI_W) / 2;
     y = (GetSystemMetrics(SM_CYSCREEN) - (UI_H + UI_ROW * (ui->lines - 1))) / 2;
@@ -381,10 +402,15 @@ static int ui_show(XrSetupUi *ui)
     /* sunken white fields (WS_EX_CLIENTEDGE draws the 3D groove without visual styles), Browse..., Go, Quit */
     ui->edit = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, 67, 250, 21, ID_ISO);
     child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, 67, 76, 22, ID_BROWSE);
-    if (ui->rows > 1) {
+    if (ui->has_extra) {
         ui->edit2 = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, 67 + UI_ROW, 250, 21,
                           ID_ISO2);
         child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, 67 + UI_ROW, 76, 22, ID_BROWSE2);
+    }
+    if (ui->file_path) {
+        const int y = 67 + UI_ROW * (ui->rows - 1);
+        ui->edit_file = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, y, 250, 21, ID_FILE);
+        child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, y, 76, 22, ID_BROWSE_FILE);
     }
     /* the target folder (issue 12: everything of the game in one folder of the player's choice) and the copy box
        (issue 17: the disc images copied into its game\ folder - the game stays whole when the images move) */
@@ -422,6 +448,10 @@ static void enable_page(XrSetupUi *ui, BOOL on)
         EnableWindow(ui->edit2, on);
         EnableWindow(GetDlgItem(ui->win, ID_BROWSE2), on);
     }
+    if (ui->edit_file) {
+        EnableWindow(ui->edit_file, on);
+        EnableWindow(GetDlgItem(ui->win, ID_BROWSE_FILE), on);
+    }
     EnableWindow(ui->target, on);
     EnableWindow(GetDlgItem(ui->win, ID_BROWSE_TARGET), on);
     EnableWindow(ui->copy, on);
@@ -436,7 +466,7 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
         return -1;
     if (!ui->win && extra_label && *extra_label && extra) {     /* the second line: before the window is made */
         widen(extra_label, ui->extra_label, 120);
-        ui->rows = 2;
+        ui->has_extra = 1;
     }
     if (!ui_show(ui))
         return -1;
@@ -452,6 +482,11 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
     if (ui->edit2 && extra) {
         widen(extra, path2, MAX_PATH * 2);
         SetWindowTextW(ui->edit2, path2);
+    }
+    if (ui->edit_file) {
+        wchar_t f[MAX_PATH * 2];
+        widen(ui->file_path, f, MAX_PATH * 2);
+        SetWindowTextW(ui->edit_file, f);
     }
     widen(target, folder, MAX_PATH * 2);
     SetWindowTextW(ui->target, folder);
@@ -485,6 +520,18 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
                             L"have that disc.", ui->title, MB_OK | MB_ICONSTOP);
                 ui->form_result = -1;
                 continue;
+            }
+            if (ui->edit_file) {
+                wchar_t f[MAX_PATH * 2];
+                GetWindowTextW(ui->edit_file, f, MAX_PATH * 2);
+                if (f[0] && GetFileAttributesW(f) == INVALID_FILE_ATTRIBUTES) {
+                    MessageBoxW(ui->win, L"That file cannot be found. Leave its line empty if you do not have it.",
+                                ui->title, MB_OK | MB_ICONSTOP);
+                    ui->form_result = -1;
+                    continue;
+                }
+                if (!WideCharToMultiByte(CP_UTF8, 0, f, -1, ui->file_path, (int)ui->file_n, NULL, NULL))
+                    ui->file_path[0] = 0;
             }
             break;
         }
@@ -530,6 +577,28 @@ void xr_setup_ui_progress(void *p, double fraction, const char *msg)
     widen(msg, ui->status, 600);
     InvalidateRect(ui->win, NULL, FALSE);
     UpdateWindow(ui->win);
+}
+
+void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_name, const char *filter, char *path,
+                           size_t n)
+{
+    wchar_t name[120], pattern[60];
+    size_t k = 0;
+    if (!ui || ui->win || !label || !*label || !path || !n)
+        return;                         /* (before the window is made) */
+    widen(label, ui->file_label, 120);
+    widen(filter_name && *filter_name ? filter_name : "Files", name, 120);
+    widen(filter && *filter ? filter : "*.*", pattern, 60);
+    memset(ui->file_filter, 0, sizeof ui->file_filter);
+    wcscpy(ui->file_filter + k, name);
+    k += wcslen(name) + 1;
+    wcscpy(ui->file_filter + k, pattern);
+    k += wcslen(pattern) + 1;
+    wcscpy(ui->file_filter + k, L"All files (*.*)");
+    k += wcslen(L"All files (*.*)") + 1;
+    wcscpy(ui->file_filter + k, L"*.*");
+    ui->file_path = path;
+    ui->file_n = n;
 }
 
 int xr_setup_ui_cancelled(void *p)

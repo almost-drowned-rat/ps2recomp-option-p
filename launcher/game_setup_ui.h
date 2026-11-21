@@ -33,6 +33,11 @@ void xr_setup_ui_progress(void *ui, double fraction, const char *text);
  * in / out). */
 int  xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, const char *note,
                       const char *extra_label, char *extra, size_t extra_n, char *target, size_t target_n, int *copy);
+/* An optional file's line on the first page, under the discs' (before the first xr_setup_ui_form): its label, the
+ * file dialog's filter (a name and a pattern), and `path` (n bytes, pre-filled, set at Go; may stay empty). Only the
+ * Windows 95 window has it. */
+void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_name, const char *filter, char *path,
+                           size_t n);
 int  xr_setup_ui_cancelled(void *ui);
 void xr_setup_ui_close(XrSetupUi *ui);
 

@@ -1223,11 +1223,35 @@ static int copy_images(L *l, const char *folder, char *extra, size_t extra_n)
     return 1;
 }
 
+/* The port's own optional file (PsLauncherConfig.extra_file_*: ZOE's subtitle pack) copied beside the game under its
+ * name, where the game looks for it - the player's download stays where it is. 0: failed. */
+static int place_file(L *l, const char *folder, const char *file)
+{
+    char to[LP];
+    CopyArg c;
+    if (!l->cfg->extra_file_name || !file || !file[0])
+        return 1;
+    join(to, sizeof to, folder, l->cfg->extra_file_name);
+    if (!strcmp(file, to))
+        return 1;
+    memset(&c, 0, sizeof c);
+    c.from[0] = file;
+    c.to[0] = to;
+    c.total = file_size(file);
+    SDL_RemovePath(to);                 /* (a newer one of the same size too) */
+    if (run_job(l, "Copying the subtitles", 0.0, 0.01, copy_job, &c, copy_frac)) {
+        xr_setup_ui_message(l->ui, 1, "Copying the file failed - see data\\launcher.log.");
+        return 0;
+    }
+    lg(l, "%s copied to %s", file, to);
+    return 1;
+}
+
 /* Another target folder than the exe's: this exe copied there and started there with the choices (--go), this one
  * ends. 1: started. */
-static int move_to_target(L *l, const char *target, int copy, const char *extra)
+static int move_to_target(L *l, const char *target, int copy, const char *extra, const char *file)
 {
-    char exe_to[LP], *argv[10];
+    char exe_to[LP], *argv[12];
     int k = 0;
     SDL_PropertiesID p;
     SDL_Process *proc;
@@ -1254,6 +1278,10 @@ static int move_to_target(L *l, const char *target, int copy, const char *extra)
         argv[k++] = "--extra";
         argv[k++] = (char *)extra;
     }
+    if (file && file[0]) {
+        argv[k++] = "--file";
+        argv[k++] = (char *)file;
+    }
     if (copy)
         argv[k++] = "--copy";
     argv[k] = NULL;
@@ -1279,8 +1307,8 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     static L l;
     const char *image = NULL, *base;
     int repair = 0, no_start = 0, setup = 0, i, ok = 0, rc, found_image = 0, form = -1, go = 0, copy = 1;
-    char extra[LP] = "", target[LP] = "";
-    const char *extra_arg = NULL;
+    char extra[LP] = "", target[LP] = "", file[LP] = "";
+    const char *extra_arg = NULL, *file_arg = NULL;
     char p[LP], stamp_want[LP + 128], *stamp_have, logp[LP];
     Uint64 payload_ofs = 0;
 
@@ -1293,6 +1321,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         else if (!strcmp(argv[i], "--go")) go = 1;
         else if (!strcmp(argv[i], "--copy")) copy = 2;
         else if (!strcmp(argv[i], "--extra") && i + 1 < argc) extra_arg = argv[++i];
+        else if (!strcmp(argv[i], "--file") && i + 1 < argc) file_arg = argv[++i];
     }
     memset(&l, 0, sizeof l);
     l.cfg = cfg;
@@ -1344,8 +1373,21 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         settings_get(&l, cfg->extra_disc_key, extra, sizeof extra);
     if (extra_arg)
         snprintf(extra, sizeof extra, "%s", extra_arg);
+    /* the port's own optional file (ZOE's subtitle pack): its line pre-filled with the copy beside the game */
+    if (cfg->extra_file_label && cfg->extra_file_name) {
+        char have[LP];
+        join(have, sizeof have, l.root, cfg->extra_file_name);
+        if (is_file(have))
+            snprintf(file, sizeof file, "%s", have);
+        if (file_arg)
+            snprintf(file, sizeof file, "%s", file_arg);
+        xr_setup_ui_file_line(l.ui, cfg->extra_file_label, cfg->extra_file_filter_name, cfg->extra_file_filter, file,
+                              sizeof file);
+    }
     if (go && found_image) {        /* the choices made on the setup page of the exe this one was copied from */
         if (copy == 2 && !copy_images(&l, l.root, extra, sizeof extra))
+            goto out;
+        if (!place_file(&l, l.root, file))
             goto out;
         if (cfg->extra_disc_key)
             settings_set(&l, cfg->extra_disc_key, extra);
@@ -1378,10 +1420,12 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     if (form > 0 && !go) {
         lg(&l, "disc image chosen on the setup page: %s; target folder %s; copy %s", l.iso, target, copy ? "yes" : "no");
         if (target[0] && !same_dir(target, l.root)) {     /* installed there: that copy of this exe goes on */
-            ok = move_to_target(&l, target, copy, extra);
+            ok = move_to_target(&l, target, copy, extra, file);
             goto out;
         }
         if (copy && !copy_images(&l, l.root, extra, sizeof extra))
+            goto out;
+        if (!place_file(&l, l.root, file))
             goto out;
         if (cfg->extra_disc_key) {      /* the second disc: only remembered for the game (it reads it itself) */
             settings_set(&l, cfg->extra_disc_key, extra);
@@ -1468,6 +1512,8 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
                                     sizeof extra, target, sizeof target, &copy);
             if (form > 0 && cfg->extra_disc_key)
                 settings_set(&l, cfg->extra_disc_key, extra);
+            if (form > 0 && !place_file(&l, l.root, file))
+                goto out;
             if (form == 0)
                 goto out;
             if (form > 0) {

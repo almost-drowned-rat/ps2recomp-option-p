@@ -135,6 +135,12 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
     return -1;                          /* no first page here: the launcher's message boxes ask */
 }
 
+void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_name, const char *filter, char *path,
+                           size_t n)
+{
+    (void)ui; (void)label; (void)filter_name; (void)filter; (void)path; (void)n;   /* (no first page here) */
+}
+
 int xr_setup_ui_cancelled(void *p)
 {
     XrSetupUi *ui = (XrSetupUi *)p;

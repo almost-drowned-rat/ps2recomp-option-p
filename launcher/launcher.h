@@ -40,6 +40,13 @@ typedef struct {
      * kept under for the game ("disc_ja"). Only read, never built from. */
     const char *extra_disc_label;
     const char *extra_disc_key;
+    /* An optional file of the port's own on the setup page (ZOE: "Subtitles (optional):", its subtitle pack - a
+     * download of its own), or NULL: its line's label, the file dialog's filter ("Subtitle pack (*.pak)" and
+     * "*.pak"), and the name it is copied to beside the game ("ZOE-subtitles.pak", where the game looks for it). */
+    const char *extra_file_label;
+    const char *extra_file_filter_name;
+    const char *extra_file_filter;
+    const char *extra_file_name;
 } PsLauncherConfig;
 
 /* The whole launcher; returns the process exit code. */
