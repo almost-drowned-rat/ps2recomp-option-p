@@ -581,10 +581,7 @@ void xr_setup_ui_progress(void *p, double fraction, const char *msg)
 
 void xr_setup_ui_extra_line(XrSetupUi *ui, const char *label)
 {
-    if (!ui || ui->win || !label || !*label)
-        return;                         /* (before the window is made) */
-    widen(label, ui->extra_label, 120);
-    ui->has_extra = 1;
+    (void)ui; (void)label;              /* the Windows window keeps its own layout: the line comes with the first page */
 }
 
 void xr_setup_ui_file_line(XrSetupUi *ui, const char *label, const char *filter_name, const char *filter, char *path,
