@@ -726,12 +726,19 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
     // before: that one, without the map (its elements stay put).
     static Owned* last = nullptr;
     static std::tuple<u32, u32, u32, bool> last_key;
-    const auto key = std::make_tuple(fbp, fbw, psm, depth);
+    // A depth buffer's Z32 and Z24 over the same pages are one (agent L, 2026-11-21): the same 32-bit layout, the
+    // renderer's one depth image for both (depths_ by ZBP and size). Kept apart, each switch of the format wrote one
+    // back and reloaded the other - ZOE's hangar takes turns between the two ~7 times a frame (11 write-backs and 19
+    // render passes a frame: on a tiling GPU, the Odin 2's Adreno, a third of its frame). Written back in the format
+    // last drawn with (Z24's leaves the top byte as it is).
+    const bool z_alias = depth && (psm == gs::PSMZ24 || psm == gs::PSMZ32);
+    const auto key = std::make_tuple(fbp, fbw, z_alias ? u32(gs::PSMZ32) : psm, depth);
     if (!last || key != last_key) {
         last = &b.owned[key];
         last_key = key;
     }
     Owned& o = *last;
+    if (z_alias && o.width) o.psm = psm;
     if (!o.width) {
         o.fbp = fbp;
         o.fbw = fbw;
