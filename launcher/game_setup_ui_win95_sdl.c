@@ -1173,8 +1173,12 @@ void xr_setup_ui_extra_line(XrSetupUi *ui, const char *label)
 int xr_setup_ui_cancelled(void *p)
 {
     XrSetupUi *ui = (XrSetupUi *)p;
-    if (ui && ui->win && !ui->in_form)
-        pump(ui);                       /* the close box answered while a step runs */
+    /* the close box answered while a step runs - pumped (events + a redraw) on the main thread only: the steps'
+       worker threads ask this too (launcher.c chd_job, the copy job), and a redraw from there raced the main thread's
+       run_job redraw on the same renderer - a crash in SDL's GL renderer (GL_QueueDrawPoints, WSL llvmpipe, the
+       tar.gz's first start at "Reading the disc", 2026-11-21). The main thread's run_job pumps anyway. */
+    if (ui && ui->win && !ui->in_form && SDL_IsMainThread())
+        pump(ui);
     return ui && ui->closed;
 }
 
