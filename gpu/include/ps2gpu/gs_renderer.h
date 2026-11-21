@@ -23,6 +23,7 @@
 #define PS2GPU_GS_RENDERER_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -395,6 +396,18 @@ public:
                                int* layout, std::uint32_t* width, std::uint32_t* height) {
         (void)fbp, (void)fbw, (void)psm, (void)image, (void)layout, (void)width, (void)height;
         return false;
+    }
+    /* DisplayTarget's answer handed to `then` (ok, image, layout, width, height), in turn after everything asked
+       before: here at once; a renderer on a thread of its own (ThreadedGsRenderer) calls it on that thread when it
+       gets there, the caller not held up until the queue is drawn (agent L, 2026-11-21: on an Odin 2 the GS thread
+       waited 12-15 ms a frame there, the renderer's thread and it in turn instead of side by side). */
+    virtual void DisplayTargetThen(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
+                                   std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)> then) {
+        std::uint64_t image = 0;
+        int layout = 0;
+        std::uint32_t width = 0, height = 0;
+        const bool ok = DisplayTarget(fbp, fbw, psm, &image, &layout, &width, &height);
+        then(ok, image, layout, width, height);
     }
     /* A target's pixels, RGBA in memory, rows top-down; false if there is none. */
     virtual bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,

@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -153,11 +154,14 @@ public:
         if (log && ++kicks_ % 60 == 0) {
             std::fprintf(stderr, "[gpu thread] last 60 frames, waits for the queue:");
             for (int i = 0; i < kWhys; ++i)
-                if (drains_[i]) std::fprintf(stderr, " %s %u", kWhyNames[i], drains_[i]);
+                if (drains_[i])
+                    std::fprintf(stderr, " %s %u (%.2f ms a frame)", kWhyNames[i], drains_[i], waited_ns_[i] / 60e6);
+            std::fprintf(stderr, "; the renderer's thread at work %.2f ms a frame", played_ns_.exchange(0) / 60e6);
             const unsigned wrong = wrong_.exchange(0);
             if (wrong) std::fprintf(stderr, "; %u write-backs answered wrong", wrong);
             std::fprintf(stderr, "\n");
             std::memset(drains_, 0, sizeof drains_);
+            std::memset(waited_ns_, 0, sizeof waited_ns_);
         }
     }
     // Answered from what the queue has made by then (the images known),
@@ -364,6 +368,18 @@ public:
         Drain(10);
         return inner_->DisplayTarget(fbp, fbw, psm, image, layout, width, height);
     }
+    void DisplayTargetThen(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
+                           std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)> then) override {
+        // The call itself in the queue (its function by pointer, freed where it is played), handed over now: the
+        // frame's end, as Kick.
+        DisplayThen* call = new DisplayThen(std::move(then));
+        const std::uint32_t args[3] = {fbp, fbw, psm};
+        Op(kDisplayThen, sizeof args + sizeof call);
+        Put(args, sizeof args);
+        Put(&call, sizeof call);
+        End();
+        Submit();
+    }
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override {
         Drain(11);
@@ -380,8 +396,9 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory, kChannelShuffle, kClutVersion,
+        kTargetToMemory, kDepthToMemory, kChannelShuffle, kClutVersion, kDisplayThen,
     };
+    using DisplayThen = std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)>;
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
     // buffer by (ZBP, width, height); all dropped by a new scale.
@@ -422,7 +439,10 @@ private:
             // rather than queue a frame after another without end.
             if (full_.size() >= kAhead) {
                 ++drains_[kWhys - 1];
+                const auto from = std::chrono::steady_clock::now();
                 drained_.wait(hold, [this] { return full_.size() < kAhead; });
+                waited_ns_[kWhys - 1] += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - from).count());
             }
             full_.push_back(std::move(open_));
             if (!spare_.empty()) {
@@ -440,8 +460,11 @@ private:
     void Drain(int why = kWhys - 1) const {
         ++drains_[why];
         Submit();
+        const auto from = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> hold(lock_);
         drained_.wait(hold, [this] { return full_.empty() && !busy_; });
+        waited_ns_[why] += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - from).count());
     }
 
     void Run() {
@@ -453,7 +476,10 @@ private:
             full_.pop_front();
             busy_ = true;
             hold.unlock();
+            const auto from = std::chrono::steady_clock::now();
             Play(chunk);
+            played_ns_.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
             chunk.clear();
             hold.lock();
             spare_.push_back(std::move(chunk));
@@ -490,6 +516,16 @@ private:
                 }
                 case kFlush: r.Flush(); break;
                 case kKick: r.Kick(); break;
+                case kDisplayThen: {
+                    const auto fbp = Take<std::uint32_t>(at), fbw = Take<std::uint32_t>(at), psm = Take<std::uint32_t>(at);
+                    std::unique_ptr<DisplayThen> then(Take<DisplayThen*>(at));
+                    std::uint64_t image = 0;
+                    int layout = 0;
+                    std::uint32_t w = 0, h = 0;
+                    const bool ok = r.DisplayTarget(fbp, fbw, psm, &image, &layout, &w, &h);
+                    (*then)(ok, image, layout, w, h);
+                    break;
+                }
                 case kUploadTexture: {
                     const auto key = Take<std::uint64_t>(at);
                     const auto w = Take<std::uint32_t>(at), h = Take<std::uint32_t>(at);
@@ -614,6 +650,8 @@ private:
         "TargetToMemory", "DepthToMemory", "ReadDepth", "ReadTexture", "DisplayTarget", "ReadTarget",
         "ReadTargetFull", "queue full"};
     mutable unsigned drains_[kWhys] = {};
+    mutable std::uint64_t waited_ns_[kWhys] = {};       // the caller's time in those waits
+    std::atomic<std::uint64_t> played_ns_{0};           // the renderer's thread in Play
     unsigned kicks_ = 0;
     // The caller's side.
     mutable Bytes open_;

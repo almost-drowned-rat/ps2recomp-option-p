@@ -2973,10 +2973,36 @@ void Rescale(Bridge& b, ps2gpu::GsScale scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %.3fx %.3fx\n", scale.x / double(kOne), scale.y / double(kOne));
 }
 
+/* The picture handed over without waiting for the renderer's queue (DisplayTargetThen): the target's image
+   presented from the renderer's thread when the queue gets there, the GS thread on to the next frame meanwhile. If
+   the renderer had no such target after all (none drawn there yet: not owned by the GPU, it is seen here first), the
+   next picture goes the waiting way, with the software picture where there is none - each frame after it handed
+   over again. PS2HOST_PRESENT_WAIT: always the waiting way (agent L, 2026-11-21). */
+static std::atomic<bool> g_present_missed{false};
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
     u32 fbp = 0, fbw = 0, psm = 0;
+    static const bool wait = std::getenv("PS2HOST_PRESENT_WAIT") != nullptr;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
         auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
+        if (!wait && found != g_bridge->owned.end() && !found->second.stale && !g_present_missed.exchange(false)) {
+            // What the picture's size takes of the GS's state, now; the rest on the renderer's thread.
+            const ps2gpu::GsScale k = g_bridge->renderer->Scale();
+            const u32 lines = std::min(gs::TheGs().ShownLines(), 448u);
+            g_bridge->renderer->DisplayTargetThen(
+                fbp, fbw, psm, [&display, k, lines, due_ns](bool ok, std::uint64_t image, int layout, u32 w, u32 h) {
+                    if (!ok) {
+                        g_present_missed = true;
+                        return;
+                    }
+                    const u32 sw = std::min(w, ps2gpu::ScaleSize(640u, k.x)), sh = std::min(h, ps2gpu::ScaleSize(lines, k.y));
+                    display.SetPictureCrop(k.x > kOne ? (k.x + 2 * kOne - 1) / (2 * kOne) : 0u,
+                                           k.y > kOne ? (k.y + 2 * kOne - 1) / (2 * kOne) : 0u);
+                    if (due_ns) display.PresentImageAt(image, layout, sw, sh, due_ns);
+                    else display.PresentImage(image, layout, sw, sh);
+                });
+            return;
+        }
         std::uint64_t image = 0;
         int layout = 0;
         u32 w = 0, h = 0;
