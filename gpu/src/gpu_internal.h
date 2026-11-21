@@ -5,6 +5,26 @@
 
 #include <volk.h>
 
+#include <cstdlib>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+/* volkInitialize, or - SDL_VULKAN_LIBRARY set (Android: the app's driver shim, which picks the system driver or the
+   player's Turnip) - that library's vkGetInstanceProcAddr, so the game and SDL's surface use the same Vulkan. */
+inline VkResult LoadVulkan() {
+#ifndef _WIN32
+    if (const char* lib = std::getenv("SDL_VULKAN_LIBRARY"); lib && *lib) {
+        if (void* h = dlopen(lib, RTLD_NOW | RTLD_LOCAL)) {
+            if (auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h, "vkGetInstanceProcAddr"))) {
+                volkInitializeCustom(gipa);
+                return VK_SUCCESS;
+            }
+        }
+    }
+#endif
+    return volkInitialize();
+}
+
 #include <atomic>
 #include <chrono>
 #include <functional>

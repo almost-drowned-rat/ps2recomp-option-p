@@ -959,8 +959,17 @@ void GpuScaledColourTransfersAsTheGs() {
                 }
             std::vector<u8> bytes(4u << 20);
             renderer->MemoryRead(0, 16384, bytes.data());
-            Check(std::memcmp(bytes.data(), reference.data(), bytes.size()) == 0,
-                  "scaled (whole, quarter-step and wide) color transfer matches scalar GS memory");
+            {
+                const bool same = std::memcmp(bytes.data(), reference.data(), bytes.size()) == 0;
+                if (!same) {
+                    std::size_t first = 0, count = 0;
+                    for (std::size_t i = 0; i < bytes.size(); ++i)
+                        if (bytes[i] != reference.data()[i]) { if (!count) first = i; ++count; }
+                    std::fprintf(stderr, "  scale %u x %u psm %02X: %zu bytes differ, first at %zX\n",
+                                 unsigned(scale.x), unsigned(scale.y), unsigned(psm), count, first);
+                }
+                Check(same, "scaled (whole, quarter-step and wide) color transfer matches scalar GS memory");
+            }
             const u32 begin = base * 32, end = begin + fbw * (sixteen ? 1 : 2) * 32;
             for (u32 i = begin * 256; i < end * 256; ++i) reference.data()[i] = u8(next() >> 24);
             renderer->MemoryWrite(begin, end, reference.data() + begin * 256);

@@ -616,7 +616,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         std::fprintf(stderr, "[window] %d controller(s) plugged in, %d of them with a known layout\n", joysticks,
                      gamepads);
     }
-    if (!Check(volkInitialize(), "volkInitialize (is there a Vulkan driver?)")) return false;
+    if (!Check(LoadVulkan(), "volkInitialize (is there a Vulkan driver?)")) return false;
     window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window_) {
         error_ = std::string("SDL_CreateWindow: ") + SDL_GetError();

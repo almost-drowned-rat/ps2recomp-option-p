@@ -350,6 +350,8 @@ std::filesystem::path ExePath() {
     // No executable of the game's own (the app's process): its folder is the app's external files dir (saves,
     // settings, logs, the unpacked discs - reachable by adb and file managers), the name the game library's
     static std::filesystem::path path = [] {
+        // (PS2HOST_HOME: a folder of its own for a run outside the app - adb shell tests, replays)
+        if (const char* home = std::getenv("PS2HOST_HOME"); home && *home) return std::filesystem::path(home) / "zoe_us";
         const char* dir = SDL_GetAndroidExternalStoragePath();
         return std::filesystem::path(dir && *dir ? dir : "/sdcard") / "zoe_us";
     }();

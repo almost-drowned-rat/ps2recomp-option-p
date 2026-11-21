@@ -174,6 +174,7 @@ int GsReplay(const std::string& file, const std::string& out) {
         }
         const char* scale = std::getenv("PS2HOST_REPLAY_SCALE");
         if (scale) GpuSetScale(std::max(1.0, std::atof(scale)));     // a factor on the lines: 1, 1.75, 2 ...
+        else if (std::getenv("PS2HOST_REPLAY_SCALE_XY")) GpuSetScale(1.0);    // (WantedScale reads the two factors)
         if (g.on_memory) g.on_memory(0, 16384, true);       // local memory as the dump has it, on the GPU too
     }
     std::FILE* trace = std::fopen((out + "/trace.txt").c_str(), "w");

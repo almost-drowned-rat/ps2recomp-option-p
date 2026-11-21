@@ -2914,6 +2914,11 @@ RenderSize FsrPresetSize() {
 }
 
 ps2gpu::GsScale WantedScale() {
+    // PS2HOST_REPLAY_SCALE_XY=<x>,<y> (diagnosis, a replay): the two factors as given - a wide picture's unequal ones
+    static const char* const xy = std::getenv("PS2HOST_REPLAY_SCALE_XY");
+    double sx = 0, sy = 0;
+    if (xy && std::sscanf(xy, "%lf,%lf", &sx, &sy) == 2 && sx >= 1.0 && sy >= 1.0)
+        return ps2gpu::GsScale{u32(sx * ps2gpu::kScaleOne + 0.5), u32(sy * ps2gpu::kScaleOne + 0.5)};
     if (const u32 q = g_replay_scale.load()) return ScaleFor(q);
     const RenderSize preset = FsrPresetSize();
     if (preset.w) return ScaleOfSize(preset, 1);

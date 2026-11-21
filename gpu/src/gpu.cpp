@@ -38,7 +38,7 @@ bool VulkanGpu::Init(std::string* error) {
         if (error) *error = text;
         return false;
     };
-    VkResult r = volkInitialize();
+    VkResult r = LoadVulkan();
     if (r != VK_SUCCESS) return fail("volkInitialize (is there a Vulkan driver?)", r);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2gpu";
