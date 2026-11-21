@@ -2158,6 +2158,17 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     const VkClearColorValue black{};
     const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    {   // the clear before the picture's blit over it: ordered by a barrier (Turnip ran them together - black bands)
+        VkImageMemoryBarrier cleared{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        cleared.oldLayout = cleared.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        cleared.srcQueueFamilyIndex = cleared.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        cleared.image = target;
+        cleared.subresourceRange = all;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &cleared);
+    }
     // 4:3 as a television shows it, 16:9, or the window's own shape (SetAspect),
     // centred in the window.
     std::int32_t w = std::int32_t(extent_.width), h = std::int32_t(extent_.height);
