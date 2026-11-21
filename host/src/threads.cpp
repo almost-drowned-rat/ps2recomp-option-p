@@ -1506,6 +1506,12 @@ bool RunIopBetweenSteps() {
 bool BlankDue() { return S().vblank_due.load(std::memory_order_relaxed); }
 u64 LastVblankNs() { return g_last_vblank_ns.load(std::memory_order_relaxed); }
 
+namespace {
+std::atomic<u64> g_last_movie_ns{0};        // NoteMoviePicture's
+}  // namespace
+void NoteMoviePicture() { g_last_movie_ns.store(LastVblankNs(), std::memory_order_relaxed); }
+u64 LastMoviePictureNs() { return g_last_movie_ns.load(std::memory_order_relaxed); }
+
 void FastThread() {
     ps2platform::NoPowerThrottling();
     // Above the rest only with cores to spare (SpareCores): on a machine

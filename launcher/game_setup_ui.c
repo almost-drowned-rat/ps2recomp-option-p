@@ -129,9 +129,9 @@ void xr_setup_ui_progress(void *p, double fraction, const char *text)
 }
 
 int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, const char *note,
-                     const char *extra_label, char *extra, size_t extra_n)
+                     const char *extra_label, char *extra, size_t extra_n, char *target, size_t target_n, int *copy)
 {
-    (void)ui; (void)disc_name; (void)iso; (void)n; (void)note; (void)extra_label; (void)extra; (void)extra_n;
+    (void)ui; (void)disc_name; (void)iso; (void)n; (void)note; (void)extra_label; (void)extra; (void)extra_n; (void)target; (void)target_n; (void)copy;
     return -1;                          /* no first page here: the launcher's message boxes ask */
 }
 

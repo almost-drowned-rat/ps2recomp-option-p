@@ -469,6 +469,8 @@ def _build_mingw(game, source, binary, cmake, ninja, generated, sse4) -> str:
                  "-DCMAKE_MAKE_PROGRAM=" + ninja, "-DPS2_GENERATED_DIR=" + generated.replace("\\", "/"),
                  "-DPS2HOST_AVX2=" + ("OFF" if sse4 else "ON"),
                  "-DPS2HOST_TIER_E=" + ("OFF" if os.environ.get("PS2_TIER_E", "").lower() == "off" else "ON"),
+                 # The F9 debug panel stays internal (the maintainer 2026-11-20): not in the player's build.
+                 "-DPS2HOST_DEBUG_PANEL=" + ("ON" if os.environ.get("PS2_DEBUG_PANEL", "").lower() == "on" else "OFF"),
                  "-DCMAKE_C_COMPILER=x86_64-w64-mingw32-clang", "-DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-clang++",
                  "-DCMAKE_RC_COMPILER=x86_64-w64-mingw32-windres"]
     for command in (configure, [cmake, "--build", binary, "-j", str(_build_jobs())]):

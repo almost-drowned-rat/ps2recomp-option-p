@@ -41,6 +41,10 @@ struct Map {
 };
 
 int Controls(Kind kind);
+/* A port's own default layout: controls a and b (DualShock 2 inputs, 0 select ... 3 start) trade their default
+   sources on the keyboard and every controller (ZOE: Start and Select - SELECT's menu on the Start button, the
+   game's pause on Select; the maintainer 2026-11-21). Before the bindings are first read. */
+void SwapDefaults(int a, int b);
 void KeyboardDefault(Map* m);
 void PadDefault(Map* m);
 const char* ControlName(int control);

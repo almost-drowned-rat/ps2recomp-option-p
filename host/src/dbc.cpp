@@ -197,6 +197,30 @@ void RecordOrReplay(u8* data) {
     }
 }
 
+}  // namespace
+
+// The game's inputs held now through the player's bindings (BUTTON MAPPING): the keyboard's and every window
+// controller's, bit n the DualShock 2 input n (1: held) - what SELECT's menu reads (it follows the binding: the
+// port's swapped defaults, SwapDefaults). Not the scripted presses, not the game's own controller filter.
+u16 BoundButtonsNow() {
+    u16 held = 0;
+    const bind::Map& km = bind::KeyboardMap();
+    for (int c = 0; c < bind::kPadControls; ++c)
+        for (int i = 0; i < bind::kSources; ++i)
+            if (km.src[c][i] && WindowFocused() && HostKeyDown(VirtualKeyOfSource(km.src[c][i]))) held |= u16(1u << c);
+    if (!WindowFocused()) return held;
+    for (const HostDevice& d : WindowControllers()) {
+        HostPadState pad;
+        if (!WindowControllerPad(d.id, &pad)) continue;
+        u8 pressure[16] = {};
+        bind::ApplyPad(bind::PadMap(d.name), &pad.buttons, pressure);
+        held |= pad.buttons;
+    }
+    return held;
+}
+
+namespace {
+
 void PadData(u32 port, u8* data) {
     u16 buttons = 0xFFFF;                                   // active low: nothing pressed
     u8 pressure[16] = {};                                   // each input's, the most any source gives
@@ -312,6 +336,13 @@ void PadData(u32 port, u8* data) {
         buttons &= u16(~hooked);
         for (int i = 0; i < 16; ++i)
             if (hooked & (1u << i)) pressure[i] = 0xFF;
+    }
+    if (!SelectToGame()) {                  // Select is the port's menu's (EnableSelectMenu), never the game's -
+        const bool select = !(buttons & 1u);
+        buttons |= 1u;
+        // where the menu does not open (scenes, movies, menus: SetSelectAllowed) it is the game's Start: it skips
+        // a scene too (the maintainer 2026-11-21)
+        if (select && !SelectMenuHere()) buttons &= u16(~(1u << 3));
     }
     if (PcMenuOpen()) {                     // the PC settings panel has the keys
         buttons = 0xFFFF;

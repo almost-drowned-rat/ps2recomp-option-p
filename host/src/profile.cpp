@@ -547,6 +547,8 @@ std::string SampleReport(int top) {
 
 namespace {
 
+wchar_t g_crash_command[4096] = L"";    // (made before: nothing allocated in a crash) - SetCrashCommand
+
 LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     if (reported.exchange(true)) return EXCEPTION_CONTINUE_SEARCH;
@@ -598,6 +600,18 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
                      lined ? "  " : "", lined ? line.FileName : "", lined ? line.LineNumber : 0ul);
     }
     std::fflush(stderr);
+    // The crash report's helper (crash_report.cpp): this program again, the report made once this one is gone.
+    if (g_crash_command[0]) {
+        static wchar_t command[4096];
+        std::memcpy(command, g_crash_command, sizeof command);
+        STARTUPINFOW startup{};
+        startup.cb = sizeof startup;
+        PROCESS_INFORMATION started{};
+        if (CreateProcessW(nullptr, command, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &started)) {
+            CloseHandle(started.hThread);
+            CloseHandle(started.hProcess);
+        }
+    }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -605,9 +619,17 @@ LONG WINAPI CrashFilter(EXCEPTION_POINTERS* info) {
 
 void InstallCrashReport() { SetUnhandledExceptionFilter(CrashFilter); }
 
+void SetCrashCommand(const wchar_t* command) {
+    std::size_t n = 0;
+    for (; command && command[n] && n + 1 < sizeof g_crash_command / sizeof g_crash_command[0]; ++n)
+        g_crash_command[n] = command[n];
+    g_crash_command[n] = 0;
+}
+
 #else
 
 void InstallCrashReport() {}
+void SetCrashCommand(const wchar_t*) {}
 void StartSampler() {}
 std::string SampleReport(int) { return ""; }
 

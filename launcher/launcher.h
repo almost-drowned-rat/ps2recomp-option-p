@@ -10,7 +10,8 @@
  *   link -> start the game.
  *
  * Nothing is downloaded and the image is only read, never moved or changed. Later starts start the game at once
- * (a stamp: the release + the image's path and size); `--repair` builds again. What to run is data in the payload
+ * (a stamp: the release + the image's size and the SHA-256 of its first 4 MiB - the same image moved builds
+ * nothing again); `--repair` builds again. What to run is data in the payload
  * (lift.txt, build.txt, toolchain.txt, written by the port's release script from its real build), so this file
  * is the same for every PS2 port; the port gives only its names (PsLauncherConfig).
  *

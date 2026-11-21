@@ -667,7 +667,10 @@ std::string g_capture_dir;
 
 void StartCapture(u64 frame) {
     namespace fs = std::filesystem;
-    fs::path base = SettingsPath().empty() ? fs::path("captures") : fs::path(SettingsPath()).parent_path() / "captures";
+    // In data\captures beside the PC settings (the maintainer 2026-11-20: a player's folder keeps the game's own
+    // files apart from what it writes for a report).
+    fs::path base = SettingsPath().empty() ? fs::path("data") / "captures"
+                                           : fs::path(SettingsPath()).parent_path() / "data" / "captures";
     char name[64];
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
@@ -783,6 +786,7 @@ void FrameDone(u64 frame) {
         // state as of now goes into the pad block the game reads this frame
         // (taken after it, every press reached the game a frame late).
         if (!PumpWindow()) throw GuestExit{0};          // the user closed the window
+        if (!HoldForSelectMenu()) throw GuestExit{0};   // SELECT's menu: the game held still meanwhile
         DbcFrame();
         return;
     }

@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <system_error>
@@ -2395,7 +2396,73 @@ void RelocatablesRunWhereverLoaded() {
     ps2host::RegisterRelocatables(nullptr, 0);
 }
 
+// A CHD (v5, uncompressed hunks of 3 sectors, unit 2048 - a DVD image's) read as the image it holds: its sectors,
+// across hunks, and its size (libchdr; the last hunk padded).
+void ChdReadsAsTheImage() {
+    using ps2host::kSectorSize;
+    const u32 sectors = 10, hunk = 3 * kSectorSize, hunks = (sectors * kSectorSize + hunk - 1) / hunk;
+    std::vector<u8> image(std::size_t(sectors) * kSectorSize);
+    for (std::size_t i = 0; i < image.size(); ++i) image[i] = u8(i * 7 + i / kSectorSize);
+    auto be32 = [](std::vector<u8>& v, u32 x) {
+        for (int b = 3; b >= 0; --b) v.push_back(u8(x >> (8 * b)));
+    };
+    auto be64 = [&](std::vector<u8>& v, u64 x) {
+        be32(v, u32(x >> 32));
+        be32(v, u32(x));
+    };
+    std::vector<u8> chd = {'M', 'C', 'o', 'm', 'p', 'r', 'H', 'D'};
+    be32(chd, 124);
+    be32(chd, 5);
+    for (int i = 0; i < 4; ++i) be32(chd, 0);            // no codec: uncompressed
+    be64(chd, image.size());                            // logical bytes
+    be64(chd, 124);                                     // the map
+    be64(chd, 0);                                       // no metadata
+    be32(chd, hunk);
+    be32(chd, kSectorSize);
+    chd.resize(124, 0);                                 // (the hashes)
+    const u32 first = (124 + 4 * hunks + hunk - 1) / hunk;
+    for (u32 h = 0; h < hunks; ++h) be32(chd, first + h);
+    chd.resize(std::size_t(first) * hunk, 0);
+    chd.insert(chd.end(), image.begin(), image.end());
+    chd.resize(std::size_t(first + hunks) * hunk, 0);
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "ps2host_test.chd";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(chd.data()), std::streamsize(chd.size()));
+    }
+    ps2host::Disc disc;
+    Check(disc.Open(path.string()) && disc.IsOpen(), "chd: opened");
+    Check(disc.Sectors() == sectors, "chd: its image's sectors");
+    std::vector<u8> got(std::size_t(4) * kSectorSize);
+    Check(disc.Read(2, 4, got.data()) && std::memcmp(got.data(), &image[2 * kSectorSize], got.size()) == 0,
+          "chd: sectors read across hunks as the image's");
+    Check(disc.Read(9, 1, got.data()) && std::memcmp(got.data(), &image[9 * kSectorSize], kSectorSize) == 0,
+          "chd: the last sector (its hunk padded)");
+    Check(!disc.Read(10, 1, got.data()), "chd: past the end");
+    disc.Open("");
+    std::error_code e;
+    std::filesystem::remove(path, e);
+}
+
+// The settings' file read past a UTF-8 byte order mark: its first line's key is the setting's, not the mark's
+// (ps2-port-engine 90281dd; then the run's settings again: none, and nowhere to write them).
+void SettingsReadPastAByteOrderMark() {
+    const std::filesystem::path path = std::filesystem::temp_directory_path() / "ps2host_settings_bom.ini";
+    {
+        std::ofstream out(path, std::ios::binary);
+        out << "\xEF\xBB\xBF" "disc=C:\\games\\disc.iso\r\nfullscreen=on\r\n";
+    }
+    ps2host::LoadSettings(path.string());
+    Check(ps2host::Setting("disc") == "C:\\games\\disc.iso", "settings: the first key after a byte order mark");
+    Check(ps2host::Setting("fullscreen") == "on", "settings: a line after it, its CR trimmed");
+    ps2host::LoadSettings("");
+    std::error_code e;
+    std::filesystem::remove(path, e);
+}
+
 int main() {
+    SettingsReadPastAByteOrderMark();
+    ChdReadsAsTheImage();
     OverlaysRunWhatIsLoaded();
     RelocatablesRunWhereverLoaded();
     MirrorsReachTheSameRam();

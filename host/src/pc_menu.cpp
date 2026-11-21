@@ -16,6 +16,7 @@
 #include <array>
 #include <cctype>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -32,6 +33,9 @@ namespace key = ps2platform::key;
 namespace {
 
 bool g_open = false;
+bool g_port_controls = false;       // BUTTON MAPPING open alone in a port's look (OpenPcMenuControls + SetControlsLook)
+// A port's own look for BUTTON MAPPING (SetControlsLook): it draws the page's lines.
+void (*g_controls_look)(bool open, const std::vector<ControlsLine>& lines, int row) = nullptr;
 bool g_releasing = false;                // closed, the game's input held back until the keys are let go
 int g_row = 0;
 
@@ -76,6 +80,13 @@ const std::vector<Choice>& Choices() {
          [] { return Setting("aspect", "4:3"); },
          [](const std::string& v) { SetWindowAspect(v); },
          "ASPECT RATIO", {"4:3", "16:9", "16:10", "21:9"}, "The picture's shape: more of the world at the sides."},
+        // STRETCH CUTSCENES (the maintainer 2026-11-20): a wide shape's movies - 4:3 between bars (OFF, the default)
+        // or stretched to the shape (ON: the shape never changes) - the "stretch_cutscenes" setting, a port's
+        // SetWidescreen callback reads it (ZOE's ShowsWide).
+        {"Stretch cutscenes", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOn("stretch_cutscenes", false)); },
+         [](const std::string& v) { SetSettingOn("stretch_cutscenes", v == "on"); },
+         "STRETCH CUTSCENES", {"OFF", "ON"}, "Movies fill a wide picture too (stretched) instead of 4:3 between bars."},
         // FIELD OF VIEW (4b): the original, or wider by 5-30 degrees (Orta's); the same hook as the aspect's.
         {"Field of view", {"0", "5", "10", "15", "20", "25", "30"},
          {"Original", "+5", "+10", "+15", "+20", "+25", "+30"},
@@ -113,11 +124,26 @@ const std::vector<Choice>& Choices() {
              ApplyBloomSetting();
          },
          "BLOOM STRENGTH", {"1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}, "How strongly bright parts glow.", kPost},
-        {"Upscaling", {"linear", "fsr1"}, {"Bilinear", "FSR 1"},
-         [] { return Setting("upscaling", "linear"); },
+        // FSR (AMD's FSR 1; "FSR" alone, the maintainer 2026-11-20); with it, the line under it: a preset drawing
+        // at a part of the window (QUALITY 1/1.5, BALANCED 1/1.7, PERFORMANCE 1/2) or CUSTOM (RENDER RESOLUTION's).
+        {"Upscaling", {"linear", "fsr1"}, {"Bilinear", "FSR"},
+         [] { return Setting("upscaling", "linear").rfind("fsr", 0) == 0 ? std::string("fsr1") : std::string("linear"); },
          [](const std::string& v) { SetWindowUpscaling(v); },
-         "UPSCALING", {"BILINEAR", "FSR 1"},
-         "A picture drawn smaller than the window: filtered up, or FSR 1 (sharper edges).", kPost},
+         "UPSCALING", {"BILINEAR", "FSR"},
+         "A picture drawn smaller than the window: filtered up, or FSR (sharper edges).", kPost},
+        // (Three only, all shown on the line - a game's own page puts them side by side: the maintainer 2026-11-21.)
+        {"FSR preset", {"quality", "balanced", "performance"}, {"Quality", "Balanced", "Performance"},
+         [] {
+             const std::string v = Setting("fsr_preset", "quality");
+             return v == "balanced" || v == "performance" ? v : std::string("quality");
+         },
+         [](const std::string& v) { SetSetting("fsr_preset", v); },
+         "FSR PRESET", {"QUALITY", "BALANCED", "PERFORMANCE"},
+         "FSR draws at a part of the window's size: QUALITY the most, PERFORMANCE the least.", kPost},
+        {"FSR sharpness", {"low", "medium", "high", "max"}, {"Low", "Medium", "High", "Max"},
+         [] { return Setting("fsr_sharpness", "high"); },
+         [](const std::string& v) { SetWindowFsrSharpness(v); },
+         "FSR SHARPNESS", {"LOW", "MEDIUM", "HIGH", "MAX"}, "How strongly FSR sharpens the picture.", kPost},
         {"V-sync", {"off", "on"}, {"Off", "On"},
          [] { return OnOff(WindowVsync()); },
          [](const std::string& v) { SetWindowVsync(v == "on"); },
@@ -250,13 +276,28 @@ bool Shown(const Choice& c) {
     if (label == "Texture pack" && TexturePacks().empty()) return false;
     if (label == "Language" && Languages().size() < 2) return false;
     if (label == "Dub" && (Dubs().size() < 2 || !g_dubs_available || !g_dubs_available())) return false;
-    if ((label == "Aspect ratio" || label == "Field of view") && !WidescreenSupported()) return false;
+    if ((label == "Aspect ratio" || label == "Field of view" || label == "Stretch cutscenes") && !WidescreenSupported())
+        return false;
+    // FSR's own lines only under UPSCALING FSR (the maintainer 2026-11-21).
+    if ((label == "FSR preset" || label == "FSR sharpness") && Setting("upscaling", "linear").rfind("fsr", 0) != 0)
+        return false;
     return true;
 }
 
 // The rows of a page: the list's - POST PROCESSING >, its own lines (FRAME RATE > after the aspect ratio's),
 // CONTROLS >, Close; a page's - its lines, then Back.
 constexpr int kCloseRow = -1, kControlsRow = -2, kPostRow = -3, kRateRow = -4, kBackRow = -5;
+// A port's own debug lines (AddDebugLine: ZOE's subtitle timing of the scene playing), rows kPortBase - n.
+constexpr int kPortBase = -100;
+struct DebugLine {
+    std::string label;
+    std::string (*get)();
+    void (*step)(int);
+};
+std::vector<DebugLine>& DebugLines() {
+    static std::vector<DebugLine> lines;
+    return lines;
+}
 std::vector<int> Rows(int page = g_page) {
     std::vector<int> rows;
     if (page == kMain) rows.push_back(kPostRow);
@@ -270,6 +311,7 @@ std::vector<int> Rows(int page = g_page) {
     }
     if (page == kMain) rows.insert(rows.begin() + std::ptrdiff_t(rate_at), kRateRow);
     if (page == kMain) {
+        for (int n = 0; n < int(DebugLines().size()); ++n) rows.push_back(kPortBase - n);
         rows.push_back(kControlsRow);
         rows.push_back(kCloseRow);
     } else {
@@ -305,6 +347,9 @@ void Draw(bool force = false) {
             text = "Frame rate >";
         } else if (rows[r] == kBackRow) {
             text = "Back";
+        } else if (rows[r] <= kPortBase) {
+            const DebugLine& d = DebugLines()[std::size_t(kPortBase - rows[r])];
+            text = d.label + std::string(16 - std::min<std::size_t>(15, d.label.size()), ' ') + "< " + d.get() + " >";
         } else if (rows[r] < 0) {
             text = "Close";
         } else {
@@ -407,6 +452,11 @@ void Change(int step) {
         OpenPage(kMain);
         return;
     }
+    if (which <= kPortBase) {
+        DebugLines()[std::size_t(kPortBase - which)].step(step);
+        Draw(true);
+        return;
+    }
     if (which < 0) {
         Close();
         return;
@@ -421,7 +471,11 @@ std::array<bool, kInputs> Held() {
     std::array<bool, kInputs> held{};
     const bool focused = WindowFocused();
     auto down = [&](int k) { return focused && HostKeyDown(k); };
+#if PS2HOST_NO_DEBUG_PANEL
+    held[kToggle] = false;          // a player's build: no F9 panel (CMake PS2HOST_DEBUG_PANEL)
+#else
     held[kToggle] = down(key::kF9);
+#endif
     held[kUp] = down(key::kUp);
     held[kDown] = down(key::kDown);
     held[kLeft] = down(key::kLeft);
@@ -438,8 +492,10 @@ std::array<bool, kInputs> Held() {
         held[kDown] = held[kDown] || button(6);
         held[kLeft] = held[kLeft] || button(7);
         held[kRight] = held[kRight] || button(5);
-        held[kAccept] = held[kAccept] || button(14);
-        held[kBack] = held[kBack] || button(13);
+        // (BUTTON MAPPING opened from a port's own page in its game's look: the game's buttons - Circle chooses,
+        // Cross goes back - as on its pages; the panel's own the other way round.)
+        held[kAccept] = held[kAccept] || button(g_port_controls ? 13 : 14);
+        held[kBack] = held[kBack] || button(g_port_controls ? 14 : 13);
     }
     return held;
 }
@@ -448,6 +504,24 @@ std::array<bool, kInputs> Held() {
 // bindings, each "INPUT: SOURCE"; Enter / Cross on one waits for a key or button (all let go first, ~5 s, Esc
 // cancels). The panel's own keys are not bound: the default layout always gets back here.
 bool g_controls = false;
+bool g_controls_only = false;       // opened alone (OpenPcMenuControls: a port's CONTROLS line) - closing ends it all
+
+void Draw(bool force);
+// The BUTTON MAPPING page closed: back on the panel's list, or - opened alone from a port's own page - the panel
+// closed (a player's build has no panel to land on).
+void CloseControls() {
+    g_controls = false;
+    if (g_controls_only) {
+        g_controls_only = false;
+        g_open = false;
+        g_releasing = true;
+        if (g_port_controls) g_controls_look(false, {}, 0);
+        else SetWindowOverlay({});
+        g_port_controls = false;
+        return;
+    }
+    Draw(true);
+}
 int g_controls_row = 0;
 std::size_t g_device = 0;           // index into ControlsDevices()
 int g_capture = -1;                 // the control waiting for a press, -1 none
@@ -468,9 +542,34 @@ const char* const kInputNames[bind::kControls] = {
 
 // A source as the player knows it: the key's name, the button's (the controller's own: an Xbox pad's A for the
 // place of Cross).
+// A key's name in English by its place (set-1 scan code): a port's own look writes the game's language, not the
+// system's ("EINGABE", "R?CK" on a German Windows; his shot 2026-11-21). "" when not one of these.
+std::string EnglishKeyName(u16 src) {
+    static const struct { u16 code; const char* name; } kNames[] = {
+        {0x01, "Esc"}, {0x0E, "Backspace"}, {0x0F, "Tab"}, {0x1C, "Enter"}, {0x1D, "Ctrl"}, {0x2A, "Shift"},
+        {0x36, "Right Shift"}, {0x38, "Alt"}, {0x39, "Space"}, {0x3A, "Caps Lock"}, {0xE048, "Up"},
+        {0xE050, "Down"}, {0xE04B, "Left"}, {0xE04D, "Right"}, {0xE01C, "Num Enter"}, {0xE01D, "Right Ctrl"},
+        {0xE038, "Right Alt"}, {0xE047, "Home"}, {0xE04F, "End"}, {0xE049, "Page Up"}, {0xE051, "Page Down"},
+        {0xE052, "Insert"}, {0xE053, "Delete"}, {0x0C, "-"}, {0x0D, "="}, {0x1A, "["}, {0x1B, "]"}, {0x27, ";"},
+        {0x28, "'"}, {0x29, "`"}, {0x2B, "\\"}, {0x33, ","}, {0x34, "."}, {0x35, "/"}};
+    for (const auto& k : kNames)
+        if (k.code == src) return k.name;
+    static const char* const kRow1 = "QWERTYUIOP", *const kRow2 = "ASDFGHJKL", *const kRow3 = "ZXCVBNM";
+    if (src >= 0x02 && src <= 0x0B) return std::string(1, src == 0x0B ? '0' : char('1' + (src - 0x02)));
+    if (src >= 0x10 && src <= 0x19) return std::string(1, kRow1[src - 0x10]);
+    if (src >= 0x1E && src <= 0x26) return std::string(1, kRow2[src - 0x1E]);
+    if (src >= 0x2C && src <= 0x32) return std::string(1, kRow3[src - 0x2C]);
+    if (src >= 0x3B && src <= 0x44) return "F" + std::to_string(src - 0x3B + 1);
+    return "";
+}
+
 std::string Shown(const HostDevice& d, u16 src) {
     if (!src) return "-";
     if (KindOf(d) == bind::Kind::kKeyboard) {
+        if (g_port_controls) {
+            const std::string english = EnglishKeyName(src);
+            if (!english.empty()) return english;
+        }
         std::string name;
         if (ps2platform::ScanCodeName(src, &name)) return name;
         return bind::SourceName(bind::Kind::kKeyboard, src);
@@ -512,7 +611,8 @@ u16 HeldSource(const HostDevice& d) {
     return 0;
 }
 
-int ControlsRows(const HostDevice& d) { return 2 + bind::Controls(KindOf(d)) + 1; }   // + Back
+// In a port's own look (g_port_controls) no Back row: Cross / Esc go back.
+int ControlsRows(const HostDevice& d) { return 2 + bind::Controls(KindOf(d)) + (g_port_controls ? 0 : 1); }
 
 void DrawControls() {
     const std::vector<HostDevice> devices = ControlsDevices();
@@ -520,6 +620,25 @@ void DrawControls() {
     const HostDevice& d = devices[g_device];
     const bind::Map m = CurrentMap(d);
     const u32 dup = bind::Duplicates(KindOf(d), m);
+    if (g_port_controls) {                  // the port draws it (its game's look)
+        std::vector<ControlsLine> rows;
+        auto upper = [](std::string s) {
+            for (char& ch : s) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+            return s;
+        };
+        rows.push_back({"DEVICE", upper(d.name), false, false});
+        rows.push_back({"RESET TO DEFAULT", "", false, false});
+        for (int c = 0; c < bind::Controls(KindOf(d)); ++c) {
+            std::string src = Shown(d, m.src[c][0]);
+            if (m.src[c][1]) src += " / " + Shown(d, m.src[c][1]);
+            const bool capture = g_capture == c;
+            rows.push_back({upper(kInputNames[c]),
+                            capture ? (KindOf(d) == bind::Kind::kKeyboard ? "PRESS A KEY" : "PRESS A BUTTON") : upper(src),
+                            capture, (dup & (1u << c)) != 0});
+        }
+        g_controls_look(true, rows, g_controls_row);
+        return;
+    }
     std::vector<std::string> lines = {"CONTROLS > BUTTON MAPPING   (Esc back)"};
     const int rows = ControlsRows(d);
     for (int r = 0; r < rows; ++r) {
@@ -584,8 +703,7 @@ void UpdateControls(WentDown went_down) {
         return;
     }
     if (went_down(kBack) || went_down(kToggle)) {
-        g_controls = false;
-        Draw(true);
+        CloseControls();
         return;
     }
     if (went_down(kUp)) g_controls_row = (g_controls_row + rows - 1) % rows;
@@ -602,9 +720,8 @@ void UpdateControls(WentDown went_down) {
             if (KindOf(d) == bind::Kind::kKeyboard) bind::KeyboardDefault(&def);
             else bind::PadDefault(&def);
             StoreMap(d, def);
-        } else if (g_controls_row == rows - 1) {
-            g_controls = false;
-            Draw(true);
+        } else if (!g_port_controls && g_controls_row == rows - 1) {
+            CloseControls();
             return;
         } else {
             g_capture = g_controls_row - 2;
@@ -666,7 +783,194 @@ void SetDubs(const std::vector<std::string>& dubs, bool (*available)()) {
     g_dubs_available = available;
 }
 
-bool PcMenuOpen() { return g_open || g_releasing; }
+// ---- SELECT's menu (the maintainer 2026-11-21, ZOE issue 3): a port whose game leaves Select unused
+// (EnableSelectMenu) opens EXIT GAME / EXIT TO MENU / BACK with it - the game held still meanwhile (devices.cpp's
+// frame waits, the last picture shown again). The "select" setting (internal: in pc_settings.ini only, no menu
+// line) = "stock" gives Select back to the game.
+bool g_select_menu = false;         // the port's EnableSelectMenu
+bool g_quit_open = false;
+int g_quit_row = 0;
+int g_quit_ask = 0;                 // EXIT GAME (2) / EXIT TO MENU (3) asked: YES / NO
+bool g_quit_yes = false;
+
+bool SelectMenuActive() { return g_select_menu && Setting("select", "ours") != "stock"; }
+
+void (*g_select_look)(bool open, int row) = nullptr;   // SetSelectMenuLook: the port draws it in the game's look
+
+void SetSelectMenuLook(void (*draw)(bool open, int row)) { g_select_look = draw; }
+
+void CloseQuitLook() {
+    if (g_select_look) g_select_look(false, 0);
+    else SetWindowOverlay({});
+}
+
+void DrawQuit() {
+    // (Asked: row 4 + 2 * (0 EXIT GAME, 1 EXIT TO MENU) + (0 YES, 1 NO).)
+    const int row = g_quit_ask ? 4 + 2 * (g_quit_ask - 2) + (g_quit_yes ? 0 : 1) : g_quit_row;
+    if (g_select_look) {
+        g_select_look(true, row);
+        return;
+    }
+    static const char* const kRows[4] = {"RESUME", "SETTINGS", "EXIT GAME", "EXIT TO MENU"};
+    std::vector<std::string> lines;
+    if (g_quit_ask) {
+        lines.push_back(std::string(kRows[g_quit_ask]) + "?  Unsaved progress will be lost.");
+        lines.push_back(std::string(g_quit_yes ? "> YES   NO" : "  YES > NO"));
+        SetWindowOverlay(lines);
+        return;
+    }
+    for (int r = 0; r < 4; ++r) lines.push_back(std::string(g_quit_row == r ? "> " : "  ") + kRows[r]);
+    SetWindowOverlay(lines);
+}
+
+// SETTINGS (the port's own pages, SetSelectSettings) and EXIT TO MENU (the port's own way to its title,
+// SetExitToMenu; without one the game starts again).
+bool (*g_select_settings)(unsigned held, unsigned pressed) = nullptr;
+bool g_settings_open = false;
+void (*g_exit_to_menu)() = nullptr;
+void SetSelectSettings(bool (*step)(unsigned held, unsigned pressed)) { g_select_settings = step; }
+bool (*g_select_allowed)() = nullptr;      // SetSelectAllowed: where Select opens it (the port's gameplay)
+void SetSelectAllowed(bool (*allowed)()) { g_select_allowed = allowed; }
+bool SelectMenuHere() { return !g_select_allowed || g_select_allowed(); }
+void SetExitToMenu(void (*go)()) { g_exit_to_menu = go; }
+
+void EnableSelectMenu(bool on) { g_select_menu = on; }
+bool SelectMenuOpen() { return g_quit_open; }
+bool SelectToGame() { return !SelectMenuActive(); }
+
+// Each window pump: Select (the pad's or Backspace) opens it; up / down, then Circle or Enter (the game's own
+// confirm: ZOE's); Cross, Select or Esc back to the game. In SETTINGS the port's pages have the input (DS2 bits:
+// 4 up, 5 right, 6 down, 7 left held; 12 triangle, 13 circle, 14 cross pressed) until they close.
+void UpdateSelectMenu() {
+    if (!SelectMenuActive()) {
+        g_quit_open = g_settings_open = false;
+        return;
+    }
+    if (g_open) return;                 // the panel's (BUTTON MAPPING from SETTINGS' CONTROLS) has the input
+    // The game's inputs through the player's bindings (BUTTON MAPPING, a port's SwapDefaults): the menu follows
+    // what is bound to Select, the directions, Circle, Cross, Triangle; Esc goes back too.
+    const u16 bound = BoundButtonsNow();
+    auto button = [&](int bit) { return ((bound >> bit) & 1) != 0; };
+    const bool select = button(0), up = button(4), down = button(6), left = button(7), right = button(5),
+               accept = button(13), back = button(14) || (WindowFocused() && HostKeyDown(key::kEscape)),
+               deflt = button(12);
+    static bool before[7] = {};
+    const bool now[7] = {select, up, down, accept, back, left, right};
+    // PS2HOST_SELECT_MENU_TEST=<pump>[,<row>[,open]] (a scripted run's look at it): opened at that window pump on
+    // that row (",open": SETTINGS' pages too, their first page drawn), closed 90 pumps later.
+    static const long long test_at = std::getenv("PS2HOST_SELECT_MENU_TEST")
+                                         ? std::atoll(std::getenv("PS2HOST_SELECT_MENU_TEST")) : -1;
+    static long long pumps = 0;
+    if (test_at >= 0) {
+        ++pumps;
+        if (pumps == test_at) {
+            const char* comma = std::strchr(std::getenv("PS2HOST_SELECT_MENU_TEST"), ',');
+            g_quit_open = true;
+            g_quit_row = comma ? std::atoi(comma + 1) % 4 : 0;
+            g_quit_ask = std::strstr(std::getenv("PS2HOST_SELECT_MENU_TEST"), ",ask") && g_quit_row >= 2 ? g_quit_row : 0;
+            g_quit_yes = false;
+            DrawQuit();
+            if (std::strstr(std::getenv("PS2HOST_SELECT_MENU_TEST"), ",open") && g_select_settings) {
+                g_settings_open = true;
+                g_select_settings(0, 0);
+            }
+            if (std::strstr(std::getenv("PS2HOST_SELECT_MENU_TEST"), ",map")) OpenPcMenuControls();   // BUTTON MAPPING
+            if (std::strstr(std::getenv("PS2HOST_SELECT_MENU_TEST"), ",exit") && g_exit_to_menu) {
+                g_exit_to_menu();                                   // EXIT TO MENU at once, the menu closed
+                g_quit_open = false;
+                CloseQuitLook();
+            }
+        } else if (pumps == test_at + 90 && g_quit_open) {
+            if (g_settings_open) g_select_settings(0, 1u << 14);    // its pages closed (Cross)
+            g_quit_open = g_settings_open = false;
+            CloseQuitLook();
+        }
+        if (pumps >= test_at && pumps <= test_at + 90) return;
+    }
+    if (g_settings_open) {
+        for (int i = 0; i < 7; ++i) before[i] = now[i];         // (back on the menu: no press carried over)
+        static bool seen[4] = {};
+        const bool press[4] = {accept, back || select, deflt, false};
+        unsigned pressed = 0;
+        if (press[0] && !seen[0]) pressed |= 1u << 13;
+        if (press[1] && !seen[1]) pressed |= 1u << 14;
+        if (press[2] && !seen[2]) pressed |= 1u << 12;
+        for (int i = 0; i < 3; ++i) seen[i] = press[i];
+        const unsigned held = (up ? 1u << 4 : 0) | (right ? 1u << 5 : 0) | (down ? 1u << 6 : 0) | (left ? 1u << 7 : 0);
+        if (!g_select_settings(held, pressed)) {
+            g_settings_open = false;
+            DrawQuit();
+        }
+        return;
+    }
+    auto went_down = [&](int i) { return now[i] && !before[i]; };
+    if (g_quit_open && g_quit_ask) {
+        // EXIT GAME / EXIT TO MENU asked (the maintainer 2026-11-21: in the game an exit asks first): left / right
+        // (up / down too) between YES and NO, Circle takes it, Cross / Select / Esc back to the menu.
+        if (went_down(1) || went_down(2) || went_down(5) || went_down(6)) {
+            g_quit_yes = !g_quit_yes;
+            DrawQuit();
+        } else if (went_down(0) || went_down(4) || (went_down(3) && !g_quit_yes)) {
+            g_quit_ask = 0;
+            DrawQuit();
+        } else if (went_down(3)) {
+            const int ask = g_quit_ask;
+            g_quit_ask = 0;
+            g_quit_open = false;
+            g_releasing = true;
+            CloseQuitLook();
+            if (ask == 2) {
+                QuitGame();
+            } else {
+                if (g_exit_to_menu) g_exit_to_menu();           // the port's way to its title
+                else RequestRestart();                          // none: the game started again (it quits too)
+            }
+        }
+        for (int i = 0; i < 7; ++i) before[i] = now[i];
+        return;
+    }
+    if (!g_quit_open) {
+        if (went_down(0) && !g_open && (!g_select_allowed || g_select_allowed())) {
+            g_quit_open = true;
+            g_quit_row = 0;
+            g_quit_ask = 0;
+            DrawQuit();
+        }
+    } else if (went_down(0) || went_down(4)) {
+        g_quit_open = false;
+        g_releasing = true;             // the game gets no input until all is let go
+        CloseQuitLook();
+    } else if (went_down(1) || went_down(2)) {
+        g_quit_row = (g_quit_row + (went_down(2) ? 1 : 3)) % 4;
+        DrawQuit();
+    } else if (went_down(3)) {
+        if (g_quit_row == 1 && g_select_settings) {            // SETTINGS: the port's pages from here on
+            g_settings_open = true;
+            g_select_settings(0, 0);
+            for (int i = 0; i < 7; ++i) before[i] = now[i];
+            return;
+        }
+        if (g_quit_row == 2 || g_quit_row == 3) {               // asked first (YES / NO, NO chosen)
+            g_quit_ask = g_quit_row;
+            g_quit_yes = false;
+            DrawQuit();
+            for (int i = 0; i < 7; ++i) before[i] = now[i];
+            return;
+        }
+        g_quit_open = false;
+        g_releasing = true;
+        CloseQuitLook();
+    }
+    for (int i = 0; i < 7; ++i) before[i] = now[i];
+}
+
+bool PcMenuOpen() { return g_open || g_releasing || g_quit_open; }
+
+bool PcPanelOpen() { return g_open; }
+
+void AddDebugLine(const std::string& label, std::string (*get)(), void (*step)(int)) {
+    DebugLines().push_back({label, get, step});
+}
 
 void OpenPcMenu() {
     if (g_open) return;
@@ -729,8 +1033,15 @@ void UpdatePcMenu() {
 }
 
 void OpenPcMenuControls() {
+    g_port_controls = g_controls_look != nullptr;      // (before the page is first drawn)
     OpenPcMenu();
+    if (g_port_controls) SetWindowOverlay({});         // (the panel's main page OpenPcMenu drew: not shown here)
     OpenControls();
+    g_controls_only = true;
+}
+
+void SetControlsLook(void (*draw)(bool open, const std::vector<ControlsLine>& lines, int row)) {
+    g_controls_look = draw;
 }
 
 }  // namespace ps2host

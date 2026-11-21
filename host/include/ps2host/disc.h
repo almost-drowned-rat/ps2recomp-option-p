@@ -5,7 +5,8 @@
  *
  * An image is an .iso (2048-byte sectors, a DVD's usual form) or a raw CD image
  * (.bin of 2352-byte sectors: sync, header, Mode 1 data at 16 or Mode 2 data at
- * 24), opened directly or through the .cue sheet naming it.
+ * 24), opened directly or through the .cue sheet naming it, or a CHD (MAME's
+ * compressed hunks, chdman createdvd / createcd; read through libchdr, BSD-3).
  */
 
 #ifndef PS2HOST_DISC_H
@@ -36,7 +37,7 @@ public:
     /* Use an image held in memory instead (the host's own tests): 2048-byte
        sectors, or raw 2352-byte ones when it starts with a sector's sync. */
     void Use(std::vector<u8> image);
-    bool IsOpen() const { return file_ != nullptr || !memory_.empty(); }
+    bool IsOpen() const { return file_ != nullptr || !memory_.empty() || chd_ != nullptr; }
     /* A CD rather than a DVD: a raw image, or an .iso small enough for a CD. */
     bool IsCd() const;
 
@@ -49,7 +50,10 @@ public:
        reaches as far). A later map over the same sectors wins; ClearMaps drops them all. */
     void MapSectors(u32 lsn, u32 count, Disc* source, u32 source_lsn);
     void MapBytes(u32 lsn, std::vector<u8> bytes);
-    void ClearMaps() { maps_.clear(); }
+    void ClearMaps();
+    /* (Maps may change while the game reads - a port's SELECT / debug line remapping a scene: one lock for all of
+       them, recursive, a map's source read within it.) The first sector of the last Read / ReadPattern. */
+    u32 LastReadLsn() const { return last_lsn_; }
     /* The disc's sectors: the image's, or as far as a map reaches. */
     u32 Sectors() const;
     /* Read sectors as sceCdRead's data pattern asks: 2048 bytes (0), 2328 (1:
@@ -82,9 +86,18 @@ private:
 
     std::FILE* file_ = nullptr;
     std::vector<u8> memory_;
+    // A CHD: its file (libchdr's chd_file), a hunk's bytes, a unit's (2048 a DVD's sector, 2448 a CD's frame:
+    // 2352 + 96 subcode - read as 2352-byte raw sectors), the hunk last read kept.
+    void* chd_ = nullptr;
+    u32 chd_hunk_bytes_ = 0, chd_unit_bytes_ = 0, chd_sector_bytes_ = 0;
+    std::vector<u8> chd_hunk_;
+    u32 chd_hunk_index_ = ~0u;
+    bool ReadChd(u64 offset, u64 length, u8* out);
+    void CloseImage();
     u64 size_ = 0;
     u32 data_offset_ = 0;       // within a raw sector: 16 (Mode 1), 24 (Mode 2); 0 for an .iso
     u32 sectors_ = 0;
+    u32 last_lsn_ = 0;          // LastReadLsn
 };
 
 /* The disc the running game reads. */

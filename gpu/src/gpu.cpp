@@ -88,6 +88,11 @@ bool VulkanGpu::Init(std::string* error) {
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
+    // The shaders' discard (gs.frag's alpha test, SPIR-V 1.6) is a demote to a helper invocation: Vulkan 1.3
+    // has it, but only enabled is it defined (the validation layer: VUID-VkShaderModuleCreateInfo-pCode-08740).
+    // Suspected for 2026-11-20 issue 14 (subtitle glyphs wrong on RADV only; Nvidia and AMD's Windows driver
+    // draw them right) - to be confirmed on RADV.
+    v13.shaderDemoteToHelperInvocation = VK_TRUE;
     // Dual-source blending: the GS's blend factor (source alpha or FIX, where
     // 0x80 is 1.0) is a second fragment output, not the alpha written.
     VkPhysicalDeviceFeatures supported;

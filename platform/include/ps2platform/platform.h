@@ -88,6 +88,9 @@ int CompareNoCase(const char* a, const char* b);
 void AttachTerminal();
 // stdout and stderr to `log` (truncated), unbuffered: a windowed run's log beside the game.
 void RedirectOutput(const std::string& log);
+// The machine for a log's head, a line each (the maintainer 2026-11-20, issue 10): the OS and its version (Wine's
+// and Proton's under Wine), the processor, its threads, the memory, the power plan.
+std::vector<std::string> SystemReport();
 // The same program started again with the same command line (RECOMP OPTIONS' RESTART NOW); false if it failed.
 bool RestartSelf();
 // The process ended at once with `code`, nothing torn down (main.cpp says why).

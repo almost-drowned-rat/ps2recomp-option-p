@@ -7,6 +7,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <utility>
+#include <vector>
 
 #include "ps2host/settings.h"
 
@@ -68,14 +70,31 @@ bool Reset() {
 
 int Controls(Kind kind) { return kind == Kind::kKeyboard ? kControls : kPadControls; }
 
+namespace {
+std::vector<std::pair<int, int>>& Swaps() {     // SwapDefaults'
+    static std::vector<std::pair<int, int>> swaps;
+    return swaps;
+}
+void ApplySwaps(Map* m) {
+    for (const auto& [a, b] : Swaps())
+        for (int i = 0; i < kSources; ++i) std::swap(m->src[a][i], m->src[b][i]);
+}
+}  // namespace
+
+void SwapDefaults(int a, int b) {
+    if (a >= 0 && b >= 0 && a < kPadControls && b < kPadControls) Swaps().push_back({a, b});
+}
+
 void KeyboardDefault(Map* m) {
     *m = Map{};
     for (int c = 0; c < kControls; ++c) m->src[c][0] = kKeyboardDefault[c];
+    ApplySwaps(m);
 }
 
 void PadDefault(Map* m) {
     *m = Map{};
     for (int c = 0; c < kPadControls; ++c) m->src[c][0] = PadSource(c);
+    ApplySwaps(m);
 }
 
 const char* ControlName(int control) { return control >= 0 && control < kControls ? kControlNames[control] : "?"; }

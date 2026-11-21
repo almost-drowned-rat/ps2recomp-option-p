@@ -1,8 +1,12 @@
 #include "ps2host/disc.h"
 
+#include "libchdr/cdrom.h"
+#include "libchdr/chd.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cstring>
+#include <mutex>
 #include <string>
 
 namespace ps2host {
@@ -26,8 +30,15 @@ std::string Bare(std::string name) {
 
 }  // namespace
 
-Disc::~Disc() {
+Disc::~Disc() { CloseImage(); }
+
+void Disc::CloseImage() {
     if (file_) std::fclose(file_);
+    file_ = nullptr;
+    if (chd_) chd_close(static_cast<chd_file*>(chd_));
+    chd_ = nullptr;
+    chd_hunk_.clear();
+    chd_hunk_index_ = ~0u;
 }
 
 namespace {
@@ -68,10 +79,27 @@ u8 ToBcd(u32 v) { return u8((v / 10) << 4 | (v % 10)); }
 }  // namespace
 
 bool Disc::Open(const std::string& path) {
-    if (file_) std::fclose(file_);
-    file_ = nullptr;
+    CloseImage();
     memory_.clear();
     std::string image = path;
+    if (image.size() > 4 && Upper(image.substr(image.size() - 4)) == ".CHD") {
+        chd_file* chd = nullptr;
+        if (chd_open(image.c_str(), CHD_OPEN_READ, nullptr, &chd) != CHDERR_NONE || !chd) return false;
+        const chd_header* h = chd_get_header(chd);
+        if (!h || !h->hunkbytes || !h->unitbytes || h->hunkbytes % h->unitbytes) {
+            chd_close(chd);
+            return false;
+        }
+        chd_ = chd;
+        chd_hunk_bytes_ = h->hunkbytes;
+        chd_unit_bytes_ = h->unitbytes;
+        // A CD's frame (2448: 2352 + 96 subcode) read as a raw sector; a DVD's unit is its 2048-byte sector.
+        chd_sector_bytes_ = chd_unit_bytes_ == CD_FRAME_SIZE ? kRawSectorSize : chd_unit_bytes_;
+        size_ = (h->logicalbytes / chd_unit_bytes_) * chd_sector_bytes_;
+        chd_hunk_.resize(chd_hunk_bytes_);
+        DetectFormat();
+        return true;
+    }
     if (image.size() > 4 && Upper(image.substr(image.size() - 4)) == ".CUE") {
         image = CueImage(path);
         if (image.empty()) return false;
@@ -106,8 +134,32 @@ bool Disc::IsCd() const {
     return data_offset_ != 0 || sectors_ <= 360000;
 }
 
+// A CHD's bytes as the plain image would hold them: each sector's unit found in its hunk (decompressed once, the
+// last kept - reads go on sector by sector).
+bool Disc::ReadChd(u64 offset, u64 length, u8* out) {
+    while (length) {
+        const u64 sector = offset / chd_sector_bytes_, inner = offset % chd_sector_bytes_;
+        const u64 take = std::min<u64>(length, chd_sector_bytes_ - inner);
+        const u64 source = sector * chd_unit_bytes_ + inner;
+        const u32 hunk = u32(source / chd_hunk_bytes_), at = u32(source % chd_hunk_bytes_);
+        if (hunk != chd_hunk_index_) {
+            if (chd_read(static_cast<chd_file*>(chd_), hunk, chd_hunk_.data()) != CHDERR_NONE) {
+                chd_hunk_index_ = ~0u;
+                return false;
+            }
+            chd_hunk_index_ = hunk;
+        }
+        std::memcpy(out, &chd_hunk_[at], std::size_t(take));
+        out += take;
+        offset += take;
+        length -= take;
+    }
+    return true;
+}
+
 bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
     if (offset + length > size_) return false;
+    if (chd_) return ReadChd(offset, length, out);
     if (!memory_.empty()) {
         std::memcpy(out, memory_.data() + offset, size_t(length));
         return true;
@@ -116,8 +168,18 @@ bool Disc::ReadBytes(u64 offset, u64 length, u8* out) {
     return std::fread(out, 1, size_t(length), file_) == length;
 }
 
+namespace {
+std::recursive_mutex g_maps_lock;           // every Disc's maps (disc.h): changed while the game reads
+}  // namespace
+
+void Disc::ClearMaps() {
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
+    maps_.clear();
+}
+
 void Disc::MapSectors(u32 lsn, u32 count, Disc* source, u32 source_lsn) {
     if (!count || !source) return;
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
     SectorMap m;
     m.lsn = lsn;
     m.count = count;
@@ -133,10 +195,12 @@ void Disc::MapBytes(u32 lsn, std::vector<u8> bytes) {
     m.count = u32((bytes.size() + kSectorSize - 1) / kSectorSize);
     bytes.resize(std::size_t(m.count) * kSectorSize, 0);
     m.bytes = std::move(bytes);
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
     maps_.push_back(std::move(m));
 }
 
 u32 Disc::Sectors() const {
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
     u32 end = sectors_;
     for (const SectorMap& m : maps_) end = std::max(end, m.lsn + m.count);
     return end;
@@ -150,7 +214,9 @@ const Disc::SectorMap* Disc::MapOf(u32 lsn) const {
 }
 
 bool Disc::Read(u32 lsn, u32 count, u8* out) {
+    last_lsn_ = lsn;
     if (maps_.empty()) return ReadOwn(lsn, count, out);
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
     if (u64(lsn) + count > Sectors()) return false;
     // Run by run: the image's own sectors read together, a mapped one from its map.
     for (u32 i = 0; i < count;) {
@@ -188,6 +254,8 @@ bool Disc::ReadOwn(u32 lsn, u32 count, u8* out) {
 
 bool Disc::ReadPattern(u32 lsn, u32 count, u32 pattern, u8* out) {
     if (pattern != 1 && pattern != 2) return Read(lsn, count, out);
+    last_lsn_ = lsn;
+    std::lock_guard<std::recursive_mutex> hold(g_maps_lock);
     if (u64(lsn) + count > Sectors()) return false;
     const u32 size = PatternSize(pattern);
     // 2340 starts at the header (offset 12), 2328 after the subheader (24).

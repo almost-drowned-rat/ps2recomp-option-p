@@ -2901,13 +2901,29 @@ std::atomic<u32> g_replay_scale{0};     // GpuSetScale's (a GS replay's): the se
 ps2gpu::GsScale g_good;                 // the last scale that ran a frame without a failed image
 }  // namespace
 
+// An FSR preset's size (UPSCALING FSR QUALITY / BALANCED / PERFORMANCE, the maintainer 2026-11-20): the shown
+// picture's size over the preset's ratio, in steps of 16 (a window dragged does not draw anew at each pixel);
+// 0 x 0 for none or before the first picture.
+RenderSize FsrPresetSize() {
+    const float ratio = FsrPresetRatio();
+    u32 w = 0, h = 0;
+    if (ratio > 0.0f) WindowShownSize(&w, &h);
+    if (!w || !h) return {};
+    auto step = [&](u32 v) { return std::max(16u, (u32(float(v) / ratio + 8.0f) / 16u) * 16u); };
+    return {step(w), step(h)};
+}
+
 ps2gpu::GsScale WantedScale() {
     if (const u32 q = g_replay_scale.load()) return ScaleFor(q);
+    const RenderSize preset = FsrPresetSize();
+    if (preset.w) return ScaleOfSize(preset, 1);
     const std::vector<RenderSize> sizes = RenderSizes();
     return ScaleOfSize(sizes[RenderSizeIndex(sizes)], SupersamplingFactor());
 }
 
 std::string RenderResolutionText() {
+    const RenderSize preset = FsrPresetSize();
+    if (preset.w) return "FSR " + std::to_string(preset.w) + "X" + std::to_string(preset.h);
     const std::vector<RenderSize> sizes = RenderSizes();
     const RenderSize& s = sizes[RenderSizeIndex(sizes)];
     if (s.w) return std::to_string(s.w) + "X" + std::to_string(s.h);
@@ -2966,6 +2982,11 @@ void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
             const ps2gpu::GsScale k = g_bridge->renderer->Scale();
             const u32 lines = std::min(gs::TheGs().ShownLines(), 448u);    // 224 in field mode
             const u32 sw = std::min(w, ps2gpu::ScaleSize(640u, k.x)), sh = std::min(h, ps2gpu::ScaleSize(lines, k.y));
+            // Drawn larger, the first PS2 column and row are only half drawn where a game's picture ends at 0.0
+            // (ZOE: its scene's geometry stops there, the rest of the column an earlier picture - 2026-11-20
+            // issue 11, a band down the left and top edges): half a PS2 pixel left out of what is shown.
+            display.SetPictureCrop(k.x > kOne ? (k.x + 2 * kOne - 1) / (2 * kOne) : 0u,
+                                   k.y > kOne ? (k.y + 2 * kOne - 1) / (2 * kOne) : 0u);
             if (due_ns) display.PresentImageAt(image, layout, sw, sh, due_ns);
             else display.PresentImage(image, layout, sw, sh);
             return;
@@ -3220,11 +3241,26 @@ std::string GpuCaptureScreen(const std::string& dir) {
     u32 w = 0, h = 0;
     char text[160];
     const ps2gpu::GsScale k = s.renderer->Scale();
+    // The lines the picture has (224 for a game drawing fields: ZOE), each written twice then - the picture as the
+    // window shows it, not squeezed into the top half of a 448-line one (his session 2026-11-20).
+    const u32 lines = std::min(gs::TheGs().ShownLines(), 448u);
+    const bool fields = lines >= 64 && lines < 300;
+    auto write = [&](const std::string& path, u32 cw, u32 ch) {
+        if (!fields) {
+            WriteBmp(path, pixels, w, cw, ch);
+            return;
+        }
+        std::vector<u32> doubled(std::size_t(cw) * ch * 2);
+        for (u32 y = 0; y < ch; ++y)
+            for (u32 r = 0; r < 2; ++r)
+                std::memcpy(&doubled[(std::size_t(y) * 2 + r) * cw], &pixels[std::size_t(y) * w], std::size_t(cw) * 4);
+        WriteBmp(path, doubled, cw, cw, ch * 2);
+    };
     if (s.renderer->ReadTargetFull(fbp, fbw, psm, &pixels, &w, &h))
-        WriteBmp(dir + "/screen.bmp", pixels, w, std::min(w, ps2gpu::ScaleSize(640u, k.x)),
-                 std::min(h, ps2gpu::ScaleSize(448u, k.y)));
+        write(dir + "/screen.bmp", std::min(w, ps2gpu::ScaleSize(640u, k.x)),
+              std::min(h, ps2gpu::ScaleSize(fields ? lines : 448u, k.y)));
     if (s.renderer->ReadTarget(fbp, fbw, psm, &pixels, &w, &h))
-        WriteBmp(dir + "/screen_1x.bmp", pixels, w, std::min(w, 640u), std::min(h, 448u));
+        write(dir + "/screen_1x.bmp", std::min(w, 640u), std::min(h, fields ? lines : 448u));
     std::snprintf(text, sizeof text, "shown: FBP %X FBW %u PSM %02X; internal resolution %.3fx %.3fx", unsigned(fbp),
                   unsigned(fbw), unsigned(psm), k.x / double(kOne), k.y / double(kOne));
     return text;

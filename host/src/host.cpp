@@ -841,6 +841,9 @@ int Run(const Options& options) {
         }
         LoadSettings((where / "pc_settings.ini").string());
     }
+    // A log's head (the maintainer 2026-11-20, issue 10): the machine, then the settings the run starts with.
+    for (const std::string& line : ps2platform::SystemReport()) std::fprintf(stderr, "[system] %s\n", line.c_str());
+    LogSettings();
     g_fast_disc = options.fast_disc || (!options.virtual_time && SettingOn("fast_loading", g_fast_loading_default));
     if (g_fast_disc) std::fprintf(stderr, "[host] disc reads fast (no drive time)\n");
     // --setting KEY=VALUE: a scripted run's own (a wider picture), for this run.

@@ -12,7 +12,7 @@ if(NOT TARGET ps2platform)
         # Windows 10's API (SetThreadInformation / SetProcessInformation: the power throttling turned off,
         # high-resolution waitable timers); WaitOnAddress, timeBeginPeriod, the open-file dialog.
         target_compile_definitions(ps2platform PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
-        target_link_libraries(ps2platform PRIVATE synchronization winmm comdlg32 gdi32 user32 ole32)
+        target_link_libraries(ps2platform PRIVATE synchronization winmm comdlg32 gdi32 user32 ole32 advapi32)
     else()
         message(FATAL_ERROR "ps2platform: no platform layer for ${CMAKE_SYSTEM_NAME} yet - "
                             "src/platform_<system>.cpp implements include/ps2platform/platform.h and keys.h "

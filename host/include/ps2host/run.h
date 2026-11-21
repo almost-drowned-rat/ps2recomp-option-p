@@ -270,6 +270,10 @@ unsigned FastForward();
 /* Real time: when the last vertical blank was due (ClockNs), on the timer's
    own grid - not when the EE took it, which it does at its next loop head. */
 u64 LastVblankNs();
+/* A movie's whole-screen picture handed to the game (sdk.cpp's native sceMpegGetPicture): NoteMoviePicture marks
+   it, LastMoviePictureNs says when (LastVblankNs's clock; 0 never) - a port showing movies alone 4:3. */
+void NoteMoviePicture();
+u64 LastMoviePictureNs();
 /* The calling thread runs the game in real time (the EE's, the GS thread,
    VIF1's worker): Windows is asked not to slow it for power (on a hybrid
    processor, not to park it on an efficiency core) and to run it above
@@ -337,6 +341,9 @@ void PresentFrame();
 /* The window's events alone (PresentFrame without the picture, which the GS
    thread presents): false once it has been closed. */
 bool PumpWindow();
+/* SELECT's menu open: the game held here (the frame's window pump, devices.cpp) until it closes; false when the
+   window closed meanwhile. */
+bool HoldForSelectMenu();
 /* Fullscreen on or off (saved as the "fullscreen" setting, settings.h, which
    the window opens with); and whether it is. */
 void SetWindowFullscreen(bool on);
@@ -364,8 +371,16 @@ void SetWindowAntiAliasing(const std::string& mode);
 u32 SupersamplingFactor();
 /* Upscaling (the "upscaling" setting): "linear", the default - a picture
    drawn smaller than shown filtered bilinearly up to the window - or
-   "fsr1", AMD's FSR 1 (its edge-adaptive upscale and sharpening). */
+   "fsr1", AMD's FSR 1 (its edge-adaptive upscale and sharpening). Under it FSR PRESET ("fsr_preset"):
+   quality (default) / balanced / performance - drawing at the shown size / 1.5, 1.7, 2.0 (FsrPresetRatio;
+   gpu_bridge's WantedScale; RENDER RESOLUTION's own size then unused). FSR SHARPNESS: "fsr_sharpness" low / medium /
+   high (default) / max. */
 void SetWindowUpscaling(const std::string& mode);
+void SetWindowFsrSharpness(const std::string& level);
+float FsrSharpnessStops();
+float FsrPresetRatio();
+/* The picture's size in the window as last shown (0 x 0 before the first, or without a window). */
+void WindowShownSize(u32* width, u32* height);
 /* BLOOM (porting guide 4b; off by default): the "bloom" setting on / off and "bloom_strength" 1-10 (5) -
    BloomStrength() 0 when off; ApplyBloomSetting() hands it to the display at once. */
 int BloomStrength();
@@ -391,6 +406,7 @@ struct GameText {
     u32 colour = 0xFFFFFF;
     bool right = false;
     float stretch = 1.0f;       // the letters' width times this (a game's wider lettering: ZOE's menu ~1.2)
+    bool centre = false;        // x is the text's middle (a subtitle)
     // Instead of the text: a coverage mask (mask_w x mask_h, 0..255) the port built from the game's own lettering
     // (ZOE: RECOMP OPTIONS from its menu's letters), drawn in `colour` into x, y, `width` x `height` (fractions),
     // filtered as the game's own; no edge.
@@ -399,6 +415,12 @@ struct GameText {
     float width = 0;
 };
 void SetGameTexts(const std::vector<GameText>& texts);
+/* A second font for the letters Liberation Sans has not (ZOE's Japanese subtitles: Noto Sans JP, SIL OFL - the port
+   ships it and its licence), the same em size; kept by the caller. */
+void SetGameTextFallbackFont(const unsigned char* data, std::size_t size);
+/* A second layer over SetGameTexts' (a port's subtitles drawn by it - ZOE's Japanese ones): the same lines, shown
+   with whatever SetGameTexts shows; an empty list removes them. */
+void SetGameSubtitleTexts(const std::vector<GameText>& texts);
 bool WidescreenSupported();
 float WideAspect();
 int FieldOfViewExtra();
@@ -414,6 +436,47 @@ void SetWindowOverlay(const std::vector<std::string>& lines);
    is open the game gets no input (PcMenuOpen). */
 void UpdatePcMenu();
 bool PcMenuOpen();
+/* SELECT's menu (the maintainer 2026-11-21): a port whose game leaves Select unused turns it on - Select then
+   opens EXIT GAME / EXIT TO MENU (the game started again: its title) / BACK over the picture, the game held still
+   meanwhile, and the game never sees Select. The internal "select" setting "stock" (pc_settings.ini only) gives
+   Select back to the game. */
+void EnableSelectMenu(bool on);
+/* The port draws SELECT's menu in its game's own look (the maintainer 2026-11-20: as if the game's) - called with
+   the row (0 RESUME, 1 SETTINGS, 2 EXIT GAME, 3 EXIT TO MENU) whenever it opens or moves, and open = false as it
+   closes; an exit asked first (YES / NO, NO chosen at first): row 4 + 2 * (0 EXIT GAME, 1 EXIT TO MENU) + (0 YES,
+   1 NO). Without it, overlay lines. */
+void SetSelectMenuLook(void (*draw)(bool open, int row));
+/* BUTTON MAPPING in a port's own look (the maintainer 2026-11-21: a port's menus look like its game's): opened from
+   its page (OpenPcMenuControls) the engine keeps the page's logic - rows, binding, capture - and calls `draw` with
+   its lines (DEVICE, RESET TO DEFAULT, each input with its source; capture: "PRESS A KEY / BUTTON") and the row
+   chosen, open = false as it closes; Circle chooses, Cross goes back, no Back row. */
+struct ControlsLine {
+    std::string label, value;
+    bool capture = false, doubled = false;
+};
+void SetControlsLook(void (*draw)(bool open, const std::vector<ControlsLine>& lines, int row));
+/* SELECT's rows (the maintainer 2026-11-20): RESUME, SETTINGS, EXIT GAME, EXIT TO MENU (row 0-3). SETTINGS: the
+   port's pages - `step` each window pump with the input as DS2 bits (held: 4 up, 5 right, 6 down, 7 left; pressed:
+   12 triangle, 13 circle, 14 cross), first with none (open them); false when they closed (back on SELECT's menu).
+   EXIT TO MENU: the port's way to its title (without one the game starts again). */
+void SetSelectSettings(bool (*step)(unsigned held, unsigned pressed));
+void SetExitToMenu(void (*go)());
+/* Where Select opens SELECT's menu (the maintainer 2026-11-21: in gameplay only - not the title, menus, movies,
+   loads): the port says so (none: anywhere). */
+void SetSelectAllowed(bool (*allowed)());
+/* Whether Select opens SELECT's menu here (SetSelectAllowed's; elsewhere it is the game's Start: dbc.cpp). */
+bool SelectMenuHere();
+/* The game's inputs held now through the player's bindings (dbc.cpp): bit n the DualShock 2 input n. */
+u16 BoundButtonsNow();
+/* The panel's own page shown (F9, or BUTTON MAPPING opened alone by OpenPcMenuControls) - a port's own pages
+   step back meanwhile. */
+bool PcPanelOpen();
+/* A port's own line on the F9 debug panel (internal: not in a player's build), after its settings: "label < value >",
+   Left / Right step it - the value read each time it is drawn (ZOE: the subtitle timing of the scene playing). */
+void AddDebugLine(const std::string& label, std::string (*get)(), void (*step)(int));
+bool SelectMenuOpen();
+bool SelectToGame();
+void UpdateSelectMenu();
 /* The PC settings for a game's own menu (a port's PC SETTINGS screen): each
    one's short name and value in capitals (RESOLUTION, 2X) and a line of help;
    a texture pack's only when one is loaded. StepPcSetting changes the n-th to

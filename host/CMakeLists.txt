@@ -25,6 +25,7 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/threads.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/iop.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/sdk.cpp
+    ${CMAKE_CURRENT_LIST_DIR}/src/crash_report.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/disc.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/cdvd.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/fileio.cpp
@@ -55,6 +56,16 @@ add_library(ps2host STATIC
     ${CMAKE_CURRENT_LIST_DIR}/src/gpu_bridge.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/boot_video.cpp
     ${CMAKE_CURRENT_LIST_DIR}/src/profile.cpp)
+# CHD disc images (disc.cpp): libchdr (BSD-3-Clause; with lzma - public domain, miniz - MIT, zstd - BSD), vendored
+# unchanged from rtissera/libchdr 47d794151b2b (third_party/libchdr, its LICENSE.txt; LICENSES/libchdr-BSD-3.txt).
+set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+set(INSTALL_STATIC_LIBS OFF CACHE BOOL "" FORCE)
+set(CHDR_VERIFY_BLOCK_CRC OFF CACHE BOOL "" FORCE)
+set(WITH_LZMA_ASM OFF CACHE BOOL "" FORCE)          # (C only: no assembler needed on any toolchain)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/third_party/libchdr ${CMAKE_BINARY_DIR}/libchdr EXCLUDE_FROM_ALL)
+target_link_libraries(ps2host PRIVATE chdr-static)
+target_include_directories(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party/libchdr/include)
+
 # The boot animation's MPEG-1 decoder: pl_mpeg (MIT, vendored unchanged: third_party/pl_mpeg, LICENSES/).
 target_include_directories(ps2host PRIVATE ${CMAKE_CURRENT_LIST_DIR}/third_party)
 # The IOP interpreter names library functions from engine/data/iop_exports.csv,
@@ -132,6 +143,14 @@ if(NOT PS2HOST_TIER_E)
     if(PS2HOST_VULKAN)
         target_compile_definitions(ps2gpu PRIVATE PS2HOST_NO_TIER_E=1)
     endif()
+endif()
+
+# The F9 debug panel (pc_menu.cpp): internal only (the maintainer 2026-11-20) - OFF in a player's build (port.py's
+# llvm-mingw build, the release toolchain, unless PS2_DEBUG_PANEL=on); the player's settings are the game's own
+# RECOMP OPTIONS page.
+option(PS2HOST_DEBUG_PANEL "Build the F9 debug panel in; OFF for a player's build" ON)
+if(NOT PS2HOST_DEBUG_PANEL)
+    target_compile_definitions(ps2host PRIVATE PS2HOST_NO_DEBUG_PANEL=1)
 endif()
 
 # AVX2: three-operand SIMD for the VU's lanes and the rest (6% of a race).
@@ -309,10 +328,18 @@ function(ps2_add_port target)
         if(no_version)
             set(game_version "0.0.0")
         endif()
+        # The crash report's (crash_report.cpp): its zip's name (the target) and the GitHub repository a report goes
+        # to (game.json "release": {"github": "owner/repository"}; none: no GitHub button).
+        string(JSON game_github ERROR_VARIABLE no_github GET ${game_json} release github)
+        if(no_github)
+            set(game_github "")
+        endif()
         target_compile_definitions(${target} PRIVATE PS2HOST_GAME_NAME="${game_name}"
                                                      PS2HOST_GAME_TITLE="${game_title}"
                                                      PS2HOST_GAME_VERSION="${game_version}"
-                                                     PS2HOST_GAME_EXECUTABLE="${game_executable}")
+                                                     PS2HOST_GAME_EXECUTABLE="${game_executable}"
+                                                     PS2HOST_GAME_TARGET="${target}"
+                                                     PS2HOST_GAME_GITHUB="${game_github}")
         # (The disc's file dialog: engine/platform's PickFile, which links what it needs.)
         set(icon ${game_dir}/build/port/icon.ico)
         if(NOT EXISTS ${icon})

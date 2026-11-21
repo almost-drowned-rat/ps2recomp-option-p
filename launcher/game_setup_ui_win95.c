@@ -14,6 +14,7 @@
 #endif
 #include <windows.h>
 #include <commdlg.h>
+#include <shlobj.h>
 
 #include "game_setup_ui.h"
 
@@ -35,13 +36,14 @@
 #define UI_ROW        34
 #define UI_TITLE_H    18
 
-enum { ID_ISO = 100, ID_ISO2, ID_BROWSE = 200, ID_BROWSE2, ID_GO = 300, ID_QUIT };
+enum { ID_ISO = 100, ID_ISO2, ID_TARGET, ID_BROWSE = 200, ID_BROWSE2, ID_BROWSE_TARGET, ID_COPY, ID_GO = 300, ID_QUIT };
 
 struct XrSetupUi {
     wchar_t  title[160];
     wchar_t  extra_label[120];          /* the second disc's line ("" none) */
     int      rows;                      /* disc lines: 1 or 2 */
-    HWND     win, edit, edit2;
+    int      lines;                     /* all lines: the discs', the target folder's, the copy box's */
+    HWND     win, edit, edit2, target, copy;
     HFONT    font, bold, marlett;
     HBRUSH   face;
     HICON    icon;
@@ -146,17 +148,18 @@ static void paint(XrSetupUi *ui)
         DrawTextW(dc, ui->intro, -1, &rect, DT_WORDBREAK);
         SelectObject(dc, old);
     }
-    text(dc, 14, 70, L"Disc image (.iso):", ui->font, K_TEXT);
+    text(dc, 14, 70, L"Disc image (.iso, .chd):", ui->font, K_TEXT);
     if (ui->rows > 1)
         text(dc, 14, 70 + UI_ROW, ui->extra_label, ui->font, K_TEXT);
+    text(dc, 14, 70 + UI_ROW * ui->rows, L"Target folder:", ui->font, K_TEXT);
     /* an etched line above the progress area */
     {
-        const int down = UI_ROW * (ui->rows - 1);
+        const int down = UI_ROW * (ui->lines - 1);
         line(dc, 10, 104 + down, client.right - 10, 104 + down, K_SHADOW);
         line(dc, 10, 105 + down, client.right - 10, 105 + down, K_LIGHT);
     }
     /* the step's text and the progress bar: a sunken groove with navy blocks spread over its whole width */
-    SetRect(&rect, 14, 114 + UI_ROW * (ui->rows - 1), client.right - 14, 146 + UI_ROW * (ui->rows - 1));
+    SetRect(&rect, 14, 114 + UI_ROW * (ui->lines - 1), client.right - 14, 146 + UI_ROW * (ui->lines - 1));
     {
         HGDIOBJ old = SelectObject(dc, ui->font);
         SetBkMode(dc, TRANSPARENT);
@@ -164,7 +167,7 @@ static void paint(XrSetupUi *ui)
         DrawTextW(dc, ui->status, -1, &rect, DT_WORDBREAK);
         SelectObject(dc, old);
     }
-    SetRect(&groove, 14, 152 + UI_ROW * (ui->rows - 1), client.right - 14, 172 + UI_ROW * (ui->rows - 1));
+    SetRect(&groove, 14, 152 + UI_ROW * (ui->lines - 1), client.right - 14, 172 + UI_ROW * (ui->lines - 1));
     FillRect(dc, &groove, ui->face);
     bevel(dc, groove, 0);
     inner_l = groove.left + 3;
@@ -287,12 +290,28 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             memset(&ofn, 0, sizeof ofn);
             ofn.lStructSize = sizeof ofn;
             ofn.hwndOwner = hwnd;
-            ofn.lpstrFilter = L"PS2 disc images (*.iso)\0*.iso\0All files (*.*)\0*.*\0";
+            ofn.lpstrFilter = L"PS2 disc images (*.iso, *.chd)\0*.iso;*.chd\0All files (*.*)\0*.*\0";
             ofn.lpstrFile = path;
             ofn.nMaxFile = MAX_PATH;
             ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
             if (GetOpenFileNameW(&ofn))
                 SetWindowTextW(LOWORD(wp) == ID_BROWSE2 ? ui->edit2 : ui->edit, path);
+            return 0;
+        }
+        case ID_BROWSE_TARGET: {
+            wchar_t path[MAX_PATH] = L"";
+            BROWSEINFOW bi;
+            PIDLIST_ABSOLUTE id;
+            memset(&bi, 0, sizeof bi);
+            bi.hwndOwner = hwnd;
+            bi.lpszTitle = L"The folder the game is installed in:";
+            bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE;
+            id = SHBrowseForFolderW(&bi);
+            if (id) {
+                if (SHGetPathFromIDListW(id, path))
+                    SetWindowTextW(ui->target, path);
+                CoTaskMemFree(id);
+            }
             return 0;
         }
         case ID_GO:
@@ -348,13 +367,14 @@ static int ui_show(XrSetupUi *ui)
     RegisterClassExW(&wc);
     if (ui->rows < 1)
         ui->rows = 1;
+    ui->lines = ui->rows + 2;
     x = (GetSystemMetrics(SM_CXSCREEN) - UI_W) / 2;
-    y = (GetSystemMetrics(SM_CYSCREEN) - (UI_H + UI_ROW * (ui->rows - 1))) / 2;
+    y = (GetSystemMetrics(SM_CYSCREEN) - (UI_H + UI_ROW * (ui->lines - 1))) / 2;
     /* WS_CLIPCHILDREN: the face painted around the buttons and the field, not over them (a repaint of the window
        for the progress would wipe them until they repaint themselves) */
     if (!CreateWindowExW(WS_EX_APPWINDOW, wc.lpszClassName, ui->title,
                          WS_POPUP | WS_MINIMIZEBOX | WS_SYSMENU | WS_CLIPCHILDREN, x, y,
-                         UI_W, UI_H + UI_ROW * (ui->rows - 1), NULL, NULL, wc.hInstance, ui)) {
+                         UI_W, UI_H + UI_ROW * (ui->lines - 1), NULL, NULL, wc.hInstance, ui)) {
         ui->failed = 1;
         return 0;
     }
@@ -366,8 +386,16 @@ static int ui_show(XrSetupUi *ui)
                           ID_ISO2);
         child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, 67 + UI_ROW, 76, 22, ID_BROWSE2);
     }
+    /* the target folder (issue 12: everything of the game in one folder of the player's choice) and the copy box
+       (issue 17: the disc images copied into its game\ folder - the game stays whole when the images move) */
+    ui->target = child(ui, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, WS_EX_CLIENTEDGE, 170, 67 + UI_ROW * ui->rows, 250,
+                       21, ID_TARGET);
+    child(ui, L"BUTTON", L"Browse...", BS_OWNERDRAW | WS_TABSTOP, 0, 428, 67 + UI_ROW * ui->rows, 76, 22,
+          ID_BROWSE_TARGET);
+    ui->copy = child(ui, L"BUTTON", L"Copy the disc image into the target folder (game\\)",
+                     BS_AUTOCHECKBOX | WS_TABSTOP, 0, 170, 68 + UI_ROW * (ui->rows + 1), 334, 18, ID_COPY);
     {
-        const int bottom = UI_H + UI_ROW * (ui->rows - 1) - 46;
+        const int bottom = UI_H + UI_ROW * (ui->lines - 1) - 46;
         child(ui, L"BUTTON", L"Go", BS_OWNERDRAW | WS_TABSTOP, 0, UI_W - 184, bottom, 80, 24, ID_GO);
         child(ui, L"BUTTON", L"Quit", BS_OWNERDRAW | WS_TABSTOP, 0, UI_W - 96, bottom, 80, 24, ID_QUIT);
     }
@@ -394,13 +422,16 @@ static void enable_page(XrSetupUi *ui, BOOL on)
         EnableWindow(ui->edit2, on);
         EnableWindow(GetDlgItem(ui->win, ID_BROWSE2), on);
     }
+    EnableWindow(ui->target, on);
+    EnableWindow(GetDlgItem(ui->win, ID_BROWSE_TARGET), on);
+    EnableWindow(ui->copy, on);
     EnableWindow(GetDlgItem(ui->win, ID_GO), on);
 }
 
 int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, const char *note,
-                     const char *extra_label, char *extra, size_t extra_n)
+                     const char *extra_label, char *extra, size_t extra_n, char *target, size_t target_n, int *copy)
 {
-    wchar_t disc[160], path[MAX_PATH * 2], path2[MAX_PATH * 2], noted[300];
+    wchar_t disc[160], path[MAX_PATH * 2], path2[MAX_PATH * 2], noted[300], folder[MAX_PATH * 2];
     if (!ui || xr_no_dialogs())
         return -1;
     if (!ui->win && extra_label && *extra_label && extra) {     /* the second line: before the window is made */
@@ -422,6 +453,9 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
         widen(extra, path2, MAX_PATH * 2);
         SetWindowTextW(ui->edit2, path2);
     }
+    widen(target, folder, MAX_PATH * 2);
+    SetWindowTextW(ui->target, folder);
+    SendMessageW(ui->copy, BM_SETCHECK, copy && *copy ? BST_CHECKED : BST_UNCHECKED, 0);
     enable_page(ui, TRUE);
     SetFocus(GetDlgItem(ui->win, ID_GO));
     InvalidateRect(ui->win, NULL, FALSE);
@@ -432,8 +466,14 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
         if (ui->form_result == 1) {
             GetWindowTextW(ui->edit, path, MAX_PATH * 2);
             if (!path[0] || GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) {
-                MessageBoxW(ui->win, L"Please choose your disc image (.iso) with Browse...", ui->title,
+                MessageBoxW(ui->win, L"Please choose your disc image (.iso, .chd) with Browse...", ui->title,
                             MB_OK | MB_ICONSTOP);
+                ui->form_result = -1;
+                continue;
+            }
+            GetWindowTextW(ui->target, folder, MAX_PATH * 2);
+            if (!folder[0]) {
+                MessageBoxW(ui->win, L"Please choose the target folder with Browse...", ui->title, MB_OK | MB_ICONSTOP);
                 ui->form_result = -1;
                 continue;
             }
@@ -460,6 +500,10 @@ int xr_setup_ui_form(XrSetupUi *ui, const char *disc_name, char *iso, size_t n, 
     if (extra && extra_n && !WideCharToMultiByte(CP_UTF8, 0, ui->edit2 ? path2 : L"", -1, extra, (int)extra_n, NULL,
                                                  NULL))
         extra[0] = 0;
+    if (target && target_n && !WideCharToMultiByte(CP_UTF8, 0, folder, -1, target, (int)target_n, NULL, NULL))
+        target[0] = 0;
+    if (copy)
+        *copy = SendMessageW(ui->copy, BM_GETCHECK, 0, 0) == BST_CHECKED;
     enable_page(ui, FALSE);
     _snwprintf(ui->intro, 400, L"The game is being built from your %ls disc - this happens only once.", disc);
     ui->intro[399] = 0;

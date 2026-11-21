@@ -36,6 +36,29 @@ const Font& TheFont() {
     return font;
 }
 
+// A port's second font for the letters Liberation Sans has not (SetGameTextFallbackFont: ZOE's Japanese subtitles,
+// Noto Sans JP), scaled to the same em.
+struct Fallback {
+    stbtt_fontinfo info{};
+    bool ok = false;
+    float em_ratio = 1.0f;      // its units to Liberation's (the same em size)
+};
+Fallback& TheFallback() {
+    static Fallback f;
+    return f;
+}
+
+// The font a code point is drawn with, and the scale factor to Liberation's units.
+const stbtt_fontinfo& FontOf(const Font& f, int cp, float* ratio) {
+    const Fallback& fb = TheFallback();
+    *ratio = 1.0f;
+    if (fb.ok && cp >= 0x80 && !stbtt_FindGlyphIndex(&f.info, cp) && stbtt_FindGlyphIndex(&fb.info, cp)) {
+        *ratio = fb.em_ratio;
+        return fb.info;
+    }
+    return f.info;
+}
+
 // UTF-8 to code points (a malformed byte stands for itself).
 std::vector<int> CodePoints(const std::string& s) {
     std::vector<int> out;
@@ -70,9 +93,11 @@ float Advance(const Font& f, const std::vector<int>& cps, float scale) {
     float x = 0;
     for (std::size_t i = 0; i < cps.size(); ++i) {
         int advance, bearing;
-        stbtt_GetCodepointHMetrics(&f.info, cps[i], &advance, &bearing);
-        x += advance * scale;
-        if (i + 1 < cps.size()) x += stbtt_GetCodepointKernAdvance(&f.info, cps[i], cps[i + 1]) * scale;
+        float ratio;
+        const stbtt_fontinfo& info = FontOf(f, cps[i], &ratio);
+        stbtt_GetCodepointHMetrics(&info, cps[i], &advance, &bearing);
+        x += advance * scale * ratio;
+        if (i + 1 < cps.size() && &info == &f.info) x += stbtt_GetCodepointKernAdvance(&f.info, cps[i], cps[i + 1]) * scale;
     }
     return x;
 }
@@ -85,14 +110,17 @@ void Coverage(const Font& f, const std::vector<int>& cps, float sx, float sy, fl
     const float scale = sx;
     for (std::size_t i = 0; i < cps.size(); ++i) {
         int advance, bearing;
-        stbtt_GetCodepointHMetrics(&f.info, cps[i], &advance, &bearing);
+        float ratio;
+        const stbtt_fontinfo& info = FontOf(f, cps[i], &ratio);
+        const float gsx = sx * ratio, gsy = sy * ratio;
+        stbtt_GetCodepointHMetrics(&info, cps[i], &advance, &bearing);
         const float shift_x = x - std::floor(x), shift_y = baseline - std::floor(baseline);
         int x0, y0, x1, y1;
-        stbtt_GetCodepointBitmapBoxSubpixel(&f.info, cps[i], sx, sy, shift_x, shift_y, &x0, &y0, &x1, &y1);
+        stbtt_GetCodepointBitmapBoxSubpixel(&info, cps[i], gsx, gsy, shift_x, shift_y, &x0, &y0, &x1, &y1);
         const int gw = x1 - x0, gh = y1 - y0;
         if (gw > 0 && gh > 0) {
             glyph.assign(std::size_t(gw) * gh, 0);
-            stbtt_MakeCodepointBitmapSubpixel(&f.info, glyph.data(), gw, gh, gw, sx, sy, shift_x, shift_y, cps[i]);
+            stbtt_MakeCodepointBitmapSubpixel(&info, glyph.data(), gw, gh, gw, gsx, gsy, shift_x, shift_y, cps[i]);
             const int ox = int(std::floor(x)) + x0, oy = int(std::floor(baseline)) + y0;
             for (int gy = 0; gy < gh; ++gy) {
                 const int py = oy + gy;
@@ -105,8 +133,8 @@ void Coverage(const Font& f, const std::vector<int>& cps, float sx, float sy, fl
                 }
             }
         }
-        x += advance * scale;
-        if (i + 1 < cps.size()) x += stbtt_GetCodepointKernAdvance(&f.info, cps[i], cps[i + 1]) * scale;
+        x += advance * scale * ratio;
+        if (i + 1 < cps.size() && &info == &f.info) x += stbtt_GetCodepointKernAdvance(&f.info, cps[i], cps[i + 1]) * scale;
     }
 }
 
@@ -142,6 +170,17 @@ void DrawMask(const GameText& t, int w, int h, std::vector<std::uint32_t>* out) 
 
 }  // namespace
 
+void SetGameTextFallbackFont(const unsigned char* data, std::size_t size) {
+    Fallback& fb = TheFallback();
+    const Font& f = TheFont();
+    fb.ok = false;
+    if (!data || size < 12 || !f.ok) return;
+    if (!stbtt_InitFont(&fb.info, data, stbtt_GetFontOffsetForIndex(data, 0))) return;
+    // (the same em: pixels per unit of each at one pixel's em)
+    fb.em_ratio = stbtt_ScaleForMappingEmToPixels(&fb.info, 1.0f) / stbtt_ScaleForMappingEmToPixels(&f.info, 1.0f);
+    fb.ok = true;
+}
+
 float GameTextWidth(const std::string& text, float height, std::uint32_t width, std::uint32_t picture_height,
                     float stretch) {
     const Font& f = TheFont();
@@ -166,7 +205,7 @@ bool DrawGameTexts(const std::vector<GameText>& texts, std::uint32_t width, std:
         const std::vector<int> cps = CodePoints(t.text);
         const float sy = t.height * float(h) / f.cap, sx = sy * (t.stretch > 0 ? t.stretch : 1.0f);
         const float advance = Advance(f, cps, sx);
-        const float left = t.right ? t.x * w - advance : t.x * w;
+        const float left = t.right ? t.x * w - advance : t.centre ? t.x * w - advance * 0.5f : t.x * w;
         const float baseline = (t.y + t.height) * h;
         const float off = std::max(1.0f, t.height * h / 12.0f);
         std::fill(cover.begin(), cover.end(), 0);

@@ -9,6 +9,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <timeapi.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -180,6 +181,154 @@ void RedirectOutput(const std::string& log) {
     }
     std::setvbuf(stdout, nullptr, _IONBF, 0);  // a run ended by force loses nothing
     std::setvbuf(stderr, nullptr, _IONBF, 0);
+}
+
+namespace {
+// A string value of HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion ("" if none).
+std::string WindowsVersionValue(const char* name) {
+    char text[256] = {};
+    DWORD size = sizeof text;
+    if (RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", name, RRF_RT_REG_SZ,
+                     nullptr, text, &size) != ERROR_SUCCESS)
+        return {};
+    return text;
+}
+
+std::string Narrow(const wchar_t* text) {
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    if (n <= 1) return {};
+    std::string out(std::size_t(n - 1), '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), n, nullptr, nullptr);
+    return out;
+}
+}  // namespace
+
+std::vector<std::string> SystemReport() {
+    std::vector<std::string> lines;
+    char line[512];
+    // The OS: Windows' own numbers (RtlGetVersion: GetVersionEx lies to programs without a manifest) and name.
+    const HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
+    OSVERSIONINFOW version{};
+    version.dwOSVersionInfoSize = sizeof version;
+    if (ntdll) {
+        if (auto get = reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion"))) get(&version);
+    }
+    // (ProductName stays "Windows 10 ..." on Windows 11: build 22000 on is 11.)
+    std::string product = WindowsVersionValue("ProductName");
+    if (version.dwBuildNumber >= 22000 && product.rfind("Windows 10", 0) == 0) product.replace(8, 2, "11");
+    std::snprintf(line, sizeof line, "OS: %s %s (Windows %lu.%lu build %lu)", product.c_str(),
+                  WindowsVersionValue("DisplayVersion").c_str(), static_cast<unsigned long>(version.dwMajorVersion),
+                  static_cast<unsigned long>(version.dwMinorVersion), static_cast<unsigned long>(version.dwBuildNumber));
+    lines.push_back(line);
+    // Under Wine: its version, its build (Proton's names itself there) and the system under it; Steam's Proton
+    // by the variables it sets.
+    if (ntdll) {
+        using WineVersionFn = const char*(CDECL*)();
+        using WineHostFn = void(CDECL*)(const char**, const char**);
+        if (auto wine = reinterpret_cast<WineVersionFn>(GetProcAddress(ntdll, "wine_get_version"))) {
+            std::string text = std::string("Wine: ") + wine();
+            if (auto build = reinterpret_cast<WineVersionFn>(GetProcAddress(ntdll, "wine_get_build_id")))
+                text += std::string(", build ") + build();
+            if (auto host = reinterpret_cast<WineHostFn>(GetProcAddress(ntdll, "wine_get_host_version"))) {
+                const char* sysname = nullptr;
+                const char* release = nullptr;
+                host(&sysname, &release);
+                if (sysname) text += std::string(", on ") + sysname + (release ? std::string(" ") + release : "");
+            }
+            lines.push_back(text);
+            const char* steam = std::getenv("STEAM_COMPAT_DATA_PATH");
+            const char* tools = std::getenv("STEAM_COMPAT_TOOL_PATHS");
+            if (steam || tools) {
+                std::string proton = "Proton: under Steam";
+                // The tool's "version" file (a Unix path: Wine's Z: drive).
+                if (tools) {
+                    std::string first = tools;
+                    first = first.substr(0, first.find(':'));
+                    std::string path = "Z:" + first + "/version";
+                    for (char& ch : path) if (ch == '/') ch = '\\';
+                    if (std::FILE* f = std::fopen(path.c_str(), "r")) {
+                        char text[128] = {};
+                        if (std::fgets(text, sizeof text, f)) {
+                            std::string v = text;
+                            while (!v.empty() && (v.back() == '\n' || v.back() == '\r')) v.pop_back();
+                            proton += ", " + v;
+                        }
+                        std::fclose(f);
+                    }
+                    proton += " (" + first + ")";
+                }
+                lines.push_back(proton);
+            }
+        }
+    }
+    // The processor: its name, cores and threads.
+    int info[4] = {};
+    char brand[49] = {};
+    __cpuid(info, int(0x80000000));
+    if (unsigned(info[0]) >= 0x80000004u) {
+        for (int i = 0; i < 3; ++i) {
+            __cpuid(info, int(0x80000002 + i));
+            std::memcpy(brand + i * 16, info, 16);
+        }
+    }
+    std::string name = brand;
+    while (!name.empty() && name.back() == ' ') name.pop_back();
+    while (!name.empty() && name.front() == ' ') name.erase(0, 1);
+    DWORD bytes = 0;
+    unsigned cores = 0;
+    GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &bytes);
+    std::vector<unsigned char> buffer(bytes);
+    if (bytes && GetLogicalProcessorInformationEx(RelationProcessorCore,
+                                                  reinterpret_cast<SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data()),
+                                                  &bytes)) {
+        for (DWORD at = 0; at < bytes;) {
+            const auto* entry = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(buffer.data() + at);
+            ++cores;
+            at += entry->Size;
+        }
+    }
+    std::snprintf(line, sizeof line, "CPU: %s, %u cores, %lu threads", name.empty() ? "?" : name.c_str(), cores,
+                  static_cast<unsigned long>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS)));
+    lines.push_back(line);
+    MEMORYSTATUSEX memory{};
+    memory.dwLength = sizeof memory;
+    if (GlobalMemoryStatusEx(&memory)) {
+        std::snprintf(line, sizeof line, "RAM: %.1f GB, %.1f GB free", double(memory.ullTotalPhys) / 1073741824.0,
+                      double(memory.ullAvailPhys) / 1073741824.0);
+        lines.push_back(line);
+    }
+    // The power plan (powrprof, loaded here: none under some Wines).
+    if (HMODULE power = LoadLibraryA("powrprof.dll")) {
+        using ActiveFn = DWORD(WINAPI*)(HKEY, GUID**);
+        using NameFn = DWORD(WINAPI*)(HKEY, const GUID*, const GUID*, const GUID*, UCHAR*, DWORD*);
+        auto active = reinterpret_cast<ActiveFn>(GetProcAddress(power, "PowerGetActiveScheme"));
+        auto read = reinterpret_cast<NameFn>(GetProcAddress(power, "PowerReadFriendlyName"));
+        GUID* scheme = nullptr;
+        const DWORD got = active && read ? active(nullptr, &scheme) : ERROR_PROC_NOT_FOUND;
+        if (got == ERROR_SUCCESS && scheme) {
+            DWORD size = 0;                                 // its size first (ERROR_MORE_DATA otherwise)
+            read(nullptr, scheme, nullptr, nullptr, nullptr, &size);
+            std::vector<wchar_t> text(size / sizeof(wchar_t) + 2, L'\0');
+            size = DWORD(text.size() * sizeof(wchar_t));
+            const DWORD named = read(nullptr, scheme, nullptr, nullptr, reinterpret_cast<UCHAR*>(text.data()), &size);
+            if (named == ERROR_SUCCESS) {
+                lines.push_back("power plan: " + Narrow(text.data()));
+            } else {
+                std::snprintf(line, sizeof line, "power plan: {%08lX-...} (its name: error %lu)",
+                              static_cast<unsigned long>(scheme->Data1), static_cast<unsigned long>(named));
+                lines.push_back(line);
+            }
+            LocalFree(scheme);
+        } else {
+            std::snprintf(line, sizeof line, "power plan: unknown (error %lu)", static_cast<unsigned long>(got));
+            lines.push_back(line);
+        }
+        FreeLibrary(power);
+    } else {
+        lines.push_back("power plan: unknown (no powrprof)");
+    }
+    return lines;
 }
 
 bool RestartSelf() {

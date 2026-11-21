@@ -47,6 +47,16 @@ namespace {
 
 constexpr int kRate = 48000;
 constexpr unsigned kRingFrames = 1u << 15;      // 683 ms: room for a long hitch's catch-up
+// Lag capped (ps2-port-engine 1c30d28, a6d1f8e, d5a17d8): the rate control's half percent drains 100 ms of backlog
+// in 20 s, and a hitch left one as long as itself - the sound behind the picture for a minute. When the ring holds
+// more than kExcessMs over its target for a whole window (kWindowMs: its fill never that low through it - bursts
+// alone are not lag), the excess is skipped, the old and the new sound crossfaded over kCrossFrames. A ring that ran
+// dry for a hitch (under a quarter of a second; not a pause) raises its target (kTargetStepMs a time, kTargetMostMs
+// over the start's at most), back down a millisecond every 2 s while it plays on.
+constexpr unsigned kExcessMs = 40;              // lag over the target, a whole window: skipped
+constexpr unsigned kWindowMs = 300;
+constexpr unsigned kCrossFrames = 240;          // 5 ms: the skip's crossfade
+constexpr unsigned kTargetStepMs = 10, kTargetMostMs = 60;
 constexpr double kMaxStretch = 0.005;           // the rate control's reach: +-0.5%
 constexpr unsigned kFadeFrames = 96;            // 2 ms: into and out of silence
 
@@ -55,11 +65,13 @@ constexpr unsigned kFadeFrames = 96;            // 2 ms: into and out of silence
 struct Ring {
     std::vector<float> data = std::vector<float>(kRingFrames * 2);
     std::atomic<unsigned long long> written{0}, read{0};
+    // A skip's crossfade's old frames, behind `read` (~0: none): not the writer's to fill until the crossfade is done.
+    std::atomic<unsigned long long> kept{~0ull};
     unsigned long long Filled() const { return written.load(std::memory_order_acquire) - read.load(std::memory_order_acquire); }
 };
 
 struct Stats {
-    std::atomic<unsigned> batches{0}, ran_dry{0};
+    std::atomic<unsigned> batches{0}, ran_dry{0}, skips{0};
     std::atomic<unsigned long long> dropped{0};
     std::atomic<double> longest_ms{0};
     std::atomic<int> fewest_ms{1 << 30}, most_ms{0};
@@ -69,7 +81,7 @@ struct Stats {
 struct Device {
     Ring ring;
     Stats stats;
-    unsigned target_frames = kRate * 60 / 1000;
+    unsigned target_frames = kRate * 45 / 1000;    // (grown after running dry for a hitch: kTargetStepMs)
     bool mute = false;
     bool log = false;
     std::atomic<bool> open{false}, stop{false};
@@ -85,6 +97,14 @@ struct Device {
     bool buffering = true;              // filling to the target before playing on
     float last[2] = {0, 0};             // the last frame played: faded out from
     unsigned fade = 0;                  // frames left of a fade in
+    unsigned base_target = 0;           // the target asked for (target_frames grows after a hitch)
+    unsigned long long window_low = ~0ull;  // the ring's lowest fill this window
+    unsigned window_frames = 0;         // device frames played this window
+    unsigned long long cross_from = 0;  // a skip's old place, crossfaded from
+    unsigned cross = 0;                 // frames left of its crossfade
+    unsigned long long since_dry = 0;   // device frames played since the ring last ran dry
+    bool dry = false;                   // buffering after running dry (not the start's)
+    unsigned long long dry_frames = 0;  // ...for so many device frames
 
     ~Device() { Close(); }
     void Close() {
@@ -137,15 +157,57 @@ inline float Cubic(float a, float b, float c, float d, float t) {
 }
 
 void Device::Render(float* out, unsigned frames) {
-    const unsigned long long available = ring.Filled();
+    if (!base_target) base_target = target_frames;
+    unsigned long long available = ring.Filled();
+    // Lag capped: the ring's lowest fill through a window above the target by more than the excess - the excess
+    // skipped (crossfaded).
+    if (!buffering) {
+        window_low = std::min(window_low, available);
+        window_frames += frames;
+        if (window_frames >= kRate * kWindowMs / 1000) {
+            const unsigned long long excess = unsigned(kRate * kExcessMs / 1000);
+            if (window_low != ~0ull && window_low > target_frames + excess && !cross) {
+                const unsigned long long skip = window_low - target_frames;
+                cross_from = ring.read.load(std::memory_order_relaxed);
+                ring.kept.store(cross_from, std::memory_order_release);
+                ring.read.store(cross_from + skip, std::memory_order_release);
+                cross = kCrossFrames;
+                smoothed_fill = double(available - skip);
+                available -= skip;
+                ++stats.skips;
+                static int told = 0;
+                if (told < 20) {
+                    ++told;
+                    std::fprintf(stderr, "[audio] %u ms behind: skipped to %u ms\n", unsigned(window_low * 1000 / kRate),
+                                 target_frames * 1000 / kRate);
+                }
+            }
+            window_low = ~0ull;
+            window_frames = 0;
+        }
+        // Played on without running dry: the target back down, a millisecond each 2 s.
+        since_dry += frames;
+        if (since_dry >= kRate * 2u && target_frames > base_target) {
+            since_dry = 0;
+            target_frames = std::max(base_target, target_frames - kRate / 1000);
+        }
+    }
     // The fill the rate control steers by: the ring's, smoothed - it jumps by a
     // whole batch each time the SPU2 delivers one.
     smoothed_fill += (double(available) - smoothed_fill) * 0.05;
     if (buffering) {
         if (available < target_frames) {
             std::fill(out, out + 2 * frames, 0.0f);
+            if (dry) dry_frames += frames;
             return;
         }
+        // Back from running dry: a hitch (the game's frames late, under a quarter of a second) - more kept from now
+        // on, up to kTargetMostMs more; a pause (the settings panel, the window put away: no sound made for
+        // longer) is no lateness, the target as it was.
+        if (dry && dry_frames < unsigned(kRate / 4))
+            target_frames = std::min(base_target + kRate * kTargetMostMs / 1000, target_frames + kRate * kTargetStepMs / 1000);
+        dry = false;
+        dry_frames = 0;
         buffering = false;
         fade = kFadeFrames;
         smoothed_fill = double(available);
@@ -171,9 +233,16 @@ void Device::Render(float* out, unsigned frames) {
             const float before = at ? frame(at - 1, ch) : frame(at, ch);
             float v = Cubic(before, frame(at, ch), frame(at + 1, ch), frame(at + 2, ch), t);
             if (fade) v *= float(kFadeFrames - fade) / float(kFadeFrames);
+            if (cross) {
+                // (a skip's: the sound it left, fading out under the new)
+                const float g = float(cross) / float(kCrossFrames);
+                const unsigned long long old = cross_from + (kCrossFrames - cross);
+                v = v * (1.0f - g) + frame(old, ch) * g;
+            }
             out[2 * k + ch] = v;
         }
         if (fade) --fade;
+        if (cross && !--cross) ring.kept.store(~0ull, std::memory_order_release);
         last[0] = out[2 * k];
         last[1] = out[2 * k + 1];
         phase += step;
@@ -186,6 +255,14 @@ void Device::Render(float* out, unsigned frames) {
         // Ran dry: what was playing fades to silence, and the ring fills to
         // the target before it plays again.
         if (log) ++stats.ran_dry;
+        // (its target raised as it plays again, if it was a hitch: above)
+        dry = true;
+        dry_frames = 0;
+        since_dry = 0;
+        window_low = ~0ull;
+        window_frames = 0;
+        cross = 0;
+        ring.kept.store(~0ull, std::memory_order_release);
         for (unsigned n = 0; k < frames; ++k, ++n) {
             const float g = n < kFadeFrames ? float(kFadeFrames - n) / float(kFadeFrames) : 0.0f;
             out[2 * k] = last[0] * g;
@@ -211,8 +288,8 @@ void LogStats(Device& d) {
     Stats& s = d.stats;
     const int fewest = s.fewest_ms.exchange(1 << 30);
     std::fprintf(stderr, "[audio] %u batches, longest wait %.1f ms; ring %d-%d ms (target %u), ran dry %u times, "
-                         "%llu frames dropped, rate %.4f-%.4f\n",
-                 s.batches.exchange(0), s.longest_ms.exchange(0), fewest == (1 << 30) ? 0 : fewest, s.most_ms.exchange(0), d.target_frames * 1000 / kRate, s.ran_dry.exchange(0), s.dropped.exchange(0),
+                         "%u skipped, %llu frames dropped, rate %.4f-%.4f\n",
+                 s.batches.exchange(0), s.longest_ms.exchange(0), fewest == (1 << 30) ? 0 : fewest, s.most_ms.exchange(0), d.target_frames * 1000 / kRate, s.ran_dry.exchange(0), s.skips.exchange(0), s.dropped.exchange(0),
                  s.stretch_min.exchange(1), s.stretch_max.exchange(1));
 }
 
@@ -298,7 +375,9 @@ void AudioFrames(const short* frames, unsigned count) {
     }
     Ring& r = d.ring;
     const unsigned long long w = r.written.load(std::memory_order_relaxed);
-    const unsigned long long room = kRingFrames - 4 - (w - r.read.load(std::memory_order_acquire));
+    // (a skip's crossfade's old frames kept until it is done: Ring::kept)
+    const unsigned long long oldest = std::min(r.read.load(std::memory_order_acquire), r.kept.load(std::memory_order_acquire));
+    const unsigned long long room = w - oldest + 4 >= kRingFrames ? 0 : kRingFrames - 4 - (w - oldest);
     if (count > room) {
         // A burst the ring cannot hold (the emulation far ahead of the device:
         // virtual time, a catch-up): the newest are dropped.

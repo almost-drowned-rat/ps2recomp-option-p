@@ -45,18 +45,25 @@ add_executable(ps2_launcher WIN32
     ${CMAKE_CURRENT_LIST_DIR}/launcher.c
     ${setup_ui}
     ${CMAKE_CURRENT_LIST_DIR}/sha256.c
-    ${CMAKE_CURRENT_LIST_DIR}/zip_read.c
-    ${CMAKE_CURRENT_LIST_DIR}/third_party/miniz/miniz_tinfl.c)
+    ${CMAKE_CURRENT_LIST_DIR}/zip_read.c)
+# CHD disc images (the build reads them as an .iso, launcher.c chd_to_iso): libchdr (BSD-3-Clause, the engine's copy,
+# host/third_party/libchdr) - its miniz (the same 11.3.2 as third_party/miniz's header) gives zip_read its inflate.
+set(CHDR_WANT_TESTS OFF CACHE BOOL "" FORCE)
+set(INSTALL_STATIC_LIBS OFF CACHE BOOL "" FORCE)
+set(CHDR_VERIFY_BLOCK_CRC OFF CACHE BOOL "" FORCE)
+set(WITH_LZMA_ASM OFF CACHE BOOL "" FORCE)          # (C only: no assembler needed on any toolchain)
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../host/third_party/libchdr ${CMAKE_BINARY_DIR}/libchdr EXCLUDE_FROM_ALL)
+target_link_libraries(ps2_launcher PRIVATE chdr-static)
+target_include_directories(ps2_launcher PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../host/third_party/libchdr/include)
 target_include_directories(ps2_launcher PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/third_party/miniz
                                                 ${CMAKE_CURRENT_BINARY_DIR})
 # miniz (3.1.2, MIT, LICENSES/miniz-MIT.txt): only its inflate; miniz_export.h, which its own build makes, empty
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/miniz_export.h "#define MINIZ_EXPORT\n")
 target_compile_definitions(ps2_launcher PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_DEFLATE_APIS
                            MINIZ_NO_ARCHIVE_APIS MINIZ_NO_ZLIB_APIS MINIZ_NO_ZLIB_COMPATIBLE_NAMES)
-set_source_files_properties(${CMAKE_CURRENT_LIST_DIR}/third_party/miniz/miniz_tinfl.c PROPERTIES COMPILE_OPTIONS "-w")
 target_link_libraries(ps2_launcher PRIVATE SDL3::SDL3-static)
 if(WIN32)
-    target_link_libraries(ps2_launcher PRIVATE comdlg32 gdi32 user32)
+    target_link_libraries(ps2_launcher PRIVATE comdlg32 gdi32 user32 shell32 ole32)
 endif()
 set(defs PS2_LAUNCHER_GAME="${PS2_LAUNCHER_GAME}" PS2_LAUNCHER_GAME_EXE="${PS2_LAUNCHER_GAME_EXE}")
 if(PS2_LAUNCHER_DISC)

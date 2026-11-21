@@ -127,6 +127,29 @@ public:
     void SetAspect(float aspect) override { aspect_.store(aspect); }
     void SetAntiAliasing(AntiAliasing mode) override { anti_aliasing_.store(int(mode)); }
     void SetUpscaling(Upscaling mode) override { upscaling_.store(int(mode)); }
+    void SetFsrSharpness(float stops) override { fsr_sharpness_.store(stops); }
+    void SetPictureCrop(std::uint32_t x, std::uint32_t y) override {
+        crop_x_.store(x);
+        crop_y_.store(y);
+    }
+    bool RepeatLast() override {
+        std::uint64_t image = 0;
+        int layout = 0;
+        std::uint32_t width = 0, height = 0;
+        {
+            std::lock_guard<std::mutex> hold(last_lock_);
+            image = last_image_, layout = last_layout_, width = last_width_, height = last_height_;
+        }
+        return image && PresentImage(image, layout, width, height);
+    }
+    void Remember(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
+        std::lock_guard<std::mutex> hold(last_lock_);
+        last_image_ = image, last_layout_ = layout, last_width_ = width, last_height_ = height;
+    }
+    void ShownSize(std::uint32_t* width, std::uint32_t* height) const override {
+        *width = shown_seen_.load() ? std::uint32_t(shown_w_.load()) : 0u;
+        *height = shown_seen_.load() ? std::uint32_t(shown_h_.load()) : 0u;
+    }
     void SetBloom(int strength) override { bloom_.store(std::clamp(strength, 0, 10)); }
     void SetPictureLabel(std::vector<std::uint32_t> rgba, std::uint32_t width, std::uint32_t height, float x0,
                          float y0, float x1, float y1) override {
@@ -385,6 +408,13 @@ private:
     // RCAS into [2] (both the shown size: fsr.comp), [2] blitted 1:1. A set each pass: a sampled image, a
     // storage image (fxaa.comp's layout).
     std::atomic<int> upscaling_{int(Upscaling::kLinear)};
+    std::atomic<float> fsr_sharpness_{0.25f};      // RCAS's stops (SetFsrSharpness)
+    std::atomic<bool> shown_seen_{false};          // a picture shown (ShownSize)
+    std::atomic<std::uint32_t> crop_x_{0}, crop_y_{0};     // SetPictureCrop's
+    std::mutex last_lock_;                                  // RepeatLast's picture: the last one given
+    std::uint64_t last_image_ = 0;
+    int last_layout_ = 0;
+    std::uint32_t last_width_ = 0, last_height_ = 0;
     static constexpr int kFsrImages = 3;
     VkImage fsr_image_[kFsrImages] = {};
     VkDeviceMemory fsr_memory_[kFsrImages] = {};
@@ -662,6 +692,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     v13.dynamicRendering = VK_TRUE;
     v13.synchronization2 = VK_TRUE;
+    v13.shaderDemoteToHelperInvocation = VK_TRUE;      // the shaders' discard (gpu.cpp)
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;
@@ -1315,7 +1346,7 @@ void VulkanDisplay::RecordFsr(VkImage source, std::uint32_t width, std::uint32_t
             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     struct { float in_view[2], in_size[2], out_size[2], sharpness, pad; } params{
         {float(width), float(height)}, {float(width), float(height)},
-        {float(fsr_out_width_), float(fsr_out_height_)}, 0.25f, 0.0f};
+        {float(fsr_out_width_), float(fsr_out_height_)}, fsr_sharpness_.load(), 0.0f};
     const std::uint32_t gx = (fsr_out_width_ + 15) / 16, gy = (fsr_out_height_ + 15) / 16;
     vkCmdBindPipeline(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_pipelines_[0]);
     vkCmdBindDescriptorSets(cmd_, VK_PIPELINE_BIND_POINT_COMPUTE, fsr_layout_, 0, 1, &fsr_sets_[0], 0, nullptr);
@@ -2106,6 +2137,7 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     shown_x0_.store(x0);
     shown_y0_.store(y0);
     shown_w_.store(std::max(dw, 1));
+    shown_seen_.store(true);
     shown_h_.store(std::max(dh, 1));
     // Anti-aliasing: FXAA at the picture's size; supersampling's picture,
     // larger than shown, averaged down to the shown size (then copied 1:1).
@@ -2193,6 +2225,7 @@ bool VulkanDisplay::Present(const std::uint32_t* pixels, std::uint32_t width, st
 
 bool VulkanDisplay::PresentImage(std::uint64_t image, int layout, std::uint32_t width, std::uint32_t height) {
     if (!width || !height || !image) return !closed_;
+    Remember(image, layout, width, height);
     std::lock_guard<std::mutex> hold(present_lock_);
     std::uint32_t index = 0;
     bool ok = true;
@@ -2203,7 +2236,28 @@ bool VulkanDisplay::PresentImage(std::uint64_t image, int layout, std::uint32_t 
     // all of it, and back to the layout its renderer has it in.
     Barrier(cmd_, source, kept, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_ACCESS_MEMORY_WRITE_BIT,
             VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
-    FinishPresent(index, source, width, height);
+    const std::uint32_t cx = std::min(crop_x_.load(), width / 8), cy = std::min(crop_y_.load(), height / 8);
+    if ((cx || cy) && EnsurePicture(width - cx, height - cy)) {
+        // SetPictureCrop's edge left out: the rest copied into the picture image first (the queue's earlier
+        // reads of it - a present before - go first by the barrier's scope).
+        Barrier(cmd_, picture_, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        VkImageBlit region{};
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.dstSubresource = region.srcSubresource;
+        region.srcOffsets[0] = {std::int32_t(cx), std::int32_t(cy), 0};
+        region.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
+        region.dstOffsets[1] = {std::int32_t(width - cx), std::int32_t(height - cy), 1};
+        vkCmdBlitImage(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, picture_,
+                       VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region, VK_FILTER_NEAREST);
+        Barrier(cmd_, picture_, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT);
+        FinishPresent(index, picture_, width - cx, height - cy);
+    } else {
+        FinishPresent(index, source, width, height);
+    }
     Barrier(cmd_, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, kept, VK_ACCESS_TRANSFER_READ_BIT,
             VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
@@ -2278,6 +2332,7 @@ bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_
                                    std::uint64_t due_ns) {
     if (!width || !height || !image) return !closed_;
     if (closed_) return false;
+    Remember(image, layout, width, height);
     if (!EnsurePaced(width, height)) return false;
     // A picture neither waiting to be shown nor being shown - or, with all
     // of them waiting, the oldest waiting (its turn is lost: the shown
@@ -2321,10 +2376,15 @@ bool VulkanDisplay::PresentImageAt(std::uint64_t image, int layout, std::uint32_
     VkImageBlit region{};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
+    // SetPictureCrop's edge left out (pixel for pixel: the picture that much smaller).
+    const std::uint32_t cx = std::min(crop_x_.load(), width / 8), cy = std::min(crop_y_.load(), height / 8);
+    region.srcOffsets[0] = {std::int32_t(cx), std::int32_t(cy), 0};
     region.srcOffsets[1] = {std::int32_t(width), std::int32_t(height), 1};
-    region.dstOffsets[1] = region.srcOffsets[1];
+    region.dstOffsets[1] = {std::int32_t(width - cx), std::int32_t(height - cy), 1};
     vkCmdBlitImage(p.copy, source, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, p.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                    1, &region, VK_FILTER_NEAREST);
+    width -= cx;
+    height -= cy;
     Barrier(p.copy, p.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
             VK_PIPELINE_STAGE_TRANSFER_BIT);
@@ -2409,15 +2469,45 @@ void VulkanDisplay::PresentLoop() {
             while (Clock::now() < due) std::this_thread::yield();
         }
         {
-            std::lock_guard<std::mutex> hold(paced_lock_);
+            std::unique_lock<std::mutex> hold(paced_lock_);
             if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
                 return;
             }
             // The oldest waiting now (a newer one may have taken its turn
-            // meanwhile): into the image already taken.
-            if (ready_.empty()) {
+            // meanwhile: CopyPaced takes the oldest's slot, then queues its
+            // own; a resize empties the queue) - waited for a little: the
+            // image is taken and must be shown. Left so (its command buffer
+            // ended, nothing submitted) its slot's fence stayed reset and
+            // never signalled: the third picture on waited for it the whole
+            // hang limit and the device counted lost (ps2-port-engine 28bd074,
+            // the same path here).
+            if (ready_.empty() && began)
+                paced_wake_.wait_for(hold, std::chrono::milliseconds(250), [&] { return stop_ || !ready_.empty(); });
+            if (stop_) {
                 if (began) vkEndCommandBuffer(cmd_);
+                return;
+            }
+            if (ready_.empty()) {
+                hold.unlock();
+                if (began) {
+                    // (none came: the image shown black - submitted, its fence signalled, the image given back)
+                    static int told = 0;
+                    if (told < 5) {
+                        ++told;
+                        std::fprintf(stderr, "[display] a picture's turn with none to show: the screen black once\n");
+                    }
+                    const VkImage target = images_[index];
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 0,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    const VkClearColorValue black{};
+                    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+                    Barrier(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, 0, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
+                    Submit(index);
+                }
                 continue;
             }
             slot = ready_.front();

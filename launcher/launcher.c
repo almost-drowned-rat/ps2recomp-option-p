@@ -6,6 +6,9 @@
 #include "sha256.h"
 #include "zip_read.h"
 
+#include "libchdr/cdrom.h"
+#include "libchdr/chd.h"
+
 #include <SDL3/SDL.h>
 
 #include <stdarg.h>
@@ -31,7 +34,8 @@ typedef struct {
     char root[LP], tools[LP], data[LP], build[LP], work[LP], obj[LP];
     char exe[LP];                           /* this exe (the payload trailer) */
     char out[LP];                           /* the game: root/game_exe ({OUT}) */
-    char iso[LP];                           /* the player's disc image ({ISO}) */
+    char iso[LP];                           /* the player's disc image */
+    char lift_iso[LP];                      /* {ISO}: the image as the build's tools read it - a CHD's .iso copy */
     char release[33];
     char clang[LP], python[LP];             /* toolchain.txt: absolute */
     char jobs[16];                          /* {JOBS} */
@@ -153,7 +157,7 @@ static void expand(L *l, const char *in, char *out, size_t n)
         else if (!strncmp(in, "{ROOT}", 6)) v = l->root, skip = 6, dir = 1;
         else if (!strncmp(in, "{WORK}", 6)) v = l->work, skip = 6, dir = 1;
         else if (!strncmp(in, "{OUT}", 5)) v = l->out, skip = 5;
-        else if (!strncmp(in, "{ISO}", 5)) v = l->iso, skip = 5;
+        else if (!strncmp(in, "{ISO}", 5)) v = l->lift_iso[0] ? l->lift_iso : l->iso, skip = 5;
         else if (!strncmp(in, "{JOBS}", 6)) v = l->jobs, skip = 6;
         if (v) {
             size_t k = strlen(v);
@@ -349,13 +353,37 @@ static void settings_set(L *l, const char *key, const char *value)
 /* the game's settings get the image (so the game does not ask for it again) */
 static void settings_set_disc(L *l) { settings_set(l, "disc", l->iso); }
 
+/* The build's stamp: the release and the image by its content - its size and the SHA-256 of its first 4 MiB (the
+ * volume descriptors, SYSTEM.CNF and the boot executable's start) - not its path: the same image moved or renamed
+ * builds nothing again (the maintainer 2026-11-20, ZOE issue 17). */
+static void stamp_text(L *l, char *out, size_t n)
+{
+    XrSha256 s;
+    uint8_t digest[32];
+    char hex[65] = "?";
+    SDL_IOStream *f = SDL_IOFromFile(l->iso, "rb");
+    if (f) {
+        static unsigned char block[1 << 16];
+        size_t total = 0, got;
+        xr_sha256_init(&s);
+        while (total < (4u << 20) && (got = SDL_ReadIO(f, block, sizeof block)) > 0) {
+            xr_sha256_update(&s, block, got);
+            total += got;
+        }
+        SDL_CloseIO(f);
+        xr_sha256_final(&s, digest);
+        xr_sha256_hex(digest, hex);
+    }
+    snprintf(out, n, "%s\nimage %lld %s\n", l->release, (long long)file_size(l->iso), hex);
+}
+
 typedef struct { L *l; char found[LP]; } FindIso;
 
 static SDL_EnumerationResult SDLCALL iso_cb(void *u, const char *dir, const char *name)
 {
     FindIso *f = (FindIso *)u;
     size_t k = strlen(name);
-    if (k > 4 && !SDL_strcasecmp(name + k - 4, ".iso")) {
+    if (k > 4 && (!SDL_strcasecmp(name + k - 4, ".iso") || !SDL_strcasecmp(name + k - 4, ".chd"))) {
         join(f->found, sizeof f->found, dir, name);
         return SDL_ENUM_SUCCESS;
     }
@@ -375,7 +403,7 @@ static void SDLCALL pick_cb(void *u, const char *const *files, int filter)
 
 static int choose_image(L *l, char *out, size_t n)
 {
-    static const SDL_DialogFileFilter f[] = { { "PS2 disc image", "iso" }, { "All files", "*" } };
+    static const SDL_DialogFileFilter f[] = { { "PS2 disc image", "iso;chd" }, { "All files", "*" } };
     Pick p;
     memset(&p, 0, sizeof p);
     SDL_ShowOpenFileDialog(pick_cb, &p, NULL, f, 2, NULL, false);
@@ -977,14 +1005,282 @@ static int start_game(L *l)
     return 1;
 }
 
+/* ── a CHD image (chdman createdvd / createcd): the game reads it itself (the engine's Disc); the build's tools
+ * read an .iso - written for the build into data/build/work (removed after it), the player's image only read ── */
+
+typedef struct { const char *from, *to; SDL_AtomicInt done_mb; Sint64 total; } ChdArg;
+
+static int chd_job(L *l, void *a)
+{
+    ChdArg *c = (ChdArg *)a;
+    chd_file *chd = NULL;
+    const chd_header *h;
+    SDL_IOStream *out;
+    unsigned char *hunk;
+    Uint32 units_per_hunk, hunks, i, u, data_at = 0;
+    Sint64 units, done = 0;
+    int rc = 1;
+    if (chd_open(c->from, CHD_OPEN_READ, NULL, &chd) != CHDERR_NONE || !chd) {
+        lg(l, "cannot open the CHD %s", c->from);
+        return 1;
+    }
+    h = chd_get_header(chd);
+    if (!h || !h->hunkbytes || !h->unitbytes || h->hunkbytes % h->unitbytes) {
+        chd_close(chd);
+        return 1;
+    }
+    units_per_hunk = h->hunkbytes / h->unitbytes;
+    hunks = h->totalhunks;
+    units = (Sint64)(h->logicalbytes / h->unitbytes);
+    c->total = units * 2048;
+    hunk = (unsigned char *)SDL_malloc(h->hunkbytes);
+    out = SDL_IOFromFile(c->to, "wb");
+    if (!hunk || !out)
+        goto done;
+    for (i = 0; i < hunks && done < units; i++) {
+        if (chd_read(chd, i, hunk) != CHDERR_NONE) {
+            lg(l, "the CHD's hunk %u unreadable", (unsigned)i);
+            goto done;
+        }
+        for (u = 0; u < units_per_hunk && done < units; u++, done++) {
+            const unsigned char *unit = hunk + (size_t)u * h->unitbytes;
+            if (h->unitbytes == CD_FRAME_SIZE) {        /* a CD's raw sector (+ subcode): its 2048 data bytes */
+                if (!data_at)
+                    data_at = unit[15] == 2 ? 24 : 16;
+                unit += data_at;
+            } else if (h->unitbytes != 2048) {
+                lg(l, "a CHD unit of %u bytes - not a disc image", (unsigned)h->unitbytes);
+                goto done;
+            }
+            if (SDL_WriteIO(out, unit, 2048) != 2048)
+                goto done;
+        }
+        SDL_SetAtomicInt(&c->done_mb, (int)((done * 2048) >> 20));
+        if (l->ui && xr_setup_ui_cancelled(l->ui))
+            goto done;
+    }
+    rc = 0;
+done:
+    if (out && !SDL_CloseIO(out))
+        rc = 1;
+    SDL_free(hunk);
+    chd_close(chd);
+    if (rc)
+        SDL_RemovePath(c->to);
+    return rc;
+}
+
+static double chd_frac(void *a)
+{
+    ChdArg *c = (ChdArg *)a;
+    const Sint64 mb = c->total >> 20;
+    return mb > 0 ? (double)SDL_GetAtomicInt(&c->done_mb) / (double)mb : 0.0;
+}
+
+/* {ISO} for the build: the image itself, or a CHD's .iso. 0: failed. */
+static int lift_image(L *l)
+{
+    size_t k = strlen(l->iso);
+    ChdArg c;
+    l->lift_iso[0] = 0;
+    if (k < 4 || SDL_strcasecmp(l->iso + k - 4, ".chd"))
+        return 1;
+    SDL_CreateDirectory(l->work);
+    join(l->lift_iso, sizeof l->lift_iso, l->work, "disc_from_chd.iso");
+    memset(&c, 0, sizeof c);
+    c.from = l->iso;
+    c.to = l->lift_iso;
+    if (run_job(l, "Reading the CHD image", 0.10, 0.01, chd_job, &c, chd_frac)) {
+        l->lift_iso[0] = 0;
+        xr_setup_ui_message(l->ui, 1, "The CHD image could not be read - see data\\launcher.log.");
+        return 0;
+    }
+    return 1;
+}
+
+/* ── the target folder (issue 12) and the images' copies (issue 17) ─────── */
+
+/* A folder's path without the separators at its end, for comparing. */
+static void plain_dir(const char *in, char *out, size_t n)
+{
+    size_t k;
+    snprintf(out, n, "%s", in);
+    k = strlen(out);
+    while (k > 1 && (out[k - 1] == '/' || out[k - 1] == '\\'))
+        out[--k] = 0;
+}
+
+static int same_dir(const char *a, const char *b)
+{
+    char x[LP], y[LP];
+    size_t i;
+    plain_dir(a, x, sizeof x);
+    plain_dir(b, y, sizeof y);
+    for (i = 0; x[i]; i++) if (x[i] == '\\') x[i] = '/';
+    for (i = 0; y[i]; i++) if (y[i] == '\\') y[i] = '/';
+#ifdef _WIN32
+    return !SDL_strcasecmp(x, y);
+#else
+    return !strcmp(x, y);
+#endif
+}
+
+static const char *base_name(const char *p)
+{
+    const char *a = strrchr(p, '/'), *b = strrchr(p, '\\');
+    const char *s = a > b ? a : b;
+    return s ? s + 1 : p;
+}
+
+typedef struct { const char *from[3]; const char *to[3]; Sint64 total; SDL_AtomicInt done_mb; } CopyArg;
+
+/* The files copied (never moved: the player's own image stays where it is - the maintainer's rule), chunk by
+ * chunk; one already there with the same size is kept. */
+static int copy_job(L *l, void *a)
+{
+    CopyArg *c = (CopyArg *)a;
+    Sint64 done = 0;
+    int i;
+    char *buf = (char *)SDL_malloc(4 << 20);
+    if (!buf)
+        return 1;
+    for (i = 0; i < 3 && c->from[i]; i++) {
+        SDL_IOStream *in, *out;
+        size_t got;
+        char part[LP];
+        if (file_size(c->to[i]) == file_size(c->from[i])) {
+            done += file_size(c->from[i]);
+            lg(l, "%s is there already", c->to[i]);
+            continue;
+        }
+        snprintf(part, sizeof part, "%s.part", c->to[i]);
+        in = SDL_IOFromFile(c->from[i], "rb");
+        out = SDL_IOFromFile(part, "wb");
+        if (!in || !out) {
+            lg(l, "cannot copy %s to %s: %s", c->from[i], c->to[i], SDL_GetError());
+            if (in) SDL_CloseIO(in);
+            if (out) SDL_CloseIO(out);
+            SDL_free(buf);
+            return 1;
+        }
+        while ((got = SDL_ReadIO(in, buf, 4 << 20)) > 0) {
+            if (SDL_WriteIO(out, buf, got) != got || (l->ui && xr_setup_ui_cancelled(l->ui))) {
+                SDL_CloseIO(in);
+                SDL_CloseIO(out);
+                SDL_RemovePath(part);
+                SDL_free(buf);
+                return 1;
+            }
+            done += (Sint64)got;
+            SDL_SetAtomicInt(&c->done_mb, (int)(done >> 20));
+        }
+        SDL_CloseIO(in);
+        if (!SDL_CloseIO(out) || !SDL_RenamePath(part, c->to[i])) {
+            lg(l, "cannot finish %s: %s", c->to[i], SDL_GetError());
+            SDL_free(buf);
+            return 1;
+        }
+        lg(l, "copied %s to %s", c->from[i], c->to[i]);
+    }
+    SDL_free(buf);
+    return 0;
+}
+
+static double copy_frac(void *a)
+{
+    CopyArg *c = (CopyArg *)a;
+    const Sint64 mb = c->total >> 20;
+    return (double)SDL_GetAtomicInt(&c->done_mb) / (double)(mb > 0 ? mb : 1);
+}
+
+/* The images into <folder>/game; iso / extra are their copies then. 0: failed. */
+static int copy_images(L *l, const char *folder, char *extra, size_t extra_n)
+{
+    char game_dir[LP], to_iso[LP], to_extra[LP] = "";
+    CopyArg c;
+    memset(&c, 0, sizeof c);
+    join(game_dir, sizeof game_dir, folder, "game");
+    SDL_CreateDirectory(game_dir);
+    join(to_iso, sizeof to_iso, game_dir, base_name(l->iso));
+    c.from[0] = l->iso;
+    c.to[0] = to_iso;
+    c.total = file_size(l->iso);
+    if (extra && extra[0]) {
+        join(to_extra, sizeof to_extra, game_dir, base_name(extra));
+        c.from[1] = extra;
+        c.to[1] = to_extra;
+        c.total += file_size(extra);
+    }
+    if (same_dir(l->iso, to_iso) && (!c.from[1] || same_dir(extra, to_extra)))
+        return 1;
+    if (run_job(l, "Copying the disc image into the game folder", 0.0, 0.10, copy_job, &c, copy_frac)) {
+        xr_setup_ui_message(l->ui, 1, "Copying the disc image failed - see data\\launcher.log.");
+        return 0;
+    }
+    snprintf(l->iso, sizeof l->iso, "%s", to_iso);
+    if (c.from[1])
+        snprintf(extra, extra_n, "%s", to_extra);
+    return 1;
+}
+
+/* Another target folder than the exe's: this exe copied there and started there with the choices (--go), this one
+ * ends. 1: started. */
+static int move_to_target(L *l, const char *target, int copy, const char *extra)
+{
+    char exe_to[LP], *argv[10];
+    int k = 0;
+    SDL_PropertiesID p;
+    SDL_Process *proc;
+    CopyArg c;
+    if (!SDL_CreateDirectory(target)) {
+        lg(l, "cannot make %s: %s", target, SDL_GetError());
+        xr_setup_ui_message(l->ui, 1, "The target folder cannot be made - choose another one.");
+        return 0;
+    }
+    join(exe_to, sizeof exe_to, target, base_name(l->exe));
+    memset(&c, 0, sizeof c);
+    c.from[0] = l->exe;
+    c.to[0] = exe_to;
+    c.total = file_size(l->exe);
+    if (run_job(l, "Copying the game into the target folder", 0.0, 0.02, copy_job, &c, copy_frac)) {
+        xr_setup_ui_message(l->ui, 1, "The game cannot be copied into the target folder - see data\\launcher.log.");
+        return 0;
+    }
+    argv[k++] = exe_to;
+    argv[k++] = "--go";
+    argv[k++] = "--image";
+    argv[k++] = l->iso;
+    if (extra && extra[0]) {
+        argv[k++] = "--extra";
+        argv[k++] = (char *)extra;
+    }
+    if (copy)
+        argv[k++] = "--copy";
+    argv[k] = NULL;
+    p = SDL_CreateProperties();
+    SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv);
+    SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, target);
+    SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);
+    proc = SDL_CreateProcessWithProperties(p);
+    SDL_DestroyProperties(p);
+    if (!proc) {
+        lg(l, "cannot start %s: %s", exe_to, SDL_GetError());
+        return 0;
+    }
+    lg(l, "installing in %s: started %s", target, exe_to);
+    SDL_DestroyProcess(proc);
+    return 1;
+}
+
 /* ── main ──────────────────────────────────────────────────────────────── */
 
 int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
 {
     static L l;
     const char *image = NULL, *base;
-    int repair = 0, no_start = 0, setup = 0, i, ok = 0, rc, found_image = 0, form = -1;
-    char extra[LP] = "";
+    int repair = 0, no_start = 0, setup = 0, i, ok = 0, rc, found_image = 0, form = -1, go = 0, copy = 1;
+    char extra[LP] = "", target[LP] = "";
+    const char *extra_arg = NULL;
     char p[LP], stamp_want[LP + 128], *stamp_have, logp[LP];
     Uint64 payload_ofs = 0;
 
@@ -993,6 +1289,10 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         else if (!strcmp(argv[i], "--setup")) setup = 1;   /* the setup page even when built (a second disc added) */
         else if (!strcmp(argv[i], "--no-start")) no_start = 1;
         else if (!strcmp(argv[i], "--image") && i + 1 < argc) image = argv[++i];
+        /* (the setup page's choices, given on by the exe it was copied from into the target folder) */
+        else if (!strcmp(argv[i], "--go")) go = 1;
+        else if (!strcmp(argv[i], "--copy")) copy = 2;
+        else if (!strcmp(argv[i], "--extra") && i + 1 < argc) extra_arg = argv[++i];
     }
     memset(&l, 0, sizeof l);
     l.cfg = cfg;
@@ -1042,26 +1342,47 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     found_image = find_image(&l, image);
     if (cfg->extra_disc_key)
         settings_get(&l, cfg->extra_disc_key, extra, sizeof extra);
+    if (extra_arg)
+        snprintf(extra, sizeof extra, "%s", extra_arg);
+    if (go && found_image) {        /* the choices made on the setup page of the exe this one was copied from */
+        if (copy == 2 && !copy_images(&l, l.root, extra, sizeof extra))
+            goto out;
+        if (cfg->extra_disc_key)
+            settings_set(&l, cfg->extra_disc_key, extra);
+        setup = 1;                  /* (not straight into an old build: the page's Go means build) */
+        form = 1;
+    }
     if (found_image && !repair && !setup) {     /* built from this image already: straight into the game */
-        snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n%lld\n", l.release, l.iso, (long long)file_size(l.iso));
+        stamp_text(&l, stamp_want, sizeof stamp_want);
         join(p, sizeof p, l.build, "stamp.txt");
         stamp_have = read_text(p);
         if (stamp_have && !strcmp(stamp_have, stamp_want) && is_file(l.out)) {
             SDL_free(stamp_have);
             lg(&l, "disc image %s - built already", l.iso);
+            settings_set_disc(&l);      /* the same image found elsewhere (moved): the game reads it there now */
             ok = no_start || start_game(&l);
             goto out;
         }
         SDL_free(stamp_have);
         stamp_have = NULL;
     }
-    /* to be built: the setup's first page (Windows: the Windows 95 window - the image's line, Go / Quit) */
-    form = xr_setup_ui_form(l.ui, cfg->disc, l.iso, sizeof l.iso, found_image ? NULL : "No disc image was found yet.",
-                            cfg->extra_disc_label, extra, sizeof extra);
+    /* to be built: the setup's first page (Windows: the Windows 95 window - the image's line, the target folder,
+       the copy box, Go / Quit) */
+    if (!go) {
+        plain_dir(l.root, target, sizeof target);
+        form = xr_setup_ui_form(l.ui, cfg->disc, l.iso, sizeof l.iso, found_image ? NULL : "No disc image was found yet.",
+                                cfg->extra_disc_label, extra, sizeof extra, target, sizeof target, &copy);
+    }
     if (form == 0)
         goto out;
-    if (form > 0) {
-        lg(&l, "disc image chosen on the setup page: %s", l.iso);
+    if (form > 0 && !go) {
+        lg(&l, "disc image chosen on the setup page: %s; target folder %s; copy %s", l.iso, target, copy ? "yes" : "no");
+        if (target[0] && !same_dir(target, l.root)) {     /* installed there: that copy of this exe goes on */
+            ok = move_to_target(&l, target, copy, extra);
+            goto out;
+        }
+        if (copy && !copy_images(&l, l.root, extra, sizeof extra))
+            goto out;
         if (cfg->extra_disc_key) {      /* the second disc: only remembered for the game (it reads it itself) */
             settings_set(&l, cfg->extra_disc_key, extra);
             lg(&l, "%s: %s", cfg->extra_disc_key, extra[0] ? extra : "(none)");
@@ -1085,7 +1406,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     }
     lg(&l, "disc image %s (%lld bytes)", l.iso, (long long)file_size(l.iso));
 
-    snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n%lld\n", l.release, l.iso, (long long)file_size(l.iso));
+    stamp_text(&l, stamp_want, sizeof stamp_want);
     join(p, sizeof p, l.build, "stamp.txt");
     stamp_have = read_text(p);
     if (repair) {
@@ -1125,6 +1446,8 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     /* the disc: the right game, the right version - else ask for another image */
     for (;;) {
         LiftArg la;
+        if (!lift_image(&l))
+            goto out;
         memset(&la, 0, sizeof la);
         la.only = "check";
         rc = run_job(&l, "Checking the disc image", 0.10, 0.01, lift_job, &la, NULL);
@@ -1139,14 +1462,16 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         {
             char why[300];
             snprintf(why, sizeof why, "That image is not the %s disc.", cfg->disc);
+            plain_dir(l.root, target, sizeof target);
+            copy = 0;
             form = xr_setup_ui_form(l.ui, cfg->disc, l.iso, sizeof l.iso, why, cfg->extra_disc_label, extra,
-                                    sizeof extra);
+                                    sizeof extra, target, sizeof target, &copy);
             if (form > 0 && cfg->extra_disc_key)
                 settings_set(&l, cfg->extra_disc_key, extra);
             if (form == 0)
                 goto out;
             if (form > 0) {
-                snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n%lld\n", l.release, l.iso, (long long)file_size(l.iso));
+                stamp_text(&l, stamp_want, sizeof stamp_want);
                 continue;
             }
         }
@@ -1164,7 +1489,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
             if (b == B_AGAIN)
                 find_image(&l, NULL);
         }
-        snprintf(stamp_want, sizeof stamp_want, "%s\n%s\n%lld\n", l.release, l.iso, (long long)file_size(l.iso));
+        stamp_text(&l, stamp_want, sizeof stamp_want);
     }
     {
         LiftArg la;
@@ -1216,6 +1541,9 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     lg(&l, "built %s", l.out);
     ok = no_start || start_game(&l);
 out:
+    /* a CHD's .iso for the build: ours, gone with it (rm_tree keeps disc images - a player's own - so by name) */
+    if (l.lift_iso[0] && SDL_RemovePath(l.lift_iso))
+        lg(&l, "removed %s", l.lift_iso);
     xr_setup_ui_close(l.ui);
     if (l.log)
         SDL_CloseIO(l.log);

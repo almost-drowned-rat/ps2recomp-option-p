@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -184,8 +185,9 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
         if (SettingOn("vsync")) g_display->SetVsync(true);
         g_display->SetAspect(SettingAspect());
         g_display->SetAntiAliasing(DisplayAntiAliasing(Setting("antialiasing", "off")));
-        g_display->SetUpscaling(Setting("upscaling", "linear") == "fsr1" ? ps2gpu::Display::Upscaling::kFsr
-                                                                         : ps2gpu::Display::Upscaling::kLinear);
+        g_display->SetUpscaling(Setting("upscaling", "linear").rfind("fsr", 0) == 0
+                                    ? ps2gpu::Display::Upscaling::kFsr : ps2gpu::Display::Upscaling::kLinear);
+        g_display->SetFsrSharpness(FsrSharpnessStops());
         g_display->SetBloom(BloomStrength());
         // Where the player left it (KeepWindowRect): its place and height, its width from the opening shape.
         int x = 0, y = 0, w = 0, h = 0;
@@ -221,7 +223,11 @@ void QuitGame() { g_closed = true; }
 namespace {
 bool g_restart = false;
 }  // namespace
-void RequestRestart() { g_restart = true; }
+// The run ends here too (run.h): a port's own RESTART NOW needs no QuitGame of its own.
+void RequestRestart() {
+    g_restart = true;
+    QuitGame();
+}
 bool RestartRequested() { return g_restart; }
 
 bool HostKeyDown(int key) {
@@ -440,9 +446,16 @@ bool PumpWindow() {
         if (g_display->TakeCapture()) RequestCapture();
         // A wide ASPECT RATIO: the game's wide picture fills the window; its 4:3 screens (menus, movies: the game
         // says which, SetWidescreen) stand 4:3 between bars - the window keeps its shape.
-        if (g_shows_wide)
+        // (Not while SELECT's menu holds the game: no 3D is drawn then, and the held wide picture went 4:3 between
+        // bars, squeezed - his session 2026-11-20. It keeps the shape it had.)
+        // (And for ten frames after it closes: the game's own sign of 3D comes back with its next frame.)
+        static int settle = 0;
+        if (SelectMenuOpen()) settle = 10;
+        else if (settle > 0) --settle;
+        if (g_shows_wide && settle == 0)
             g_display->SetPictureAspect(SettingAspect() > 4.0f / 3.0f + 0.01f && !g_shows_wide() ? 4.0f / 3.0f : 0.0f);
         UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
+        UpdateSelectMenu();                 // Select: EXIT GAME / EXIT TO MENU (a port's EnableSelectMenu)
         // F1: the FPS counter on or off; its figure redrawn twice a second.
         static std::chrono::steady_clock::time_point fps_drawn{};
         const auto now = std::chrono::steady_clock::now();
@@ -474,6 +487,19 @@ bool PumpWindow() {
 #endif
     if (ps2platform::FallbackWindowOpen()) PresentFallback();
     return !g_closed;                  // a game's EXIT GAME (QuitGame) with no window too
+}
+
+// SELECT's menu open: the game held still here (its frame, on the vblank path) - the window pumped, the last
+// picture shown again with the menu, ~60 times a second - until it closes or the window does.
+bool HoldForSelectMenu() {
+    while (SelectMenuOpen()) {
+        if (!PumpWindow()) return false;
+#ifdef PS2HOST_VULKAN
+        if (g_display) g_display->RepeatLast();
+#endif
+        std::this_thread::sleep_for(std::chrono::milliseconds(16));
+    }
+    return !g_closed;
 }
 
 void SetWindowFullscreen(bool on) {
@@ -586,8 +612,40 @@ void SetWindowAntiAliasing(const std::string& mode) {
 void SetWindowUpscaling(const std::string& mode) {
     SetSetting("upscaling", mode);
 #ifdef PS2HOST_VULKAN
-    if (g_display)
-        g_display->SetUpscaling(mode == "fsr1" ? ps2gpu::Display::Upscaling::kFsr : ps2gpu::Display::Upscaling::kLinear);
+    if (g_display) {
+        g_display->SetUpscaling(mode.rfind("fsr", 0) == 0 ? ps2gpu::Display::Upscaling::kFsr
+                                                         : ps2gpu::Display::Upscaling::kLinear);
+        g_display->SetFsrSharpness(FsrSharpnessStops());
+    }
+#endif
+}
+
+// FSR SHARPNESS (the "fsr_sharpness" setting) in RCAS's stops: low 1.0, medium 0.5, high 0.25 (FSR's own until
+// 2026-11-20, the default), max 0.
+float FsrSharpnessStops() {
+    const std::string v = Setting("fsr_sharpness", "high");
+    return v == "low" ? 1.0f : v == "medium" ? 0.5f : v == "max" ? 0.0f : 0.25f;
+}
+
+void SetWindowFsrSharpness(const std::string& level) {
+    SetSetting("fsr_sharpness", level);
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->SetFsrSharpness(FsrSharpnessStops());
+#endif
+}
+
+// FSR PRESET's ratio of the shown picture to the picture drawn (FSR's own: QUALITY 1.5, BALANCED 1.7,
+// PERFORMANCE 2.0); 0 for none (CUSTOM: the chosen RENDER RESOLUTION; or UPSCALING bilinear).
+float FsrPresetRatio() {
+    if (Setting("upscaling", "linear").rfind("fsr", 0) != 0) return 0.0f;
+    const std::string v = Setting("fsr_preset", "quality");
+    return v == "balanced" ? 1.7f : v == "performance" ? 2.0f : 1.5f;
+}
+
+void WindowShownSize(std::uint32_t* width, std::uint32_t* height) {
+    *width = *height = 0;
+#ifdef PS2HOST_VULKAN
+    if (g_display) g_display->ShownSize(width, height);
 #endif
 }
 
@@ -641,7 +699,29 @@ void DumpGameTexts(const std::vector<std::uint32_t>& pixels, u32 width, u32 heig
     std::fprintf(stderr, "[text] %s at %.3f s\n", path.c_str(), double(LastVblankNs()) / 1e9);
 }
 
+namespace {
+void ShowGameTexts(const std::vector<GameText>& texts);
+std::vector<GameText> g_menu_texts, g_subtitle_texts;      // the two layers (SetGameTexts, SetGameSubtitleTexts)
+void ShowLayers() {
+    std::vector<GameText> all = g_menu_texts;
+    all.insert(all.end(), g_subtitle_texts.begin(), g_subtitle_texts.end());
+    ShowGameTexts(all);
+}
+}  // namespace
+
 void SetGameTexts(const std::vector<GameText>& texts) {
+    g_menu_texts = texts;
+    ShowLayers();
+}
+
+void SetGameSubtitleTexts(const std::vector<GameText>& texts) {
+    if (texts.empty() && g_subtitle_texts.empty()) return;
+    g_subtitle_texts = texts;
+    ShowLayers();
+}
+
+namespace {
+void ShowGameTexts(const std::vector<GameText>& texts) {
     static const bool dump = std::getenv("PS2HOST_GAME_TEXT_DUMP") != nullptr;
 #ifdef PS2HOST_VULKAN
     if (!g_display && !dump) return;
@@ -658,7 +738,7 @@ void SetGameTexts(const std::vector<GameText>& texts) {
         for (std::size_t i = 0; i < texts.size(); ++i) {
             const GameText &a = texts[i], &b = last[i];
             if (a.text != b.text || a.x != b.x || a.y != b.y || a.height != b.height || a.colour != b.colour ||
-                a.right != b.right || a.stretch != b.stretch || a.width != b.width || a.mask != b.mask)
+                a.right != b.right || a.centre != b.centre || a.stretch != b.stretch || a.width != b.width || a.mask != b.mask)
                 return false;
         }
         return true;
@@ -679,6 +759,7 @@ void SetGameTexts(const std::vector<GameText>& texts) {
     else g_display->SetPictureLabel(std::move(pixels), columns, kLines, 0.0f, 0.0f, 1.0f, 1.0f);
 #endif
 }
+}  // namespace
 
 void SetWidescreen(std::function<bool()> shows_wide) {
     g_shows_wide = std::move(shows_wide);

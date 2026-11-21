@@ -109,6 +109,17 @@ public:
        as before either way. */
     enum class Upscaling { kLinear, kFsr };
     virtual void SetUpscaling(Upscaling mode) { (void)mode; }
+    /* The picture's left `x` columns and top `y` rows left out of what is shown (PresentImage, PresentImageAt):
+       a picture drawn larger whose first PS2 column / row is only half drawn (gpu_bridge's PresentGpuPicture). */
+    virtual void SetPictureCrop(std::uint32_t x, std::uint32_t y) { (void)x, (void)y; }
+    /* The last picture given (PresentImage / PresentImageAt) shown again now, with the overlay as it is: a game
+       held still behind a menu (the host's SELECT menu). False when there is none. */
+    virtual bool RepeatLast() { return false; }
+    /* FSR's sharpening (RCAS) in its stops: 0 the sharpest, each stop half as sharp (FSR SHARPNESS). */
+    virtual void SetFsrSharpness(float stops) { (void)stops; }
+    /* The picture's size in the window as last shown (its letterbox's inside), 0 x 0 before the first: FSR's
+       presets draw at a fraction of it. */
+    virtual void ShownSize(std::uint32_t* width, std::uint32_t* height) const { *width = *height = 0; }
     /* BLOOM (porting guide 4b, a PC enhancement, off by default): the finished picture's bright parts spread
        as a soft glow, before it is scaled to the window - 0 off, else BLOOM STRENGTH 1-10. */
     virtual void SetBloom(int strength) { (void)strength; }

@@ -281,6 +281,9 @@ void NativeGetPicture(lifted::Context& c) {
                      static_cast<unsigned long long>(g_sunk), g_native->errors(), g_native->ended() ? ", ended" : "",
                      g_native->error().empty() ? "" : (" - " + g_native->error()).c_str());
     g_ts_context = nullptr;
+    // A movie's picture (a whole-screen one: 320 pixels across or more) - LastMoviePictureNs (a port's 4:3 for
+    // movies alone, ZOE's ShowsWide, the maintainer 2026-11-20).
+    if (got && picture.shown_width >= 320) NoteMoviePicture();
     if (got) {
         std::vector<u32> rgba;
         unsigned th0 = 0, th1 = 0;

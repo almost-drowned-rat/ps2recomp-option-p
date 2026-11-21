@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2host/crash_report.h"
 #include "ps2host/disc.h"
 #include "ps2host/host.h"
 #include "ps2host/run.h"
@@ -55,6 +56,7 @@ bool HasAvx2() {
 }
 
 std::string g_log;     // the log a run started without arguments writes
+std::filesystem::path g_here;      // ...its folder (the game's), for the crash reports
 
 #ifdef PS2HOST_GAME_EXECUTABLE
 /* Whether `path` is an image of the game's disc: the executable it boots is
@@ -72,7 +74,7 @@ bool IsGameDisc(const std::string& path) {
 /* The player's disc image, from a file dialog; "" if they cancel. */
 std::string PickDisc() {
     return ps2platform::PickFile("Choose your " PS2HOST_GAME_NAME " disc image",
-                                 "Disc images (*.iso; *.cue; *.bin)\0*.iso;*.cue;*.bin\0All files (*.*)\0*.*\0");
+                                 "Disc images (*.iso; *.chd; *.cue; *.bin)\0*.iso;*.chd;*.cue;*.bin\0All files (*.*)\0*.*\0");
 }
 #endif
 
@@ -88,17 +90,21 @@ std::vector<std::string> PlayArguments(const char* self) {
     const std::filesystem::path here = exe.parent_path();
     ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
-    // None chosen yet, or gone: an image of the game's disc beside the
-    // executable is taken without asking.
+    // None chosen yet, or gone (moved): an image of the game's disc beside the executable or in its "game"
+    // folder (the launcher's, as option-c's) is taken without asking.
     if (!IsGameDisc(disc)) {
-        std::error_code error;
-        for (const auto& entry : std::filesystem::directory_iterator(here, error)) {
-            std::string ext = entry.path().extension().string();
-            for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
-            if ((ext == ".iso" || ext == ".bin" || ext == ".cue") && IsGameDisc(entry.path().string())) {
-                disc = entry.path().string();
-                break;
+        for (const std::filesystem::path& folder : {here, here / "game"}) {
+            std::error_code error;
+            for (const auto& entry : std::filesystem::directory_iterator(folder, error)) {
+                std::string ext = entry.path().extension().string();
+                for (char& ch : ext) ch = char(tolower(static_cast<unsigned char>(ch)));
+                if ((ext == ".iso" || ext == ".chd" || ext == ".bin" || ext == ".cue") &&
+                    IsGameDisc(entry.path().string())) {
+                    disc = entry.path().string();
+                    break;
+                }
             }
+            if (IsGameDisc(disc)) break;
         }
     }
     while (!IsGameDisc(disc)) {
@@ -109,10 +115,27 @@ std::vector<std::string> PlayArguments(const char* self) {
         if (disc.empty()) return {};
     }
     if (disc != ps2host::Setting("disc")) ps2host::SetSetting("disc", disc);
-    // No terminal to read: what the run says goes to a log beside it, stdout's and stderr's lines in the
-    // order they were written, unbuffered (a run ended by force loses nothing).
-    g_log = exe.stem().string() + ".log";
-    ps2platform::RedirectOutput((here / g_log).string());
+    // No terminal to read: what the run says goes to a log in data\logs, stdout's and stderr's lines in the
+    // order they were written, unbuffered (a run ended by force loses nothing). The "log_keep" setting (1, the
+    // default, or 3): the last runs' logs kept as <name>.1.log, <name>.2.log (the maintainer 2026-11-20).
+    const std::filesystem::path logs = here / "data" / "logs";
+    std::error_code made;
+    std::filesystem::create_directories(logs, made);
+    const std::string stem = exe.stem().string();
+    g_log = "data\\logs\\" + stem + ".log";
+    g_here = here;
+    const int keep = ps2host::Setting("log_keep") == "3" ? 3 : 1;
+    for (int n = 1; n <= 2; ++n) {
+        std::error_code gone;
+        if (n >= keep) std::filesystem::remove(logs / (stem + "." + std::to_string(n) + ".log"), gone);
+    }
+    if (keep > 1) {
+        std::error_code moved;
+        std::filesystem::remove(logs / (stem + ".2.log"), moved);
+        std::filesystem::rename(logs / (stem + ".1.log"), logs / (stem + ".2.log"), moved);
+        std::filesystem::rename(logs / (stem + ".log"), logs / (stem + ".1.log"), moved);
+    }
+    ps2platform::RedirectOutput((logs / (stem + ".log")).string());
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
     return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
             "--audio", "--timeout", "315360000"};     // ten years
@@ -127,11 +150,20 @@ int main(int argc, char** argv) {
     // A port built as a windowed program has no console of its own. Started from a terminal its output goes to
     // that one; redirected (a file, a pipe: the tools' runs), where it was sent.
     ps2platform::AttachTerminal();
+#ifdef PS2HOST_GAME_TITLE
+    const ps2host::ReportGame report{PS2HOST_GAME_TITLE, PS2HOST_GAME_VERSION, PS2HOST_GAME_TARGET,
+                                     PS2HOST_GAME_GITHUB};
+    // A crashed run's report (ps2host/crash_report.h: this program started again by the crash's filter).
+    if (ps2host::IsCrashReportHelper(argc, argv)) return ps2host::CrashReportHelper(argc, argv, report);
+#endif
     std::vector<std::string> play;
     std::vector<char*> play_argv;
     if (argc == 1) {
         play = PlayArguments(argv[0]);
         if (play.empty()) return 0;
+#ifdef PS2HOST_GAME_TITLE
+        ps2host::ArmCrashReports(g_here, g_log, report);     // (a player's run: crashes and error stops reported)
+#endif
         for (std::string& arg : play) play_argv.push_back(arg.data());
         play_argv.push_back(nullptr);
         argc = int(play.size());
@@ -158,8 +190,10 @@ int main(int argc, char** argv) {
     if (!play.empty() && code != 0) {         // closing the window ends a run with 0
         std::fflush(nullptr);
         const std::string text = "The game stopped because of an error. What happened is in " +
-                                 g_log + ", beside the game.";
-        ps2platform::ShowMessage(ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle().c_str(), text, true);
+                                 g_log + " in the game's folder.";
+        if (!ps2host::ReportStop(code))       // (a player's run: a crash report and the message with it)
+            ps2platform::ShowMessage(ps2host::GameTitle().empty() ? "PS2 port" : ps2host::GameTitle().c_str(), text,
+                                     true);
     }
     // What must be finished is (the report written, the settings and the
     // memory card saved as they changed, the WAV's header here); the rest -

@@ -49,6 +49,9 @@ bool SampleRenderThread();
 /* A host crash (an access violation and the like, on any thread): its code,
    address and the stack by name, to stderr, before the process ends. */
 void InstallCrashReport();
+/* A program to start after the crash's lines are written (Windows: a command line - crash_report.cpp's helper);
+   "" none. */
+void SetCrashCommand(const wchar_t* command);
 /* --sample-from N: no samples until frame N (devices.cpp calls this each frame). */
 void SetSampleFrom(unsigned long long frame);
 void SampleFrame(unsigned long long frame);

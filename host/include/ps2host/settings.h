@@ -26,6 +26,12 @@ void SetSetting(const std::string& key, const std::string& value);
 void SetSettingOn(const std::string& key, bool on);
 /* Sets one for this run only (--setting): the file is not written. */
 void RunSetting(const std::string& key, const std::string& value);
+/* Sets one for a session (a LAN game's host's, say): read before the file's value, never written to the file,
+   until ClearSessionSettings. */
+void SessionSetting(const std::string& key, const std::string& value);
+void ClearSessionSettings();
+/* All of them in one log line ("[settings] <file>: key=value ..."), as a run starts; SetSetting logs each change. */
+void LogSettings();
 
 }  // namespace ps2host
 
