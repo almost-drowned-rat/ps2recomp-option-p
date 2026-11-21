@@ -37,6 +37,7 @@
 #include <string>
 #include <vector>
 
+#include "ps2platform/platform.h"
 #include "ps2host/dma.h"
 #include "ps2host/timeline.h"
 #ifdef PS2HOST_VULKAN
@@ -674,7 +675,7 @@ void StartCapture(u64 frame) {
     char name[64];
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
-    localtime_s(&tm, &now);
+    tm = ps2platform::LocalTime(now);
     std::snprintf(name, sizeof name, "%04d%02d%02d-%02d%02d%02d-frame%llu", tm.tm_year + 1900, tm.tm_mon + 1,
                   tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<unsigned long long>(frame + 1));
     const fs::path dir = base / name;

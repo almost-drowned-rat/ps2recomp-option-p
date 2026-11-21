@@ -2,6 +2,7 @@
  * libmc2's handlers over a directory (mc2.h).
  */
 
+#include "ps2platform/platform.h"
 #include "ps2host/mc2.h"
 
 #include <algorithm>
@@ -106,7 +107,7 @@ void DateTime(const fs::path& path, u8 out[8]) {
         when = std::chrono::system_clock::to_time_t(system);
     }
     std::tm local{};
-    localtime_s(&local, &when);
+    local = ps2platform::LocalTime(when);
     const u32 year = u32(local.tm_year + 1900);
     const u8 bytes[8] = {0, u8(local.tm_sec), u8(local.tm_min), u8(local.tm_hour), u8(local.tm_mday),
                          u8(local.tm_mon + 1), u8(year), u8(year >> 8)};

@@ -26,6 +26,8 @@ typedef struct {
     uint16_t method;          /* 0 stored, 8 deflate */
     uint16_t flags;
     int      dir;             /* name ends with a separator */
+    uint16_t made_by;         /* "version made by": its high byte the system (3: Unix) */
+    uint32_t mode;            /* a Unix-made entry's permission bits (external attributes >> 16), else 0 */
 } ZipEntry;
 
 typedef struct ZipFile ZipFile;

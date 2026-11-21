@@ -37,6 +37,26 @@ endif()
 # the ports' launchers), SDL3's elsewhere.
 if(WIN32)
     set(setup_ui ${CMAKE_CURRENT_LIST_DIR}/game_setup_ui_win95.c)
+elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    # Linux (agent L, 2026-11-21): the same Windows 95 window drawn with SDL3 (game_setup_ui_win95_sdl.c) - its
+    # font Liberation Sans (engine/data/fonts, SIL OFL 1.1) by stb_truetype, both built in here.
+    set(setup_ui ${CMAKE_CURRENT_LIST_DIR}/game_setup_ui_win95_sdl.c)
+    set(launcher_gen ${CMAKE_CURRENT_BINARY_DIR}/launcher_generated)
+    if(NOT EXISTS ${launcher_gen}/stb_truetype.h)
+        file(DOWNLOAD https://raw.githubusercontent.com/nothings/stb/2c980bb59875b0d32144a71867fbdebb2f77cd20/stb_truetype.h
+             ${launcher_gen}/stb_truetype.h
+             EXPECTED_HASH SHA256=ecd30b05e0dd4fea3a13c26810dd9e1992dc379049482c393d5a19e6b5090aab TLS_VERIFY ON)
+    endif()
+    foreach(face Regular Bold)
+        string(TOLOWER ${face} face_lower)
+        set(font_file ${CMAKE_CURRENT_LIST_DIR}/../data/fonts/LiberationSans-${face}.ttf)
+        set(font_inc ${launcher_gen}/liberation_sans_${face_lower}.inc)
+        if(NOT EXISTS ${font_inc} OR ${font_file} IS_NEWER_THAN ${font_inc})
+            file(READ ${font_file} font_hex HEX)
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," font_bytes "${font_hex}")
+            file(WRITE ${font_inc} "// From engine/data/fonts/LiberationSans-${face}.ttf (engine/launcher): generated.\n${font_bytes}\n")
+        endif()
+    endforeach()
 else()
     set(setup_ui ${CMAKE_CURRENT_LIST_DIR}/game_setup_ui.c)
 endif()
@@ -57,6 +77,9 @@ target_link_libraries(ps2_launcher PRIVATE chdr-static)
 target_include_directories(ps2_launcher PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../host/third_party/libchdr/include)
 target_include_directories(ps2_launcher PRIVATE ${CMAKE_CURRENT_LIST_DIR} ${CMAKE_CURRENT_LIST_DIR}/third_party/miniz
                                                 ${CMAKE_CURRENT_BINARY_DIR})
+if(launcher_gen)
+    target_include_directories(ps2_launcher PRIVATE ${launcher_gen})
+endif()
 # miniz (3.1.2, MIT, LICENSES/miniz-MIT.txt): only its inflate; miniz_export.h, which its own build makes, empty
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/miniz_export.h "#define MINIZ_EXPORT\n")
 target_compile_definitions(ps2_launcher PRIVATE MINIZ_NO_STDIO MINIZ_NO_TIME MINIZ_NO_DEFLATE_APIS

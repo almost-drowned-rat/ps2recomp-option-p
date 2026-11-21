@@ -26,11 +26,21 @@
 #include <shellapi.h>
 
 #include <SDL3/SDL.h>
+#elif defined(__linux__)
+#include <cpuid.h>
+#include <signal.h>
+#include <sys/sysinfo.h>
+#include <sys/utsname.h>
+#include <unistd.h>
+
+#include <SDL3/SDL.h>
+
+#include "ps2platform/platform.h"
 #endif
 
 namespace ps2host {
 
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__linux__)
 
 namespace fs = std::filesystem;
 
@@ -41,6 +51,7 @@ fs::path g_folder;
 std::string g_log;
 ReportGame g_game;
 
+#ifdef _WIN32
 std::string Narrow(const std::wstring& w) {
     if (w.empty()) return {};
     const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
@@ -73,6 +84,23 @@ void Raise(const std::string& title) {
     }).detach();
 }
 
+// A path's text (UTF-8) and a path from UTF-8 text.
+std::string PathText(const fs::path& p) { return Narrow(p.wstring()); }
+fs::path PathOf(const std::string& s) { return fs::path(Widen(s)); }
+std::FILE* OpenFile(const fs::path& p, const wchar_t* mode) { return _wfopen(p.wstring().c_str(), mode); }
+#else
+// Linux (agent L, 2026-11-21): paths are UTF-8 bytes already.
+std::string PathText(const fs::path& p) { return p.string(); }
+fs::path PathOf(const std::string& s) { return fs::path(s); }
+std::FILE* OpenFile(const fs::path& p, const wchar_t* mode) {
+    char m[8] = {};
+    for (int i = 0; i < 7 && mode[i]; ++i) m[i] = char(mode[i]);
+    return std::fopen(p.c_str(), m);
+}
+// (the message comes up in front by itself: the window manager raises a new dialog)
+void Raise(const std::string&) {}
+#endif
+
 // ------------------------------------------------------------ a zip, stored
 
 std::uint32_t Crc32(const std::string& data) {
@@ -103,10 +131,14 @@ void Put32(std::string& s, std::uint32_t v) { Put16(s, v & 0xFFFF), Put16(s, v >
 bool WriteZip(const fs::path& path, const std::vector<Entry>& entries) {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
     localtime_s(&tm, &now);
+#else
+    tm = ps2platform::LocalTime(now);
+#endif
     const unsigned dos_time = unsigned(tm.tm_hour << 11 | tm.tm_min << 5 | tm.tm_sec / 2);
     const unsigned dos_date = unsigned((tm.tm_year - 80) << 9 | (tm.tm_mon + 1) << 5 | tm.tm_mday);
-    std::FILE* f = _wfopen(path.wstring().c_str(), L"wb");
+    std::FILE* f = OpenFile(path, L"wb");
     if (!f) return false;
     std::string central;
     std::uint32_t at = 0;
@@ -146,7 +178,7 @@ constexpr std::size_t kMostOfAFile = 48u << 20;     // a longer log: its first 8
 constexpr std::uintmax_t kMostOfACapture = 16u << 20;
 
 bool ReadFile(const fs::path& path, std::string* out) {
-    std::FILE* f = _wfopen(path.wstring().c_str(), L"rb");
+    std::FILE* f = OpenFile(path, L"rb");
     if (!f) return false;
     out->clear();
     char chunk[1 << 16];
@@ -161,9 +193,18 @@ bool ReadFile(const fs::path& path, std::string* out) {
 /* The player's own folder (C:\Users\<name>) written %USERPROFILE% - either
    slash, any case. */
 std::string Private(std::string text) {
+#ifdef _WIN32
     wchar_t profile[MAX_PATH] = {};
     if (!GetEnvironmentVariableW(L"USERPROFILE", profile, MAX_PATH)) return text;
     const std::string mine = Narrow(profile);
+    const char* const kMark = "%USERPROFILE%";
+#else
+    // Linux: the home folder (/home/<name>) written $HOME.
+    const char* home = std::getenv("HOME");
+    if (!home) return text;
+    const std::string mine = home;
+    const char* const kMark = "$HOME";
+#endif
     if (mine.size() < 4) return text;
     for (const bool forward : {false, true}) {
         std::string from = mine;
@@ -175,7 +216,7 @@ std::string Private(std::string text) {
         std::string out;
         std::size_t at = 0;
         for (std::size_t hit; (hit = lower_text.find(lower_from, at)) != std::string::npos; at = hit + from.size())
-            out += text.substr(at, hit - at) + "%USERPROFILE%";
+            out += text.substr(at, hit - at) + kMark;
         out += text.substr(at);
         text = out;
     }
@@ -183,6 +224,7 @@ std::string Private(std::string text) {
 }
 
 std::string Processor() {
+#ifdef _WIN32
     int info[4];
     __cpuid(info, 0x80000000);
     if (unsigned(info[0]) < 0x80000004u) return "?";
@@ -191,11 +233,21 @@ std::string Processor() {
         __cpuid(info, 0x80000002 + i);
         std::memcpy(brand + 16 * i, info, 16);
     }
+#else
+    unsigned info[4] = {};
+    if (!__get_cpuid(0x80000000u, &info[0], &info[1], &info[2], &info[3]) || info[0] < 0x80000004u) return "?";
+    char brand[49] = {};
+    for (unsigned i = 0; i < 3; ++i) {
+        __get_cpuid(0x80000002u + i, &info[0], &info[1], &info[2], &info[3]);
+        std::memcpy(brand + 16 * i, info, 16);
+    }
+#endif
     std::string s = brand;
     while (!s.empty() && s.front() == ' ') s.erase(s.begin());
     return s;
 }
 
+#ifdef _WIN32
 std::string WindowsBuild() {
     using RtlGetVersionFn = LONG(WINAPI*)(OSVERSIONINFOW*);
     const auto get = reinterpret_cast<RtlGetVersionFn>(
@@ -207,11 +259,16 @@ std::string WindowsBuild() {
     std::snprintf(text, sizeof text, "%lu.%lu.%lu", v.dwMajorVersion, v.dwMinorVersion, v.dwBuildNumber);
     return text;
 }
+#endif
 
 std::string Stamp(const char* form) {
     const std::time_t now = std::time(nullptr);
     std::tm tm{};
+#ifdef _WIN32
     localtime_s(&tm, &now);
+#else
+    tm = ps2platform::LocalTime(now);
+#endif
     char text[64];
     std::strftime(text, sizeof text, form, &tm);
     return text;
@@ -223,6 +280,7 @@ fs::path MakeReport(const fs::path& folder, const fs::path& log, const ReportGam
     const fs::path dir = folder / "crash reports";
     fs::create_directories(dir, error);
     std::vector<Entry> entries;
+#ifdef _WIN32
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     MEMORYSTATUSEX memory{};
@@ -237,12 +295,25 @@ fs::path MakeReport(const fs::path& folder, const fs::path& log, const ReportGam
                        "Windows: " + WindowsBuild() + "\r\n" +
                        "Processor: " + Processor() + "\r\n" +
                        "Memory: " + ram + "\r\n";
+#else
+    // Linux: the same lines, the system's in the platform layer's words (its log head's, SystemReport).
+    struct sysinfo memory{};
+    sysinfo(&memory);
+    char ram[32];
+    std::snprintf(ram, sizeof ram, "%.1f GB", double(memory.totalram) * memory.mem_unit / double(1ull << 30));
+    std::string text = game.title + " " + game.version + "\r\n" +
+                       "Executable: " + ps2platform::ExePath().filename().string() + "\r\n" +
+                       "When: " + Stamp("%Y-%m-%d %H:%M:%S") + "\r\n" +
+                       "What happened: " + why + "\r\n";
+    for (const std::string& line : ps2platform::SystemReport()) text += line + "\r\n";
+    text += "Processor: " + Processor() + "\r\n" + "Memory: " + ram + "\r\n";
+#endif
     entries.push_back({"report.txt", text});
     std::string data;
-    if (ReadFile(log, &data)) entries.push_back({Narrow(log.filename().wstring()), Private(data)});
+    if (ReadFile(log, &data)) entries.push_back({PathText(log.filename()), Private(data)});
     fs::path prev = log;                        // (the run before's: <name>.1.log - main.cpp's rotation)
     prev.replace_extension(".1.log");
-    if (ReadFile(prev, &data)) entries.push_back({Narrow(prev.filename().wstring()), Private(data)});
+    if (ReadFile(prev, &data)) entries.push_back({PathText(prev.filename()), Private(data)});
     if (ReadFile(folder / "pc_settings.ini", &data)) entries.push_back({"pc_settings.ini", Private(data)});
     // The newest capture (F12) of the last hour: its pictures and small files
     // (not its GS stream or trace, tens of MB).
@@ -253,20 +324,26 @@ fs::path MakeReport(const fs::path& folder, const fs::path& log, const ReportGam
             newest = e.path(), newest_time = e.last_write_time(error);
     if (!newest.empty() && fs::file_time_type::clock::now() - newest_time < std::chrono::hours(1))
         for (const auto& e : fs::directory_iterator(newest, error)) {
-            const std::string name = Narrow(e.path().filename().wstring());
+            const std::string name = PathText(e.path().filename());
             if (!e.is_regular_file(error) || e.file_size(error) > kMostOfACapture || name == "replay.bin" ||
                 name == "trace.txt" || !ReadFile(e.path(), &data))
                 continue;
-            entries.push_back({"capture/" + Narrow(newest.filename().wstring()) + "/" + name, data});
+            entries.push_back({"capture/" + PathText(newest.filename()) + "/" + name, data});
         }
-    const fs::path zip = dir / Widen(game.target + "-" + game.version + "-" + Stamp("%Y%m%d-%H%M%S") + ".zip");
+    const fs::path zip = dir / PathOf(game.target + "-" + game.version + "-" + Stamp("%Y%m%d-%H%M%S") + ".zip");
     if (!WriteZip(zip, entries)) {
-        std::fprintf(stderr, "[report] could not write %s\n", Narrow(zip.wstring()).c_str());
+        std::fprintf(stderr, "[report] could not write %s\n", PathText(zip).c_str());
         return {};
     }
-    std::fprintf(stderr, "[report] %s: %zu files\n", Narrow(zip.wstring()).c_str(), entries.size());
+    std::fprintf(stderr, "[report] %s: %zu files\n", PathText(zip).c_str(), entries.size());
     return zip;
 }
+
+#ifdef _WIN32
+const std::string kSep = "\\";
+#else
+const std::string kSep = "/";
+#endif
 
 /* The player told where the report is: the folder, a GitHub issue, or close. */
 void Tell(const fs::path& zip, const ReportGame& game, bool crashed) {
@@ -274,13 +351,13 @@ void Tell(const fs::path& zip, const ReportGame& game, bool crashed) {
     const std::string title = game.title.empty() ? "PS2 port" : game.title;
     std::string text = title + (crashed ? " crashed." : " stopped because of an error.");
     if (zip.empty()) {
-        text += "\n\nNo crash report could be saved. What happened is in data\\logs\\" + game.target + ".log.";
+        text += "\n\nNo crash report could be saved. What happened is in data" + kSep + "logs" + kSep + game.target + ".log.";
         Raise(title);
         SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, title.c_str(), text.c_str(), nullptr);
         return;
     }
     text += "\n\nA crash report was saved in the \"crash reports\" folder beside the game:\n" +
-            Narrow(zip.filename().wstring()) +
+            PathText(zip.filename()) +
             "\n\nPlease attach it to a report of the problem, with what you were doing when it happened.";
     std::vector<SDL_MessageBoxButtonData> buttons = {{SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT, 0, "Open the folder"}};
     if (!game.github.empty()) buttons.push_back({0, 1, "Report on GitHub"});
@@ -290,6 +367,7 @@ void Tell(const fs::path& zip, const ReportGame& game, bool crashed) {
     int chosen = 2;
     Raise(title);
     if (!SDL_ShowMessageBox(&box, &chosen)) return;
+#ifdef _WIN32
     if (chosen == 0) {
         const std::wstring select = L"/select,\"" + zip.wstring() + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", select.c_str(), nullptr, SW_SHOWNORMAL);
@@ -297,6 +375,11 @@ void Tell(const fs::path& zip, const ReportGame& game, bool crashed) {
         const std::wstring url = Widen("https://github.com/" + game.github + "/issues/new");
         ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
     }
+#else
+    // Linux: the folder in the desktop's file manager, the issue page in its browser (xdg-open, by SDL).
+    if (chosen == 0) SDL_OpenURL(("file://" + PathText(zip.parent_path())).c_str());
+    else if (chosen == 1) SDL_OpenURL(("https://github.com/" + game.github + "/issues/new").c_str());
+#endif
 }
 
 }  // namespace
@@ -306,16 +389,21 @@ void ArmCrashReports(const fs::path& folder, const std::string& log, const Repor
     g_folder = folder;
     g_log = log;
     g_game = game;
+#ifdef _WIN32
     wchar_t exe[MAX_PATH] = {};
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     const std::wstring command = L"\"" + std::wstring(exe) + L"\" --crash-report " +
                                  std::to_wstring(GetCurrentProcessId()) + L" \"" + (folder / Widen(log)).wstring() + L"\"";
     SetCrashCommand(command.c_str());
+#else
+    SetCrashHelper({ps2platform::ExePath().string(), "--crash-report", std::to_string(getpid()),
+                    PathText(folder / PathOf(log))});
+#endif
     if (const char* v = std::getenv("PS2HOST_TEST_CRASH")) {
         const int seconds = std::atoi(v);
         std::fprintf(stderr, "[report] a test's crash in %d s\n", seconds);
         std::thread([seconds] {
-            Sleep(DWORD(seconds) * 1000);
+            std::this_thread::sleep_for(std::chrono::seconds(seconds));
             volatile int* nowhere = nullptr;
             *nowhere = 1;
         }).detach();
@@ -324,7 +412,9 @@ void ArmCrashReports(const fs::path& folder, const std::string& log, const Repor
 
 bool IsCrashReportHelper(int argc, char** argv) { return argc == 4 && std::string(argv[1]) == "--crash-report"; }
 
-int CrashReportHelper(int, char**, const ReportGame& game) {
+int CrashReportHelper(int argc, char** argv, const ReportGame& game) {
+#ifdef _WIN32
+    (void)argc, (void)argv;
     // (the arguments again as Windows has them: a log's path in any language)
     int count = 0;
     wchar_t** args = CommandLineToArgvW(GetCommandLineW(), &count);
@@ -337,6 +427,14 @@ int CrashReportHelper(int, char**, const ReportGame& game) {
         WaitForSingleObject(process, 20000);
         CloseHandle(process);
     }
+#else
+    if (argc != 4) return 2;
+    const pid_t pid = pid_t(std::strtol(argv[2], nullptr, 10));
+    const fs::path log = argv[3];
+    // The crashed process gone first (a core dump may hold it a while): at most 20 s.
+    for (int i = 0; i < 400 && pid > 0 && kill(pid, 0) == 0; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+#endif
     // The game's folder: the log's (Option P's logs in its data\logs).
     fs::path folder = log.parent_path();
     if (folder.filename() == "logs" && folder.parent_path().filename() == "data") folder = folder.parent_path().parent_path();
@@ -348,7 +446,7 @@ int CrashReportHelper(int, char**, const ReportGame& game) {
 bool ReportStop(int code) {
     if (!g_armed) return false;
     std::fflush(nullptr);
-    const fs::path zip = MakeReport(g_folder, g_folder / Widen(g_log), g_game,
+    const fs::path zip = MakeReport(g_folder, g_folder / PathOf(g_log), g_game,
                                     "it stopped with an error (code " + std::to_string(code) + ")");
     Tell(zip, g_game, false);
     return true;

@@ -9,6 +9,7 @@
 #define PS2HOST_PROFILE_H
 
 #include <string>
+#include <vector>
 
 namespace ps2host {
 
@@ -52,6 +53,8 @@ void InstallCrashReport();
 /* A program to start after the crash's lines are written (Windows: a command line - crash_report.cpp's helper);
    "" none. */
 void SetCrashCommand(const wchar_t* command);
+/* The same elsewhere (Linux): the helper's arguments, argv[0] the program; empty none. */
+void SetCrashHelper(const std::vector<std::string>& argv);
 /* --sample-from N: no samples until frame N (devices.cpp calls this each frame). */
 void SetSampleFrom(unsigned long long frame);
 void SampleFrame(unsigned long long frame);

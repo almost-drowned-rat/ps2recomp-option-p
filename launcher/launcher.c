@@ -18,6 +18,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/stat.h>
 #endif
 
 #define LP 1024
@@ -620,7 +622,7 @@ static int no_game_dialog(L *l, const char *why)
 static void open_folder(L *l, const char *dir)
 {
     char url[LP + 16], *s;
-    snprintf(url, sizeof url, "file:///%s", dir);
+    snprintf(url, sizeof url, "file://%s%s", dir[0] == '/' ? "" : "/", dir);
     for (s = url; *s; s++)
         if (*s == '\\')
             *s = '/';
@@ -716,6 +718,11 @@ static int unzip_into(L *l, const char *zp, const char *dest, Prog *prog, const 
                 lg(l, "%s: %s: %s", what, e->name, err);
                 bad = 1;
             }
+#ifndef _WIN32
+            /* Linux: a program in the zip (the compiler, Python) runnable again - its Unix mode kept */
+            else if (e->mode & 0111)
+                chmod(dst, 0755);
+#endif
         }
         SDL_AddAtomicInt(&prog->done_n, 1);
     }
@@ -1488,6 +1495,9 @@ static int move_to_target(L *l, const char *target, const char *extra, const cha
         xr_setup_ui_message(l->ui, 1, "The game cannot be copied into the target folder - see data\\launcher.log.");
         return 0;
     }
+#ifndef _WIN32
+    chmod(exe_to, 0755);                /* (the copy a program again: the AppImage) */
+#endif
     argv[k++] = exe_to;
     argv[k++] = "--go";
     argv[k++] = "--image";
@@ -1553,7 +1563,21 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         if (k > 0 && k < LP)
             WideCharToMultiByte(CP_UTF8, 0, w, -1, self, (int)sizeof self, NULL, NULL);
 #else
-        snprintf(self, sizeof self, "/proc/self/exe");
+        /* Linux: the AppImage is the one file the player has (the payload appended to it, as to the Windows exe) and
+         * its folder is the game's - the launcher itself runs from the AppImage's read-only mount */
+        const char *appimage = SDL_getenv("APPIMAGE");
+        if (appimage && *appimage) {
+            char *slash;
+            snprintf(self, sizeof self, "%s", appimage);
+            snprintf(l.root, sizeof l.root, "%s", appimage);
+            slash = strrchr(l.root, '/');
+            if (slash)
+                slash[1] = 0;
+            else
+                snprintf(l.root, sizeof l.root, "./");
+        } else {
+            snprintf(self, sizeof self, "/proc/self/exe");
+        }
 #endif
         snprintf(l.exe, sizeof l.exe, "%s", exe_name && *exe_name ? exe_name : self);
     }

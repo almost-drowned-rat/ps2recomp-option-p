@@ -29,6 +29,12 @@
 #include <dbghelp.h>
 #include <intrin.h>
 #include <timeapi.h>
+#elif defined(__linux__)
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <signal.h>
+#include <sys/syscall.h>
+#include <unistd.h>
 #endif
 
 namespace ps2host {
@@ -626,10 +632,97 @@ void SetCrashCommand(const wchar_t* command) {
     g_crash_command[n] = 0;
 }
 
+void SetCrashHelper(const std::vector<std::string>&) {}
+
+#elif defined(__linux__)
+
+// Linux (agent L, 2026-11-21): the crash report's half of the Windows filter above - a signal handler on its own
+// stack writes the signal, the address and the stack (glibc's backtrace: the executable's exported names, else its
+// offsets) to the log, starts the report's helper (crash_report.cpp: this program again, SetCrashHelper) and lets
+// the signal end the process. The sampler (--sample) is the Windows build's (on Linux: perf).
+
+namespace {
+
+char g_crash_exe[4096] = "";                 // (made before: nothing allocated in a crash) - SetCrashHelper
+char g_crash_args[8][4096] = {};
+int g_crash_argc = 0;
+
+void CrashHandler(int signal, siginfo_t* info, void*) {
+    static std::atomic<bool> reported{false};
+    if (!reported.exchange(true)) {
+        const char* name = signal == SIGSEGV ? "SIGSEGV" : signal == SIGBUS ? "SIGBUS" : signal == SIGILL ? "SIGILL"
+                           : signal == SIGFPE ? "SIGFPE" : signal == SIGABRT ? "SIGABRT" : "signal";
+        std::fprintf(stderr, "[crash] %s (%d, code %d) at %p on thread %ld\n", name, signal, info ? info->si_code : 0,
+                     info ? info->si_addr : nullptr, static_cast<long>(syscall(SYS_gettid)));
+        void* frames[32];
+        const int n = backtrace(frames, 32);
+        Dl_info where{};
+        for (int i = 0; i < n; ++i) {
+            if (dladdr(frames[i], &where) && where.dli_fname) {
+                const char* file = std::strrchr(where.dli_fname, '/');
+                file = file ? file + 1 : where.dli_fname;
+                const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(where.dli_fbase);
+                std::fprintf(stderr, "[crash]   %s+0x%llX %s\n", file,
+                             static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[i]) - base),
+                             where.dli_sname ? where.dli_sname : "?");
+            } else {
+                std::fprintf(stderr, "[crash]   %p\n", frames[i]);
+            }
+        }
+        std::fflush(stderr);
+        // The crash report's helper (crash_report.cpp): this program again, the report made once this one is gone.
+        if (g_crash_exe[0]) {
+            char* argv[10] = {};
+            argv[0] = g_crash_exe;
+            for (int i = 0; i < g_crash_argc; ++i) argv[i + 1] = g_crash_args[i];
+            const pid_t child = fork();
+            if (child == 0) {
+                setsid();
+                execv(g_crash_exe, argv);
+                _exit(127);
+            }
+        }
+    }
+    // The default action now (SA_RESETHAND): the process ends as the signal says, a core where the system keeps one.
+    raise(signal);
+}
+
+}  // namespace
+
+void InstallCrashReport() {
+    static std::vector<char> alternate(std::size_t(256) * 1024);    // a stack overflow still reports
+    stack_t stack{};
+    stack.ss_sp = alternate.data();
+    stack.ss_size = alternate.size();
+    sigaltstack(&stack, nullptr);
+    struct sigaction action{};
+    action.sa_sigaction = CrashHandler;
+    action.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
+    sigemptyset(&action.sa_mask);
+    for (int signal : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT}) sigaction(signal, &action, nullptr);
+    void* warm[1];
+    backtrace(warm, 1);                       // (glibc loads its unwinder on the first call: not in the crash)
+}
+
+void SetCrashCommand(const wchar_t*) {}
+
+void SetCrashHelper(const std::vector<std::string>& argv) {
+    g_crash_exe[0] = 0;
+    g_crash_argc = 0;
+    if (argv.empty()) return;
+    std::snprintf(g_crash_exe, sizeof g_crash_exe, "%s", argv[0].c_str());
+    for (std::size_t i = 1; i < argv.size() && g_crash_argc < 8; ++i)
+        std::snprintf(g_crash_args[g_crash_argc++], sizeof g_crash_args[0], "%s", argv[i].c_str());
+}
+
+void StartSampler() {}
+std::string SampleReport(int) { return ""; }
+
 #else
 
 void InstallCrashReport() {}
 void SetCrashCommand(const wchar_t*) {}
+void SetCrashHelper(const std::vector<std::string>&) {}
 void StartSampler() {}
 std::string SampleReport(int) { return ""; }
 
