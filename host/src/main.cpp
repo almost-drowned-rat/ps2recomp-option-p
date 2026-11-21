@@ -5,6 +5,7 @@
 
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -149,8 +150,15 @@ std::vector<std::string> PlayArguments(const char* self) {
     }
     ps2platform::RedirectOutput((logs / (stem + ".log")).string());
     std::fprintf(stderr, "[port] disc %s\n", disc.c_str());
-    return {self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
-            "--audio", "--timeout", "315360000"};     // ten years
+    std::vector<std::string> args{self, "--disc", disc, "--memcard", (here / "memcard").string(), "--window", "--gpu",
+                                  "--audio", "--timeout", "315360000"};     // ten years
+    // (a measured run that ends by itself - the profiler's summary written at its end: PS2HOST_TIMEOUT = seconds)
+    if (const char* t = std::getenv("PS2HOST_TIMEOUT"); t && *t) args.back() = t;      // ("--timeout"'s value)
+    // A developer's session recorded or played back (no command line on Android: the environment, there set from
+    // the app's dev_env.txt): PS2HOST_RECORD_INPUT / PS2HOST_REPLAY_INPUT = a file, as --record-input / --replay-input
+    if (const char* f = std::getenv("PS2HOST_RECORD_INPUT"); f && *f) args.insert(args.end(), {"--record-input", f});
+    if (const char* f = std::getenv("PS2HOST_REPLAY_INPUT"); f && *f) args.insert(args.end(), {"--replay-input", f});
+    return args;
 #else
     return {self};
 #endif
