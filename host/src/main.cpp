@@ -158,6 +158,20 @@ std::vector<std::string> PlayArguments(const char* self) {
     // the app's dev_env.txt): PS2HOST_RECORD_INPUT / PS2HOST_REPLAY_INPUT = a file, as --record-input / --replay-input
     if (const char* f = std::getenv("PS2HOST_RECORD_INPUT"); f && *f) args.insert(args.end(), {"--record-input", f});
     if (const char* f = std::getenv("PS2HOST_REPLAY_INPUT"); f && *f) args.insert(args.end(), {"--replay-input", f});
+    // PS2HOST_ARGS: more arguments, split at spaces (a benchmark's --virtual-time --paced / --real-time-from N).
+    if (const char* more = std::getenv("PS2HOST_ARGS"); more && *more) {
+        std::fprintf(stderr, "[port] more arguments (PS2HOST_ARGS): %s\n", more);
+        std::string word;
+        for (const char* c = more;; ++c) {
+            if (*c == ' ' || *c == '\0') {
+                if (!word.empty()) args.push_back(word);
+                word.clear();
+                if (!*c) break;
+            } else {
+                word += *c;
+            }
+        }
+    }
     return args;
 #else
     return {self};
