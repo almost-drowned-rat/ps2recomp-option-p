@@ -326,6 +326,7 @@ private:
     /* Android: the app in the background (Home, Back, another app) - its window's surface taken away: the swapchain
        and the Vulkan surface are let go and nothing is presented until it comes back (Pump; under present_lock_) */
     bool background_ = false;
+    bool extent_from_window_ = false;          // the swapchain sized by SDL's window (a turned panel: CreateSwapchain)
     std::atomic<bool> foreground_{false};     // back from the background: a new surface at the next present
     static bool SDLCALL LifeCycle(void* self, SDL_Event* e);
     VkPhysicalDevice gpu_ = VK_NULL_HANDLE;
@@ -756,6 +757,9 @@ bool VulkanDisplay::CreateSwapchain() {
         (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)) {
         if (w > 0 && h > 0) extent_ = VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
         transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        extent_from_window_ = true;
+    } else {
+        extent_from_window_ = false;
     }
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
@@ -956,6 +960,15 @@ bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
         }
     }
     if (background_ || !surface_) return false;        // (Android, in the background: nothing to show on)
+    if (extent_from_window_ && swapchain_) {
+        // Sized by the window, not the surface: a new window size (Android at the start: 1920x914 with the bars, then
+        // 1920x1080 once they are hidden) need not give OUT_OF_DATE - a swapchain of the first size would stay.
+        // Checked each present (a cached value of SDL's), besides the resize event.
+        int w = 0, h = 0;
+        if (SDL_GetWindowSizeInPixels(window_, &w, &h) && w > 0 && h > 0 &&
+            (std::uint32_t(w) != extent_.width || std::uint32_t(h) != extent_.height))
+            stale_ = true;
+    }
     if (stale_ && !CreateSwapchain()) {
         *ok = false;
         return false;

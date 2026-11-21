@@ -169,7 +169,11 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     if (g_display) {
         Note("window", "window: Vulkan on " + g_display->Describe());
         g_display->SetBorderless(Setting("fullscreen_mode", "fullscreen") == "borderless");
+#ifdef __ANDROID__
+        g_display->SetFullscreen(true);     // (Android: a window is the whole screen; windowed showed the system bars)
+#else
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
+#endif
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
             // Shown on the display's own thread (its lane named so); dropped
