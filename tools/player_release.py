@@ -54,11 +54,13 @@ from ps2decomp import game as game_config  # noqa: E402
 TRAILER_MAGIC = b"XRPAYLD1"
 
 
-def ninja_block(text: str, marker: str) -> dict:
-    """The variables of the first build statement whose outputs contain marker."""
+def ninja_block(text: str, marker: str, exact: bool = False) -> dict:
+    """The variables of the first build statement whose outputs contain marker (exact: one output is marker - a
+    Linux executable has no .exe to tell it from the objects' folder names)."""
     flat = re.sub(r"\$\r?\n\s*", "", text)
     for match in re.finditer(r"^build ([^\n]*)\n((?:  [^\n]*\n)*)", flat, re.M):
-        if marker in match.group(1).split(":")[0]:
+        outputs = match.group(1).split(":")[0]
+        if (marker in outputs.split()) if exact else (marker in outputs):
             values = {}
             for line in match.group(2).splitlines():
                 key, _, value = line.strip().partition(" = ")
@@ -109,7 +111,7 @@ def make_payload(args, game, stage: str) -> None:
     obj_ext = ".cpp.o" if linux else ".cpp.obj"
     exe_name = target if linux else target + ".exe"
     compile_vars = ninja_block(ninja, "/generated/dispatch" + obj_ext)
-    link_vars = ninja_block(ninja, exe_name)
+    link_vars = ninja_block(ninja, exe_name, exact=linux)
 
     # headers: each include folder of the compile line, copied (headers only) to include/<n>
     cc = split(compile_vars["FLAGS"]) + split(compile_vars["DEFINES"])
@@ -152,7 +154,16 @@ def make_payload(args, game, stage: str) -> None:
         else:
             link.append(linux_path(args, item) if linux else item)
     if linux:
-        link = [item for item in link if item not in ("-g",)]
+        # (CMake's own: "-Xlinker --dependency-file=<the build folder's>" - the pair left out)
+        kept = []
+        for item in link:
+            if "--dependency-file" in item:
+                if kept and kept[-1] == "-Xlinker":
+                    kept.pop()
+                continue
+            if item != "-g":
+                kept.append(item)
+        link = kept
         if not any(item.startswith("--sysroot") for item in link):
             link.insert(0, "--sysroot={TOOLS}/llvm/sysroot")
         if not any(item.startswith("--target") for item in link):

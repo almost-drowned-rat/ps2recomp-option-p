@@ -213,7 +213,11 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDOUT_NUMBER, SDL_PROCESS_STDIO_NULL);
         SDL_SetNumberProperty(p, SDL_PROP_PROCESS_CREATE_STDERR_NUMBER, SDL_PROCESS_STDIO_NULL);
     }
-    SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);
+#ifdef _WIN32
+    SDL_SetBooleanProperty(p, SDL_PROP_PROCESS_CREATE_BACKGROUND_BOOLEAN, true);   /* (no console window) */
+#endif
+    /* (not in the background elsewhere: SDL gives a background process's exit code as 0 there - a failed compile and
+       the wrong disc's code 3 would pass unseen) */
     proc = SDL_CreateProcessWithProperties(p);
     SDL_DestroyProperties(p);
     if (!proc) {
