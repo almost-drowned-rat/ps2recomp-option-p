@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # release_linux.sh - a PS2 port's Linux release: ONE AppImage, the same release as the Windows exe (agent L,
-# 2026-11-21). The AppImage holds the launcher (engine/launcher, its Windows 95 setup window drawn with SDL3); the
+# 2026-11-21). Also <APPIMAGE base>-linux-x86_64.tar.gz: the same without the AppImage (no FUSE needed). The AppImage holds the launcher (engine/launcher, its Windows 95 setup window drawn with SDL3); the
 # payload - the engine's libraries and the port's own objects prebuilt, the translator, the game's player package,
 # Python and the compiler bundle - is appended to it as player_release.py appends it to the Windows exe, and the
 # launcher reads it from $APPIMAGE. The player's first start translates his disc and builds the game beside the
@@ -61,12 +61,16 @@ ninja -C "$OUT/build-port" > "$OUT/build-port.log"
 tail -1 "$OUT/host_tests.log"
 
 echo "== the launcher"
+# its window icon: the --icon PNG's BMP twin beside it (<name>.bmp, 64x64, 32-bit with alpha), if there is one
+ICON_DEF=()
+[ -n "$ICON" ] && [ -f "${ICON%.png}.bmp" ] && ICON_DEF=(-DPS2_LAUNCHER_ICON="$(realpath "${ICON%.png}.bmp")")
 cmake -S "$ENGINE/launcher" -B "$OUT/build-launcher" -G Ninja -DCMAKE_BUILD_TYPE=Release "${TC[@]}" \
     -DPS2_LAUNCHER_GAME="$LAUNCHER_GAME" -DPS2_LAUNCHER_DISC="$LAUNCHER_DISC" -DPS2_LAUNCHER_TITLE="$LAUNCHER_TITLE" \
     -DPS2_LAUNCHER_GAME_EXE="$TARGET" -DPS2_LAUNCHER_OUTPUT=launcher \
     -DPS2_LAUNCHER_EXTRA_DISC="${LAUNCHER_EXTRA_DISC:-}" -DPS2_LAUNCHER_EXTRA_KEY="${LAUNCHER_EXTRA_KEY:-}" \
     -DPS2_LAUNCHER_FILE_LABEL="${LAUNCHER_FILE_LABEL:-}" -DPS2_LAUNCHER_FILE_FILTER_NAME="${LAUNCHER_FILE_FILTER_NAME:-}" \
     -DPS2_LAUNCHER_FILE_FILTER="${LAUNCHER_FILE_FILTER:-}" -DPS2_LAUNCHER_FILE_NAME="${LAUNCHER_FILE_NAME:-}" \
+    "${ICON_DEF[@]}" \
     > "$OUT/build-launcher.configure.log"
 ninja -C "$OUT/build-launcher" > "$OUT/build-launcher.log"
 max="$(objdump -T "$OUT/build-launcher/launcher" "$OUT/build-port/$TARGET" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
@@ -117,5 +121,25 @@ PKG=()
 python3 -I "$ENGINE/tools/player_release.py" --linux --game "$GAME_DIR" --release "$RELEASE" \
     --launcher "$LAUNCHER_IMG" --out "$OUT/release" --tree "$OUT/build-port" --llvm-bundle "$BUNDLE" \
     --llvm-root "$LLVM" --sysroot "$SYSROOT" --game-exe "$APPIMAGE_NAME" "${PKG[@]}" "${EXTRA[@]}"
-(cd "$OUT/release" && sha256sum "$APPIMAGE_NAME" > SHA256SUMS.txt && cat SHA256SUMS.txt)
-echo "done: $OUT/release/$APPIMAGE_NAME"
+
+# The same release as a tar.gz, for systems without FUSE: a folder with the launcher itself (no AppImage around it)
+# and the payload appended to it - the launcher reads its own file (/proc/self/exe) and builds the game beside it.
+echo "== the tar.gz"
+TAR_BASE="${APPIMAGE_NAME%-x86_64.AppImage}"
+TAR_NAME="$TAR_BASE-linux-x86_64.tar.gz"
+rm -rf "$OUT/release-tar" "$OUT/tar-stage"
+mkdir -p "$OUT/tar-stage/$TAR_BASE"
+cp "$OUT/build-launcher/launcher" "$OUT/launcher-plain"
+"$LLVM/bin/llvm-objcopy" --strip-unneeded "$OUT/launcher-plain"
+python3 -I "$ENGINE/tools/player_release.py" --linux --game "$GAME_DIR" --release "$RELEASE" \
+    --launcher "$OUT/launcher-plain" --out "$OUT/release-tar" --tree "$OUT/build-port" --llvm-bundle "$BUNDLE" \
+    --llvm-root "$LLVM" --sysroot "$SYSROOT" --game-exe "$TAR_BASE" "${PKG[@]}" "${EXTRA[@]}" > "$OUT/release-tar.log"
+cp "$OUT/release-tar/$TAR_BASE" "$OUT/tar-stage/$TAR_BASE/$TAR_BASE"
+chmod 755 "$OUT/tar-stage/$TAR_BASE/$TAR_BASE"
+[ -n "$ICON" ] && cp "$ICON" "$OUT/tar-stage/$TAR_BASE/icon.png"
+printf '%s\n' "$DESKTOP_NAME - start ./$TAR_BASE (the first start builds the game from your disc, in this folder)." \
+    > "$OUT/tar-stage/$TAR_BASE/README.txt"
+tar -C "$OUT/tar-stage" -czf "$OUT/release/$TAR_NAME" "$TAR_BASE"
+rm -rf "$OUT/release-tar" "$OUT/tar-stage" "$OUT/launcher-plain"
+(cd "$OUT/release" && sha256sum "$APPIMAGE_NAME" "$TAR_NAME" > SHA256SUMS.txt && cat SHA256SUMS.txt)
+echo "done: $OUT/release/$APPIMAGE_NAME, $OUT/release/$TAR_NAME"

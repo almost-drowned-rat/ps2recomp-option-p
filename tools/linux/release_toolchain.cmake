@@ -32,8 +32,8 @@ set(CMAKE_CXX_FLAGS_INIT "-stdlib=libc++")
 # glibc and the system's Vulkan loader / SDL's libraries (loaded at run time)
 set(ps2_linux_cxx_libs
     "-nostdlib++ ${PS2_LINUX_LLVM}/lib/x86_64-unknown-linux-gnu/libc++.a ${PS2_LINUX_LLVM}/lib/x86_64-unknown-linux-gnu/libc++abi.a ${PS2_LINUX_LLVM}/lib/x86_64-unknown-linux-gnu/libunwind.a")
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld -static-libgcc")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld -static-libgcc")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=bfd -static-libgcc")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=bfd -static-libgcc")
 set(CMAKE_CXX_STANDARD_LIBRARIES "${ps2_linux_cxx_libs} -lpthread -ldl -lm")
 
 # pkg-config (SDL3's checks) looks into the sysroot only
