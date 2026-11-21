@@ -739,6 +739,16 @@ bool VulkanDisplay::CreateSwapchain() {
     SDL_GetWindowSizeInPixels(window_, &w, &h);
     extent_ = caps.currentExtent.width != 0xFFFFFFFFu ? caps.currentExtent
               : VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
+    // A display mounted turned (Android: the Odin 2 Portal's panel is portrait, the game always landscape): the
+    // surface reports a 90/270 degree transform. The picture is drawn upright at the window's own size (SDL's, in
+    // pixels - the surface's extent can be either way round) and the compositor turns it (preTransform identity):
+    // with the reported transform it came out turned, with a swapped extent squashed (Odin, 2026-11-21).
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+    if (transform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR &&
+        (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)) {
+        if (w > 0 && h > 0) extent_ = VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
+        transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    }
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         error_ = "the swapchain cannot be a transfer destination";
@@ -786,7 +796,7 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
+    sci.preTransform = transform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
