@@ -749,10 +749,24 @@ bool VulkanDisplay::CreateSwapchain() {
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(n);
     vkGetPhysicalDeviceSurfaceFormatsKHR(gpu_, surface_, &n, formats.data());
+    // An 8-bit UNORM picture in the plain sRGB colour space (the one Windows' drivers offer): a desktop with HDR or
+    // wide-gamut output (KDE / GNOME on Wayland) lists B8G8R8A8_UNORM with other colour spaces too - extended sRGB,
+    // pass-through - which the compositor shows brighter (agent L, 2026-11-21: the picture too bright on KDE).
     VkSurfaceFormatKHR chosen = formats.empty() ? VkSurfaceFormatKHR{} : formats[0];
-    for (const auto& f : formats)
-        if (f.format == VK_FORMAT_B8G8R8A8_UNORM) chosen = f;
+    int rank = 0;
+    for (const auto& f : formats) {
+        const bool srgb = f.colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        const int r = f.format == VK_FORMAT_B8G8R8A8_UNORM ? (srgb ? 4 : 2)
+                      : f.format == VK_FORMAT_R8G8B8A8_UNORM ? (srgb ? 3 : 1) : 0;
+        if (r > rank) rank = r, chosen = f;
+    }
     format_ = chosen.format;
+    static bool told = false;
+    if (!told) {
+        told = true;
+        std::fprintf(stderr, "[display] swapchain format %d, colour space %d (of %u offered)\n", int(chosen.format),
+                     int(chosen.colorSpace), unsigned(formats.size()));
+    }
 
     vkGetPhysicalDeviceSurfacePresentModesKHR(gpu_, surface_, &n, nullptr);
     std::vector<VkPresentModeKHR> modes(n);

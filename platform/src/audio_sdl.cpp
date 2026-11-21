@@ -1,13 +1,18 @@
 /*
  * Sound out through SDL3 (platform.h's RunAudioOutput) on the systems without
  * a file of their own (Linux: PipeWire, PulseAudio or ALSA, whichever SDL
- * finds). The same pull as src/audio_win32.cpp's WASAPI loop: the calling
- * thread renders what the device has room for, a 20 ms buffer as WASAPI's;
- * the ring, the rate control and the mixing stay in engine/host's audio.cpp.
+ * finds). As src/audio_win32.cpp's WASAPI loop renders what the device asks
+ * for when its event fires, SDL's stream asks here (its get callback, on SDL's
+ * audio thread): exactly the frames the device is about to play, so nothing
+ * runs dry between the device's (larger) periods and nothing piles up. The
+ * calling thread waits until stop; the ring, the rate control and the mixing
+ * stay in engine/host's audio.cpp.
  */
 
 #include <SDL3/SDL.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -18,19 +23,38 @@
 
 namespace ps2platform {
 
+namespace {
+
+struct Pull {
+    const AudioOutput* out;
+    std::vector<float> scratch;
+};
+
+void SDLCALL Wanted(void* user, SDL_AudioStream* stream, int additional, int) {
+    auto* p = static_cast<Pull*>(user);
+    const int frame_bytes = int(sizeof(float) * 2);
+    int frames = additional / frame_bytes;
+    while (frames > 0) {
+        const unsigned n = unsigned(std::min<std::size_t>(std::size_t(frames), p->scratch.size() / 2));
+        p->out->render(p->out->user, p->scratch.data(), n);
+        SDL_PutAudioStreamData(stream, p->scratch.data(), int(n) * frame_bytes);
+        frames -= int(n);
+    }
+}
+
+}  // namespace
+
 void RunAudioOutput(const AudioOutput& a) {
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         std::fprintf(stderr, "[audio] SDL audio: %s\n", SDL_GetError());
         a.opened->store(-1);
         return;
     }
-    const unsigned buffer_frames = unsigned(a.rate / 50);   // 20 ms, WASAPI's buffer
-    const unsigned chunk = unsigned(a.rate / 400);          // rendered 2.5 ms at a time
-    std::vector<float> scratch(std::size_t(chunk) * 2);
+    Pull pull{&a, std::vector<float>(std::size_t(a.rate / 50) * 2)};      // 20 ms at a time at most
     bool ever = false;
     while (!a.stop->load()) {
         SDL_AudioSpec spec{SDL_AUDIO_F32, 2, a.rate};
-        SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
+        SDL_AudioStream* stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Wanted, &pull);
         if (!stream) {
             if (!ever) {
                 std::fprintf(stderr, "[audio] no sound device: %s\n", SDL_GetError());
@@ -41,34 +65,20 @@ void RunAudioOutput(const AudioOutput& a) {
             continue;
         }
         if (!ever) {
+            SDL_AudioSpec device{};
+            int period = 0;
+            SDL_GetAudioDeviceFormat(SDL_GetAudioStreamDevice(stream), &device, &period);
             const char* driver = SDL_GetCurrentAudioDriver();
-            std::fprintf(stderr, "[audio] playing (SDL %s, %.0f ms buffer, %u ms target)\n", driver ? driver : "?",
-                         1000.0 * buffer_frames / a.rate, a.target_ms);
+            std::fprintf(stderr, "[audio] playing (SDL %s, device %d Hz, %d-frame periods = %.0f ms, %u ms target)\n",
+                         driver ? driver : "?", device.freq, period,
+                         device.freq ? 1000.0 * period / device.freq : 0.0, a.target_ms);
         }
         ever = true;
         a.opened->store(1);
         SDL_ResumeAudioStreamDevice(stream);
-        const int frame_bytes = int(sizeof(float) * 2);
-        bool lost = false;
-        while (!a.stop->load()) {
-            const int queued = SDL_GetAudioStreamQueued(stream);
-            if (queued < 0) {               // the device went away
-                lost = true;
-                break;
-            }
-            if (unsigned(queued / frame_bytes) + chunk <= buffer_frames) {
-                a.render(a.user, scratch.data(), chunk);
-                if (!SDL_PutAudioStreamData(stream, scratch.data(), int(chunk) * frame_bytes)) {
-                    lost = true;
-                    break;
-                }
-                continue;
-            }
-            std::this_thread::sleep_for(std::chrono::microseconds(1000));
-        }
+        // (SDL moves the stream to a new default device by itself - headphones plugged in or pulled)
+        while (!a.stop->load()) std::this_thread::sleep_for(std::chrono::milliseconds(20));
         SDL_DestroyAudioStream(stream);
-        if (!lost) break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));       // a new default device
     }
     SDL_QuitSubSystem(SDL_INIT_AUDIO);
 }
