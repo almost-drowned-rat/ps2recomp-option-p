@@ -337,13 +337,10 @@ void PadData(u32 port, u8* data) {
         for (int i = 0; i < 16; ++i)
             if (hooked & (1u << i)) pressure[i] = 0xFF;
     }
-    if (!SelectToGame()) {                  // Select is the port's menu's (EnableSelectMenu), never the game's -
-        const bool select = !(buttons & 1u);
-        buttons |= 1u;
-        // where the menu does not open (scenes, movies, menus: SetSelectAllowed) it is the game's Start: it skips
-        // a scene too (the maintainer 2026-11-21)
-        if (select && !SelectMenuHere()) buttons &= u16(~(1u << 3));
-    }
+    // Select is the port's menu's (EnableSelectMenu), never the game's - where the menu does not open (scenes,
+    // movies, menus: SetSelectAllowed) it does nothing (the maintainer 2026-11-21: Select skipping a scene as Start
+    // "sorgt für mehr Probleme als es wert ist" - taken out again).
+    if (!SelectToGame()) buttons |= 1u;
     if (PcMenuOpen()) {                     // the PC settings panel has the keys
         buttons = 0xFFFF;
         pad = HostPadState{};
