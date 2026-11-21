@@ -31,7 +31,11 @@
 #include <timeapi.h>
 #elif defined(__linux__)
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <unwind.h>                 // (bionic has backtrace() only from API 33: the unwinder directly)
+#else
 #include <execinfo.h>
+#endif
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -642,6 +646,23 @@ void SetCrashHelper(const std::vector<std::string>&) {}
 // the signal end the process. The sampler (--sample) is the Windows build's (on Linux: perf).
 
 namespace {
+
+#ifdef __ANDROID__
+struct Frames { void** out; int max, n; };
+_Unwind_Reason_Code Frame(_Unwind_Context* context, void* arg) {
+    Frames* f = static_cast<Frames*>(arg);
+    if (const std::uintptr_t pc = _Unwind_GetIP(context)) {
+        if (f->n >= f->max) return _URC_END_OF_STACK;
+        f->out[f->n++] = reinterpret_cast<void*>(pc);
+    }
+    return _URC_NO_REASON;
+}
+int backtrace(void** out, int max) {          // (bionic's own backtrace() needs API 33)
+    Frames f{out, max, 0};
+    _Unwind_Backtrace(Frame, &f);
+    return f.n;
+}
+#endif
 
 char g_crash_exe[4096] = "";                 // (made before: nothing allocated in a crash) - SetCrashHelper
 char g_crash_args[8][4096] = {};

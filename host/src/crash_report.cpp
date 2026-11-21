@@ -27,7 +27,12 @@
 
 #include <SDL3/SDL.h>
 #elif defined(__linux__)
+#if defined(__x86_64__) || defined(__i386__)
 #include <cpuid.h>
+#endif
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 #include <signal.h>
 #include <sys/sysinfo.h>
 #include <sys/utsname.h>
@@ -233,6 +238,30 @@ std::string Processor() {
         __cpuid(info, 0x80000002 + i);
         std::memcpy(brand + 16 * i, info, 16);
     }
+#elif defined(__ANDROID__)
+    // ARM: no brand string - the SoC's maker and model (Android 12+: ro.soc.*), else the board platform
+    char maker[PROP_VALUE_MAX] = {}, model[PROP_VALUE_MAX] = {};
+    __system_property_get("ro.soc.manufacturer", maker);
+    __system_property_get("ro.soc.model", model);
+    if (!model[0]) __system_property_get("ro.board.platform", model);
+    char brand[49] = {};
+    std::snprintf(brand, sizeof brand, "%s%s%s", maker, maker[0] && model[0] ? " " : "", model[0] ? model : "?");
+#elif !defined(__x86_64__) && !defined(__i386__)
+    // ARM Linux: /proc/cpuinfo's model name or Hardware line, if any
+    if (std::FILE* f = std::fopen("/proc/cpuinfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f))
+            if (!std::strncmp(line, "model name", 10) || !std::strncmp(line, "Hardware", 8))
+                if (const char* colon = std::strchr(line, ':')) {
+                    std::string v = colon + 1;
+                    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.erase(v.begin());
+                    while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.pop_back();
+                    std::fclose(f);
+                    return v.empty() ? "?" : v;
+                }
+        std::fclose(f);
+    }
+    char brand[49] = "?";
 #else
     unsigned info[4] = {};
     if (!__get_cpuid(0x80000000u, &info[0], &info[1], &info[2], &info[3]) || info[0] < 0x80000004u) return "?";

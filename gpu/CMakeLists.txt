@@ -50,6 +50,18 @@ set(GLSLANG_TESTS OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 set(GLSLANG_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(glslang)
+# The shader compiler: glslang's own build - or, where the target's binaries cannot run here (Android), the build
+# machine's glslang (PS2GPU_GLSLANG, found by itself when cross-compiling)
+if(CMAKE_SYSTEM_NAME STREQUAL "Android" AND NOT PS2GPU_GLSLANG)
+    find_program(PS2GPU_GLSLANG NAMES glslang glslangValidator REQUIRED NO_CMAKE_FIND_ROOT_PATH)
+endif()
+if(PS2GPU_GLSLANG)
+    set(ps2gpu_glslang ${PS2GPU_GLSLANG})
+    set(ps2gpu_glslang_dep)
+else()
+    set(ps2gpu_glslang ${ps2gpu_glslang_dep})
+    set(ps2gpu_glslang_dep ${ps2gpu_glslang_dep})
+endif()
 
 set(PS2GPU_SHADER_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${PS2GPU_SHADER_DIR})
@@ -62,10 +74,10 @@ foreach(shader gs.vert gs.frag date.vert date.frag swizzle.comp decode.comp dept
     string(REPLACE "." "_" name ${shader})
     set(out ${PS2GPU_SHADER_DIR}/${name}.h)
     add_custom_command(OUTPUT ${out}
-        COMMAND glslang-standalone -V --target-env vulkan1.3 --vn spirv_${name}
+        COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 --vn spirv_${name}
                 -I${CMAKE_CURRENT_LIST_DIR}/third_party/smaa
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader}
-        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+        DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/${shader} ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
         COMMENT "glslang ${shader}")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
@@ -73,41 +85,41 @@ endforeach()
 # dual-source blending.
 set(out ${PS2GPU_SHADER_DIR}/gs_frag_single.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
+    COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -DSINGLE_OUTPUT --vn spirv_gs_frag_single
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
     COMMENT "glslang gs.frag (single output)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The swizzle straight to and from a colour target (a storage image).
 set(out ${PS2GPU_SHADER_DIR}/swizzle_image_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DIMAGE --vn spirv_swizzle_image_comp
+    COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -DIMAGE --vn spirv_swizzle_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
     COMMENT "glslang swizzle.comp (a target's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # The texture decode straight into a texture's image (a storage image).
 set(out ${PS2GPU_SHADER_DIR}/decode_image_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DTO_IMAGE --vn spirv_decode_image_comp
+    COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -DTO_IMAGE --vn spirv_decode_image_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/decode.comp ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
     COMMENT "glslang decode.comp (into a texture's image)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and from a depth buffer, sampled.
 set(out ${PS2GPU_SHADER_DIR}/swizzle_depth_comp.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
+    COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -DDEPTH_IMAGE --vn spirv_swizzle_depth_comp
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/swizzle.comp ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
     COMMENT "glslang swizzle.comp (a depth buffer)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # ...and blending in the shader, from a copy of the target (a factor over 1).
 set(out ${PS2GPU_SHADER_DIR}/gs_frag_blend.h)
 add_custom_command(OUTPUT ${out}
-    COMMAND glslang-standalone -V --target-env vulkan1.3 -DSHADER_BLEND --vn spirv_gs_frag_blend
+    COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -DSHADER_BLEND --vn spirv_gs_frag_blend
             -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag
-    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_SHADER_INCLUDES} glslang-standalone
+    DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/gs.frag ${PS2GPU_SHADER_INCLUDES} ${ps2gpu_glslang_dep}
     COMMENT "glslang gs.frag (blending in the shader)")
 list(APPEND PS2GPU_SHADER_HEADERS ${out})
 # UPSCALING: FSR 1's two passes (third_party/fidelityfx_fsr1).
@@ -115,11 +127,11 @@ foreach(pass easu rcas)
     string(TOUPPER ${pass} define)
     set(out ${PS2GPU_SHADER_DIR}/fsr_${pass}_comp.h)
     add_custom_command(OUTPUT ${out}
-        COMMAND glslang-standalone -V --target-env vulkan1.3 -D${define} --vn spirv_fsr_${pass}_comp
+        COMMAND ${ps2gpu_glslang} -V --target-env vulkan1.3 -D${define} --vn spirv_fsr_${pass}_comp
                 -I${CMAKE_CURRENT_LIST_DIR}/third_party/fidelityfx_fsr1
                 -o ${out} ${CMAKE_CURRENT_LIST_DIR}/shaders/fsr.comp
         DEPENDS ${CMAKE_CURRENT_LIST_DIR}/shaders/fsr.comp ${CMAKE_CURRENT_LIST_DIR}/third_party/fidelityfx_fsr1/ffx_a.h
-                ${CMAKE_CURRENT_LIST_DIR}/third_party/fidelityfx_fsr1/ffx_fsr1.h glslang-standalone
+                ${CMAKE_CURRENT_LIST_DIR}/third_party/fidelityfx_fsr1/ffx_fsr1.h ${ps2gpu_glslang_dep}
         COMMENT "glslang fsr.comp (${pass})")
     list(APPEND PS2GPU_SHADER_HEADERS ${out})
 endforeach()
