@@ -1,6 +1,7 @@
 /*
  * game_setup_ui_win95_sdl.c - the launcher's window on Linux: game_setup_ui_win95.c (the Windows window) drawn with
- * SDL3, pixel for pixel the same page - the maintainer's rule for every port's launcher ("the more old-fashioned the
+ * SDL3, the same page in the look of Windows 2000 (the maintainer, 2026-11-21: the Linux launchers in Windows 2000's
+ * look - the #D4D0C8 face, the title bar's navy-to-light-blue gradient, Windows 2000's bevels) - the maintainer's rule for every port's launcher ("the more old-fashioned the
  * better") and for this port's Linux build (2026-11-21: "a direct port of the launcher with all its features and its
  * look"). The same layout constants, colours, bevels, owner-drawn buttons, sunken fields, title bar with the close
  * box, etched line and blocky progress bar; the same texts and checks. Only the system parts differ: the font is
@@ -31,9 +32,10 @@ static const unsigned char k_font_bold[] = {
 };
 
 typedef struct { Uint8 r, g, b; } Rgb;
-static const Rgb K_FACE = {192, 192, 192}, K_LIGHT = {255, 255, 255}, K_SHADOW = {128, 128, 128}, K_DARK = {0, 0, 0},
-                 K_TITLE = {0, 0, 128}, K_TITLE_TEXT = {255, 255, 255}, K_TEXT = {0, 0, 0},
-                 K_PROGRESS = {0, 0, 128}, K_WINDOW = {255, 255, 255};
+/* Windows 2000's standard scheme: 3D face, highlight, shadow, dark shadow; the active caption's gradient */
+static const Rgb K_FACE = {212, 208, 200}, K_LIGHT = {255, 255, 255}, K_SHADOW = {128, 128, 128}, K_DARK = {64, 64, 64},
+                 K_TITLE = {10, 36, 106}, K_TITLE2 = {166, 202, 240}, K_TITLE_TEXT = {255, 255, 255},
+                 K_TEXT = {0, 0, 0}, K_FRAME = {0, 0, 0}, K_PROGRESS = {10, 36, 106}, K_WINDOW = {255, 255, 255};
 
 #define UI_W          520
 #define UI_H          236               /* with one disc line; a second one adds UI_ROW */
@@ -129,11 +131,12 @@ static void line(XrSetupUi *ui, int x0, int y0, int x1, int y1, Rgb c)
     }
 }
 
-/* The classic two-pixel bevel: raised (buttons, the window) or sunken (fields, the progress groove). */
+/* Windows 2000's two-pixel bevel: raised (buttons, the window - the face and white over the dark shadow and the
+   shadow) or sunken (fields, the progress groove - the shadow and the dark shadow over white and the face). */
 static void bevel(XrSetupUi *ui, int l, int t, int r, int b, int raised)
 {
-    const Rgb otl = raised ? K_LIGHT : K_SHADOW, obr = raised ? K_DARK : K_LIGHT;
-    const Rgb itl = raised ? K_FACE : K_DARK, ibr = raised ? K_SHADOW : K_FACE;
+    const Rgb otl = raised ? K_FACE : K_SHADOW, obr = raised ? K_DARK : K_LIGHT;
+    const Rgb itl = raised ? K_LIGHT : K_DARK, ibr = raised ? K_SHADOW : K_FACE;
     line(ui, l, b - 1, l, t, otl);
     line(ui, l, t, r - 1, t, otl);
     line(ui, r - 1, t, r - 1, b - 1, obr);
@@ -291,7 +294,7 @@ static void close_cross(XrSetupUi *ui, int x, int y)
 static void focus_rect(XrSetupUi *ui, int l, int t, int r, int b)
 {
     int i;
-    colour(ui, K_DARK);
+    colour(ui, K_FRAME);
     for (i = l; i < r; i += 2) {
         SDL_RenderPoint(ui->ren, (float)i, (float)t);
         SDL_RenderPoint(ui->ren, (float)i, (float)(b - 1));
@@ -318,10 +321,10 @@ static void draw_button(XrSetupUi *ui, const Ctl *c, int focused)
     down = ui->pressed == c->id && ui->pressed_inside;
     fill(ui, l, t, r, b, K_FACE);
     if (c->id == ID_GO) {                  /* FrameRect black, then inside it */
-        fill(ui, l, t, r, t + 1, K_DARK);
-        fill(ui, l, b - 1, r, b, K_DARK);
-        fill(ui, l, t, l + 1, b, K_DARK);
-        fill(ui, r - 1, t, r, b, K_DARK);
+        fill(ui, l, t, r, t + 1, K_FRAME);
+        fill(ui, l, b - 1, r, b, K_FRAME);
+        fill(ui, l, t, l + 1, b, K_FRAME);
+        fill(ui, r - 1, t, r, b, K_FRAME);
         l++, t++, r--, b--;
     }
     bevel(ui, l, t, r, b, !down);
@@ -372,8 +375,19 @@ static void paint(XrSetupUi *ui)
     SDL_SetRenderTarget(ui->ren, NULL);
     fill(ui, 0, 0, cw, ch, K_FACE);
     bevel(ui, 0, 0, cw, ch, 1);
-    /* the title bar: solid navy, the icon left, white bold caption; a close box with Marlett's cross */
-    fill(ui, title_l, title_t, title_r, title_b, K_TITLE);
+    /* the title bar: Windows 2000's gradient, navy to light blue, the icon left, white bold caption; a close box with
+       Marlett's cross */
+    {
+        int x;
+        const int span = title_r - title_l > 1 ? title_r - title_l - 1 : 1;
+        for (x = title_l; x < title_r; ++x) {
+            const int k = x - title_l;
+            const Rgb c = {(Uint8)(K_TITLE.r + (K_TITLE2.r - K_TITLE.r) * k / span),
+                           (Uint8)(K_TITLE.g + (K_TITLE2.g - K_TITLE.g) * k / span),
+                           (Uint8)(K_TITLE.b + (K_TITLE2.b - K_TITLE.b) * k / span)};
+            fill(ui, x, title_t, x + 1, title_b, c);
+        }
+    }
     if (ui->icon) {
         SDL_FRect d = {(float)(title_l + 2), (float)(title_t + 1), 16.0f, 16.0f};
         SDL_RenderTexture(ui->ren, ui->icon, NULL, &d);
