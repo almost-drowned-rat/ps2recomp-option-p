@@ -1009,6 +1009,17 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
                     std::size_t(overlay_width_) * overlay_height_ * 4);
         overlay_slot_generation_[slot_] = overlay_generation_;
     }
+    // After the picture's blit into the same image: two transfer writes over the same pixels need a barrier to keep
+    // their order (Turnip ran them together and the blit covered the FPS counter; the Adreno driver kept the order)
+    VkImageMemoryBarrier after{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.oldLayout = after.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    after.srcQueueFamilyIndex = after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    after.image = target;
+    after.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &after);
     VkBufferImageCopy copy{};
     copy.bufferOffset = offset;
     copy.bufferRowLength = overlay_width_;
