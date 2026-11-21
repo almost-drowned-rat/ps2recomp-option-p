@@ -5,8 +5,8 @@
  * better") and for this port's Linux build (2026-11-21: "a direct port of the launcher with all its features and its
  * look"). The same layout constants, colours, bevels, owner-drawn buttons, sunken fields, title bar with the close
  * box, etched line and progress bar; the same texts and checks. Only the system parts differ: the font is
- * Liberation Sans (SIL OFL 1.1, engine/data/fonts; MS Sans Serif is a Windows system font) at 8 pt, drawn without
- * antialiasing as Windows draws its dialog font, rasterised by stb_truetype; the dialogs are SDL3's (the desktop's
+ * Liberation Sans (SIL OFL 1.1, engine/data/fonts; MS Sans Serif is a Windows system font) at 8 pt, rasterised by
+ * stb_truetype and drawn smoothed with full-strength strokes (the maintainer's choice over Windows' unsmoothed font); the dialogs are SDL3's (the desktop's
  * own file and folder pickers by its portal); the window is borderless and dragged by its title bar. On a scaled
  * screen (125 %, 150 %, 200 %) the page is drawn at the screen's own pixels, as Windows draws a dialog at 120 dpi
  * and more: the layout scaled, the font rasterised at the larger size, the bevels and lines one pixel - not a
@@ -241,7 +241,7 @@ static int text_width_n(const Font *f, const char *s, size_t n)
 
 static int text_width(const Font *f, const char *s) { return text_width_n(f, s, strlen(s)); }
 
-/* text with its cell's top at y (as TextOut: the ascent below y), in one colour, no antialiasing; drawn only in
+/* text with its cell's top at y (as TextOut: the ascent below y), in one colour, smoothed; drawn only in
    the window's pixel columns [clip_l, clip_r) */
 static void text_n(XrSetupUi *ui, const Font *f, int x, int y, const char *s, size_t n, Rgb c, int clip_l, int clip_r)
 {
@@ -249,7 +249,7 @@ static void text_n(XrSetupUi *ui, const Font *f, int x, int y, const char *s, si
     unsigned char glyph[64 * 64];
     const int top = X(ui, y) + f->pascent;
     x = X(ui, x);
-    colour(ui, c);
+    SDL_SetRenderDrawBlendMode(ui->ren, SDL_BLENDMODE_BLEND);
     while (p < end && *p) {
         const int cp = next_cp(&p);
         const char *q = p;
@@ -261,12 +261,16 @@ static void text_n(XrSetupUi *ui, const Font *f, int x, int y, const char *s, si
         if (gw > 0 && gh > 0 && gw <= 64 && gh <= 64) {
             stbtt_MakeCodepointBitmap(&f->info, glyph, gw, gh, gw, f->pscale, f->pscale, cp);
             for (gy = 0; gy < gh; ++gy)
-                for (gx = 0; gx < gw; ++gx)
-                    if (glyph[gy * gw + gx] >= 112) {
-                        const int px = x + x0 + gx;
-                        if (px >= clip_l && px < clip_r)
-                            SDL_RenderPoint(ui->ren, (float)px, (float)(top + y0 + gy));
-                    }
+                for (gx = 0; gx < gw; ++gx) {
+                    /* antialiased, the coverage raised (^0.6) so the strokes stay as dark as a bitmap font's:
+                       at 125 % and more the unsmoothed 1-pixel strokes read thin and blurred (the maintainer) */
+                    const int v = glyph[gy * gw + gx];
+                    const int px = x + x0 + gx;
+                    if (!v || px < clip_l || px >= clip_r)
+                        continue;
+                    SDL_SetRenderDrawColor(ui->ren, c.r, c.g, c.b, (Uint8)(SDL_powf(v / 255.0f, 0.6f) * 255.0f + 0.5f));
+                    SDL_RenderPoint(ui->ren, (float)px, (float)(top + y0 + gy));
+                }
         }
         x += advance(f, cp, next);
     }
@@ -494,13 +498,14 @@ static void paint(XrSetupUi *ui)
     /* an etched line above the progress area */
     pline(ui, X(ui, 10), X(ui, 104 + down), X(ui, cw - 10), X(ui, 104 + down), K_SHADOW);
     pline(ui, X(ui, 10), X(ui, 104 + down) + 1, X(ui, cw - 10), X(ui, 104 + down) + 1, K_LIGHT);
-    /* the step's text and the progress bar: a sunken groove with navy blocks spread over its whole width */
-    /* the step's text, and under it how far the build is ("47% done") - as Windows 2000's own setups showed it */
+    /* the step's text, and right of it how far the build is */
     if (ui->building) {
-        char done[16];
-        snprintf(done, sizeof done, "%d%% done", ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress);
-        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down - line_height(&ui->font), ui->status, K_TEXT);
-        text(ui, &ui->font, 14, 146 + down - line_height(&ui->font), done, K_TEXT);
+        /* the percentage right-aligned on the step's line; the step's text wraps short of it */
+        char done[8];
+        snprintf(done, sizeof done, "%d%%", ui->progress < 0 ? 0 : ui->progress > 100 ? 100 : ui->progress);
+        text(ui, &ui->font, cw - 14 - text_width(&ui->font, done), 114 + down, done, K_TEXT);
+        text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14 - text_width(&ui->font, "100%") - 12, 146 + down,
+                     ui->status, K_TEXT);
     } else {
         text_wrapped(ui, &ui->font, 14, 114 + down, cw - 14, 146 + down, ui->status, K_TEXT);
     }
