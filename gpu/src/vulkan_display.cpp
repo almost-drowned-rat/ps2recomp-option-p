@@ -323,6 +323,11 @@ private:
     void UpdateCursor();
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    /* Android: the app in the background (Home, Back, another app) - its window's surface taken away: the swapchain
+       and the Vulkan surface are let go and nothing is presented until it comes back (Pump; under present_lock_) */
+    bool background_ = false;
+    std::atomic<bool> foreground_{false};     // back from the background: a new surface at the next present
+    static bool SDLCALL LifeCycle(void* self, SDL_Event* e);
     VkPhysicalDevice gpu_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     std::uint32_t family_ = 0;
@@ -635,6 +640,9 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     ici.ppEnabledExtensionNames = extensions;
     if (!Check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance")) return false;
     volkLoadInstance(instance_);
+#ifdef __ANDROID__
+    SDL_AddEventWatch(LifeCycle, this);
+#endif
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
         error_ = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
         return false;
@@ -910,12 +918,44 @@ void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
     vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+/* Android's life cycle (an event watch: SDL sends these from Android's own thread, at once - the event loop may be
+   blocked while paused): Home / Back / another app take the window's surface away, so the swapchain and the Vulkan
+   surface are let go first; back in the foreground the next present makes new ones (the picture stayed black). */
+bool SDLCALL VulkanDisplay::LifeCycle(void* self, SDL_Event* e) {
+    VulkanDisplay* d = static_cast<VulkanDisplay*>(self);
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_DID_ENTER_BACKGROUND) {
+        std::lock_guard<std::mutex> hold(d->present_lock_);
+        if (!d->background_) {
+            d->background_ = true;
+            d->foreground_ = false;
+            d->DestroySwapchain();
+            if (d->surface_) vkDestroySurfaceKHR(d->instance_, d->surface_, nullptr);
+            d->surface_ = VK_NULL_HANDLE;
+            std::fprintf(stderr, "[display] in the background: the surface let go\n");
+        }
+    } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        d->foreground_ = true;
+    }
+    return true;
+}
+
 bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
     *ok = true;
     if (closed_) {
         *ok = false;
         return false;
     }
+    if (background_ && foreground_.exchange(false)) {  // (Android: back - the window's new surface)
+        if (SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
+            background_ = false;
+            stale_ = true;
+            std::fprintf(stderr, "[display] back in the foreground: a new surface\n");
+        } else {
+            surface_ = VK_NULL_HANDLE;
+            foreground_ = true;                     // (its window not there yet: again at the next present)
+        }
+    }
+    if (background_ || !surface_) return false;        // (Android, in the background: nothing to show on)
     if (stale_ && !CreateSwapchain()) {
         *ok = false;
         return false;
@@ -3126,6 +3166,9 @@ bool VulkanDisplay::KeyDown(int scancode) const {
 }
 
 VulkanDisplay::~VulkanDisplay() {
+#ifdef __ANDROID__
+    SDL_RemoveEventWatch(LifeCycle, this);
+#endif
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         stop_ = true;
