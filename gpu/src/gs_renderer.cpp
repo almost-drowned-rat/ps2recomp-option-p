@@ -568,7 +568,8 @@ public:
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
     void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override;
-    void Flush() override;
+    void Flush() override;          // every open batch, oldest first
+    void FlushOne();                // the batch being filled (DrawTriangles)
     void Kick() override {
         Flush();
         g_.Flush();
@@ -873,6 +874,38 @@ private:
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
     PendingVertices pending_;
+    /* Batches open beside the one being filled (agent L, 2026-11-22): a primitive goes to the newest open batch of
+       its state that nothing opened after it covers - draws of two kinds taking turns (ZOE: an object's body and its
+       glow, A B A B) become A A ... B B: fewer draws, and on a tile GPU (Turnip: each draw's state change is what
+       costs) ~28 % fewer batches in ZOE's boss fight. Its order kept: a batch is recorded only after every batch
+       opened before it, and a primitive joins an older batch only where it overlaps nothing in the newer ones (their
+       boxes). A batch reading its target (a copy, blending in the shader), sampling a target or with DATE: the one
+       batch open, as before. PS2HOST_GPU_OPEN_BATCHES=N (1: one batch, as before). */
+    struct OpenBatch {
+        GsDrawState state;
+        PendingVertices pending;
+        bool drawn_any = false;
+        int drawn_x0 = 0, drawn_y0 = 0, drawn_x1 = 0, drawn_y1 = 0;
+        std::vector<BatchTri> tris;
+        std::vector<SpriteSpan> sprites;
+        FlatTriangle last_flat{};
+        bool last_flat_valid = false;
+        std::vector<FlatQuad> quads;
+        bool read_any = false, read_all = false;
+        int read_x0 = 0, read_y0 = 0, read_x1 = 0, read_y1 = 0;
+        std::uint64_t clut_recording = ~0ull;
+        float box[4] = {1e30f, 1e30f, -1e30f, -1e30f};     // what its primitives cover (GS pixels: x0, y0, x1, y1)
+        std::uint64_t order = 0;                            // when it was opened
+    };
+    std::vector<OpenBatch> parked_;                         // the open batches but the one being filled
+    float box_[4] = {1e30f, 1e30f, -1e30f, -1e30f};         // the batch being filled's (OpenBatch::box)
+    std::uint64_t order_ = 0, next_order_ = 1;
+    const int open_batches_ = [] {
+        const char* n = std::getenv("PS2HOST_GPU_OPEN_BATCHES");
+        return n ? std::clamp(std::atoi(n), 1, 16) : 4;      // (ChooseBatch looks at 16 at most)
+    }();
+    void SwapBatch(OpenBatch& b);
+    void ChooseBatch(const GsDrawState& state, const float* box);
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -939,8 +972,8 @@ private:
     VkBuffer clut_ring_ = VK_NULL_HANDLE;
     VkDeviceMemory clut_ring_memory_ = VK_NULL_HANDLE;
     std::uint32_t* clut_ring_mapped_ = nullptr;
-    std::uint64_t clut_ring_recording_ = ~0ull;
-    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for  // the recording the part in use is filled for
+    std::uint64_t clut_ring_recording_ = ~0ull;  // the recording the part in use is filled for
+    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for
     std::uint32_t clut_ring_used_ = 0;
     std::unordered_map<std::uint64_t, std::uint32_t> clut_ring_placed_;     // version -> its first entry
     std::uint64_t clut_version_ = 0;            // ClutVersion's latest, and its entries
@@ -3147,6 +3180,13 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
 
 void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, std::size_t count) {
     RecordShuffle();
+    // What it covers, and the open batch it goes to (ChooseBatch: the one being filled after it).
+    float box[4] = {1e30f, 1e30f, -1e30f, -1e30f};
+    for (std::size_t i = 0; i < count; ++i) {
+        box[0] = std::min(box[0], v[i].x), box[1] = std::min(box[1], v[i].y);
+        box[2] = std::max(box[2], v[i].x), box[3] = std::max(box[3], v[i].y);
+    }
+    if (open_batches_ > 1 && count >= 3) ChooseBatch(state, box);
     if (!SameBatch(state, state_)) {
         if (!pending_.empty()) {
             const BatchBreak why = BreakWhy(state, state_);
@@ -3189,7 +3229,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
                 if (state.texture != state_.texture) tex_before = state_.texture;
             }
         }
-        Flush();
+        FlushOne();     // (ChooseBatch parked the others; with one batch open, the same as Flush)
     }
     // A primitive sampling the target it draws into, where the batch has
     // drawn already: the batch so far first (the next takes a new copy).
@@ -3400,6 +3440,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
         clut = ClutRingEntry() | (state.csa & 31u) << 22 | (state.palette_eight ? 1u : 0u) << 27;
         pending_clut_recording_ = g_.filling_id();
     }
+    for (int i = 0; i < 2; ++i) box_[i] = std::min(box_[i], box[i]), box_[i + 2] = std::max(box_[i + 2], box[i + 2]);
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
         for (int k = 0; k < 3; ++k, ++out) {
@@ -3479,8 +3520,87 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
     }
 }
 
+void VulkanGsRenderer::SwapBatch(OpenBatch& b) {
+    std::swap(state_, b.state);
+    std::swap(pending_, b.pending);
+    std::swap(drawn_any_, b.drawn_any);
+    std::swap(drawn_x0_, b.drawn_x0), std::swap(drawn_y0_, b.drawn_y0);
+    std::swap(drawn_x1_, b.drawn_x1), std::swap(drawn_y1_, b.drawn_y1);
+    std::swap(batch_tris_, b.tris);
+    std::swap(sprites_, b.sprites);
+    std::swap(last_flat_, b.last_flat);
+    std::swap(last_flat_valid_, b.last_flat_valid);
+    std::swap(quads_, b.quads);
+    std::swap(read_any_, b.read_any), std::swap(read_all_, b.read_all);
+    std::swap(read_x0_, b.read_x0), std::swap(read_y0_, b.read_y0);
+    std::swap(read_x1_, b.read_x1), std::swap(read_y1_, b.read_y1);
+    std::swap(pending_clut_recording_, b.clut_recording);
+    for (int i = 0; i < 4; ++i) std::swap(box_[i], b.box[i]);
+    std::swap(order_, b.order);
+}
+
 void VulkanGsRenderer::Flush() {
+    // The parked batches and the one being filled, oldest first.
+    while (!parked_.empty()) {
+        auto oldest = std::min_element(parked_.begin(), parked_.end(),
+                                       [](const OpenBatch& a, const OpenBatch& b) { return a.order < b.order; });
+        if (!pending_.empty() && order_ < oldest->order) FlushOne();
+        SwapBatch(*oldest);
+        FlushOne();
+        SwapBatch(*oldest);
+        parked_.erase(oldest);
+    }
+    FlushOne();
+}
+
+/* Where a primitive of `state` covering `box` goes (DrawTriangles, before its own checks): the newest open batch of its
+   state that no batch opened after it covers, made the one being filled - or a new batch, the newest; past
+   open_batches_, the oldest recorded. */
+void VulkanGsRenderer::ChooseBatch(const GsDrawState& state, const float* box) {
+    auto unsafe = [&](const GsDrawState& st) { return ShaderBlend(st) || (st.textured && st.texture_target) || st.date; };
+    if (unsafe(state) || (!pending_.empty() && unsafe(state_))) {
+        if (!parked_.empty()) Flush();          // one batch for it, as before - the others recorded first
+        return;
+    }
+    auto covers = [&](const float* o) { return box[0] < o[2] && o[0] < box[2] && box[1] < o[3] && o[1] < box[3]; };
+    // The open batches, newest first (-1: the one being filled): the first of its state is the one; the first that
+    // the primitive overlaps ends the search (it cannot be drawn before that one).
+    int open[16], n = 0;
+    if (!pending_.empty()) open[n++] = -1;
+    for (int i = 0; i < int(parked_.size()) && n < 16; ++i) open[n++] = i;
+    auto order = [&](int i) { return i < 0 ? order_ : parked_[std::size_t(i)].order; };
+    std::sort(open, open + n, [&](int a, int b) { return order(a) > order(b); });
+    for (int k = 0; k < n; ++k) {
+        const int i = open[k];
+        const GsDrawState& st = i < 0 ? state_ : parked_[std::size_t(i)].state;
+        if (SameBatch(state, st)) {
+            if (i < 0) return;                  // the one being filled
+            // It becomes the one being filled, that one parked in its place (an empty one dropped).
+            SwapBatch(parked_[std::size_t(i)]);
+            if (parked_[std::size_t(i)].pending.empty()) parked_.erase(parked_.begin() + i);
+            return;
+        }
+        if (covers(i < 0 ? box_ : parked_[std::size_t(i)].box)) break;
+    }
+    // A new batch, the newest; past open_batches_ open, the oldest recorded.
+    if (!pending_.empty()) {
+        parked_.emplace_back();
+        SwapBatch(parked_.back());
+        if (int(parked_.size()) >= open_batches_) {
+            auto oldest = std::min_element(parked_.begin(), parked_.end(),
+                                           [](const OpenBatch& a, const OpenBatch& b) { return a.order < b.order; });
+            SwapBatch(*oldest);
+            FlushOne();
+            SwapBatch(*oldest);
+            parked_.erase(oldest);
+        }
+    }
+    order_ = next_order_++;
+}
+
+void VulkanGsRenderer::FlushOne() {
     RecordShuffle();
+    for (int i = 0; i < 2; ++i) box_[i] = 1e30f, box_[i + 2] = -1e30f;
     if (pending_clut_recording_ != ~0ull) {
         // The batch's CLUTs were placed in the ring part of the recording they were drawn in: recorded in another,
         // a later recording could write over them while it reads them. Never seen (a submit flushes first); said.
