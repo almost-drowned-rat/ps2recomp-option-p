@@ -121,6 +121,10 @@ public:
     }
     bool fps_toggle_ = false;
     double PresentsPerSecond() const override { return fps_.load(); }
+    std::uint64_t PresentCount() const override { return present_count_.load(std::memory_order_relaxed); }
+    double TakeLongestPresentGap() override { return longest_gap_.exchange(0.0); }
+    std::atomic<std::uint64_t> present_count_{0};
+    std::atomic<double> longest_gap_{0.0};
     std::atomic<double> fps_{0.0};
     std::chrono::steady_clock::time_point fps_since_{};
     std::uint64_t fps_presents_ = 0;
@@ -2681,13 +2685,17 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             interval_sum_ += ms;
             interval_squares_ += ms * ms;
             interval_longest_ = std::max(interval_longest_, ms);
+            if (ms > longest_gap_.load(std::memory_order_relaxed)) longest_gap_.store(ms, std::memory_order_relaxed);
             static const bool hitch = std::getenv("PS2HOST_HITCH") != nullptr;
             if (hitch && ms > 25.0)
                 std::fprintf(stderr, "[hitch] present: %.1f ms since the last\n", ms);
         }
         last_present_ = now;
         // The FPS counter's: presents counted over half a second at a time.
-        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) ++fps_presents_;
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            ++fps_presents_;
+            present_count_.fetch_add(1, std::memory_order_relaxed);
+        }
         const double counted = std::chrono::duration<double>(now - fps_since_).count();
         if (counted >= 0.5) {
             fps_.store(fps_since_.time_since_epoch().count() ? fps_presents_ / counted : 0.0);

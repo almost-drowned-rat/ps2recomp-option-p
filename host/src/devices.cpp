@@ -782,7 +782,19 @@ void CountSpeed() {
     second_from = now;
     second_frames = 0;
     // Each second too (the maintainer 2026-11-22: "nimm jede Sekunde auf").
-    if (g_speed_log || SettingOverlayShows("speed")) std::fprintf(stderr, "[speed] second: %.1f %%\n", speed);
+    if (g_speed_log || SettingOverlayShows("speed")) {
+        // ...with the pictures shown in it and the longest wait between two (60 and ~16.7 ms: no drop).
+        static u64 presents_before = 0;
+        u64 presents = 0;
+        double gap = 0;
+        if (ps2gpu::Display* display = WindowDisplay()) {
+            presents = display->PresentCount();
+            gap = display->TakeLongestPresentGap();
+        }
+        std::fprintf(stderr, "[speed] second: %.1f %%, %llu pictures, longest gap %.1f ms\n", speed,
+                     (unsigned long long)(presents - presents_before), gap);
+        presents_before = presents;
+    }
     sum += speed;
     slowest = std::min(slowest, speed);
     if (++seconds < 5) return;

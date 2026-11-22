@@ -719,8 +719,8 @@ bool FramePacingDefault();
    the guest's vertical blank comes from - TIMER, the 59.94 Hz timer, or DISPLAY, every n-th blank of the display
    itself (a 60 / 120 / 180 / 240 Hz one; a picture then stays exactly n refreshes) - and how the pictures go out -
    PACED, evenly spaced (FrameDue), or IMMEDIATE, each as soon as it is done: timer+paced, timer+immediate,
-   display+paced, display+immediate. Unset or "auto": the best the device has - DISPLAY where the display's blank
-   can be had and its rate fits, TIMER otherwise, paced as the port's default says (SetFramePacingDefault). The
+   display+paced, display+immediate. Unset or "auto": the best the device has - TIMER for now (DISPLAY held pictures on the Odin 2,
+   2026-11-22), paced as the port's default says (SetFramePacingDefault). The
    old values: on = timer+paced, off = timer+immediate (option-p), timer / display = that source, paced (option-c). */
 std::string FramePacingSetting();           // one of the four, or "auto"
 bool FramePacingDisplaySource();            // DISPLAY wanted (auto: where it can be had)

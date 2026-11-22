@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -523,6 +524,12 @@ private:
                 case kDrawSame: {
                     if (op == kDraw) std::memcpy(&played_, at, sizeof played_), at += sizeof played_;
                     const std::uint32_t n = Take<std::uint32_t>(at);
+                    // Read where they lie in the chunk when aligned (every op's size is whole words: always) -
+                    // a copy of every vertex was a tenth of this thread (ZOE's boss fight, 2026-11-22).
+                    if (reinterpret_cast<std::uintptr_t>(at) % alignof(GsVertex) == 0) {
+                        r.DrawTriangles(played_, reinterpret_cast<const GsVertex*>(at), n);
+                        break;
+                    }
                     vertices_.resize(n);
                     std::memcpy(vertices_.data(), at, n * sizeof(GsVertex));
                     r.DrawTriangles(played_, vertices_.data(), n);

@@ -597,7 +597,10 @@ void WriteBack(Bridge& b, Owned& o) {
 void ApplyPatch(Bridge& b);
 
 void Sync(Bridge& b, u32 begin, u32 end, bool write, const Owned* except = nullptr) {
-    Mutate(kMutSync);
+    // A mutation only where something changes: a write, a patch applied, blocks brought back from the GPU
+    // (WriteBack counts its own). A read that finds nothing to do - a CLUT load's, most of them - leaves the
+    // fast path standing (ZOE's boss fight, 2026-11-22: ~5 M of 7 M fast-path misses came right after one).
+    if (write || !b.patch.blocks.empty()) Mutate(kMutSync);
     {
         const auto& t = gs::TheGs().last_transfer;
         TraceBlocks(b, begin, end, "CPU %s %X-%X (last transfer: bp %X bw %u psm %02X at %u,%u %ux%u)",
@@ -611,6 +614,7 @@ void Sync(Bridge& b, u32 begin, u32 end, bool write, const Owned* except = nullp
     // two clock reads were ~1 % of the GS thread in the hangar).
     if (const u32 e = std::min(end, 16384u);
         begin < e && std::memchr(b.blocks.data() + begin, Bridge::kGpuNewer, e - begin)) {
+        if (!write) Mutate(kMutSync);
         Timed timed(Section::GpuSync);
         const TimelineStep step("sync: memory for the CPU");
         Coherent(b, begin, end, false);

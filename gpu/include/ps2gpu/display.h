@@ -62,6 +62,10 @@ public:
     /* Pictures shown a second, over the last half second or so: the FPS
        counter's (F1), apart from TakePacing so it takes nothing from it. */
     virtual double PresentsPerSecond() const { return 0.0; }
+    /* Pictures shown since the start, and the longest time between two since the last call (ms; taken: reset) -
+       the per-second log's (GAME SPEED's, 2026-11-22: 60 FPS without a drop). */
+    virtual std::uint64_t PresentCount() const { return 0; }
+    virtual double TakeLongestPresentGap() { return 0.0; }
 
     /* Vertical sync: each picture waits for the screen's refresh (no
        tearing, FIFO), or goes at once (IMMEDIATE, or MAILBOX where that is

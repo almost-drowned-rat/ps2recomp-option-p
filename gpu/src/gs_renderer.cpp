@@ -976,7 +976,19 @@ private:
     std::uint64_t clut_ring_recording_ = ~0ull;  // the recording the part in use is filled for
     std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for
     std::uint32_t clut_ring_used_ = 0;
-    std::unordered_map<std::uint64_t, std::uint32_t> clut_ring_placed_;     // version -> its first entry
+    // Version -> its first entry, this recording's: an open-addressed table whose slots count as empty unless
+    // stamped with the recording's generation (a new recording clears nothing), and the last one looked up.
+    // (An unordered_map before: a node allocated per CLUT, freed per recording - ~8 % of the renderer thread
+    // in ZOE's boss fight, 2026-11-22.)
+    struct ClutPlaced {
+        std::uint64_t version = 0;
+        std::uint32_t entry = 0, generation = 0;
+    };
+    static constexpr std::uint32_t kClutPlacedSlots = kClutRingVersions * 2;    // a power of two
+    std::vector<ClutPlaced> clut_ring_placed_ = std::vector<ClutPlaced>(kClutPlacedSlots);
+    std::uint32_t clut_ring_generation_ = 1;
+    std::uint64_t clut_last_version_ = 0;
+    std::uint32_t clut_last_entry_ = 0, clut_last_generation_ = 0;
     std::uint64_t clut_version_ = 0;            // ClutVersion's latest, and its entries
     std::uint32_t clut_version_entries_[256] = {};
     bool CanPaletteInShader() const override { return clut_ring_mapped_ != nullptr; }
@@ -2998,11 +3010,23 @@ std::uint32_t VulkanGsRenderer::ClutRingEntry() {
     if (g_.filling_id() != clut_ring_recording_) {
         clut_ring_recording_ = g_.filling_id();
         clut_ring_used_ = 0;
-        clut_ring_placed_.clear();
+        if (++clut_ring_generation_ == 0) {         // (wrapped: every slot's stamp cleared once)
+            for (ClutPlaced& p : clut_ring_placed_) p.generation = 0;
+            clut_ring_generation_ = 1;
+        }
     }
+    if (clut_last_generation_ == clut_ring_generation_ && clut_last_version_ == clut_version_) return clut_last_entry_;
     const std::uint32_t part = std::uint32_t(g_.slot()) * kClutRingVersions * 256;
-    auto found = clut_ring_placed_.find(clut_version_);
-    if (found != clut_ring_placed_.end()) return found->second;
+    std::uint32_t slot = std::uint32_t((clut_version_ * 0x9E3779B97F4A7C15ull) >> 40) & (kClutPlacedSlots - 1);
+    while (clut_ring_placed_[slot].generation == clut_ring_generation_) {
+        if (clut_ring_placed_[slot].version == clut_version_) {
+            clut_last_version_ = clut_version_;
+            clut_last_entry_ = clut_ring_placed_[slot].entry;
+            clut_last_generation_ = clut_ring_generation_;
+            return clut_last_entry_;
+        }
+        slot = (slot + 1) & (kClutPlacedSlots - 1);
+    }
     if (clut_ring_used_ == kClutRingVersions) {
         // The part full within one recording (thousands of CLUTs): its first CLUTs written over - the draws
         // that read them recorded already, and this recording's CLUTs placed again from the start would
@@ -3013,7 +3037,10 @@ std::uint32_t VulkanGsRenderer::ClutRingEntry() {
     }
     const std::uint32_t entry = part + clut_ring_used_++ * 256;
     std::memcpy(clut_ring_mapped_ + entry, clut_version_entries_, 1024);
-    clut_ring_placed_[clut_version_] = entry;
+    clut_ring_placed_[slot] = ClutPlaced{clut_version_, entry, clut_ring_generation_};
+    clut_last_version_ = clut_version_;
+    clut_last_entry_ = entry;
+    clut_last_generation_ = clut_ring_generation_;
     return entry;
 }
 

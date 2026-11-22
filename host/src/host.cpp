@@ -538,8 +538,10 @@ std::string FramePacingSetting() {
 }
 
 bool FramePacingDisplaySource() {
+    // auto: the timer for now - the display's source showed pictures held 0.1-0.5 s on the Odin 2 while the game ran
+    // on (the maintainer saw it, 2026-11-22; under investigation). display+paced / display+immediate by hand only.
     const std::string v = FramePacingSetting();
-    return v == "auto" || v.rfind("display", 0) == 0;
+    return v.rfind("display", 0) == 0;
 }
 
 bool FramePacingPaced() {
