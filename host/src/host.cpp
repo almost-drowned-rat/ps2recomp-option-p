@@ -34,6 +34,9 @@
 
 namespace ps2host {
 
+bool g_planned_stop = false;   // PlannedStop
+
+
 /* --gs-replay <file> <dir>: a GS stream (engine/tools/pcsx2dump.py's, from a
    PCSX2 GS dump) through the GS model alone: local memory and registers set,
    then GIF packets, privileged registers and vertical blanks in turn - each
@@ -954,6 +957,7 @@ int Run(const Options& options) {
             outcome = "stopped: the time limit, between threads (no thread was in a loop)";
         if (abort.reason == 2 && UntilFrameReached())
             outcome = "stopped: frame " + std::to_string(options.until_frame) + " reached (--until-frame)";
+        g_planned_stop = abort.reason == 2 && (watchdog.fired || UntilFrameReached());
     }
     // The GS takes what it was sent before the report reads it.
     try {
@@ -965,6 +969,8 @@ int Run(const Options& options) {
     Report(options, outcome);
     return code;
 }
+
+bool PlannedStop() { return g_planned_stop; }
 
 int Main(int argc, char** argv) {
     // PS2HOST_CORES=N: the process held to its first N logical cores from

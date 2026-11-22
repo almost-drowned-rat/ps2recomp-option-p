@@ -55,6 +55,9 @@ bool IsCrashReportHelper(int argc, char** argv);
 int CrashReportHelper(int argc, char** argv, const ReportGame& game);
 /* The game stopped with an error (`code` not 0): the report made and the
    player told. False when not armed (the caller says what it can). */
+/* Whether the run ended as it was asked to - the time limit (--timeout) or --until-frame: no error, no crash report
+   for it (a benchmark's planned end on Android showed "stopped because of an error"; agent L, 2026-11-22). */
+bool PlannedStop();
 bool ReportStop(int code);
 
 }  // namespace ps2host

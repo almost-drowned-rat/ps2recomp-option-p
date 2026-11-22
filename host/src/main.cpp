@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
     // RECOMP OPTIONS' RESTART NOW: the same executable again, as it was started (its command line, the
     // environment as it is) - the settings saved by now.
     if (ps2host::RestartRequested()) ps2platform::RestartSelf();
-    if (!play.empty() && code != 0) {         // closing the window ends a run with 0
+    if (!play.empty() && code != 0 && !ps2host::PlannedStop()) {   // closing the window ends a run with 0
         std::fflush(nullptr);
         const std::string text = "The game stopped because of an error. What happened is in " +
                                  g_log + " in the game's folder.";
