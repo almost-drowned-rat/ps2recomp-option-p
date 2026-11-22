@@ -158,6 +158,14 @@ public:
                 if (drains_[i])
                     std::fprintf(stderr, " %s %u (%.2f ms a frame)", kWhyNames[i], drains_[i], waited_ns_[i] / 60e6);
             std::fprintf(stderr, "; the renderer's thread at work %.2f ms a frame", played_ns_.exchange(0) / 60e6);
+            static std::uint64_t queue_waited = 0;
+            const std::uint64_t q = QueueWaitNanoseconds();
+            static std::uint64_t gpu_waited = 0;
+            const std::uint64_t g = GpuWaitNanoseconds();
+            std::fprintf(stderr, " (waiting for the queue's lock %.2f ms, for the GPU %.2f ms of it)", (q - queue_waited) / 60e6,
+                         (g - gpu_waited) / 60e6);
+            queue_waited = q;
+            gpu_waited = g;
             const unsigned wrong = wrong_.exchange(0);
             if (wrong) std::fprintf(stderr, "; %u write-backs answered wrong", wrong);
             std::fprintf(stderr, "\n");

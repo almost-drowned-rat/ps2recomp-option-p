@@ -4518,6 +4518,8 @@ std::string SubmitStats() {
 }
 
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
+std::uint64_t QueueWaitNanoseconds() { return g_queue_wait_ns.load(std::memory_order_relaxed); }
+std::uint64_t GpuWaitNanoseconds() { return g_gpu_wait_ns.load(std::memory_order_relaxed); }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 void SetShaderCompileMode(int mode) {
     g_shader_mode.store(std::clamp(mode, int(kShaderOff), int(kShaderHybrid)), std::memory_order_relaxed);

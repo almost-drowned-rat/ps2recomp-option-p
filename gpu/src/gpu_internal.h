@@ -45,6 +45,10 @@ inline std::uint64_t g_submits = 0;
    submissions, presents and the device's wait-idle from one thread at a
    time, and the display presents from a thread of its own. */
 inline std::mutex g_queue_lock;
+/* The renderer's waits for g_queue_lock (its submits; the present thread may hold it), summed - the GPU thread log's. */
+inline std::atomic<std::uint64_t> g_queue_wait_ns{0};
+/* ...and its waits for the GPU (a recording slot's fence: the ring full, or a sync), summed. */
+inline std::atomic<std::uint64_t> g_gpu_wait_ns{0};
 /* VK_EXT_extended_dynamic_state3's colour blending - enable, equation, write mask - as dynamic state: the GS
    renderer's pipelines then differ by shader only, not by each draw's blending (agent L, 2026-11-22: ZOE's boss
    fight bound a pipeline every third draw, the alpha-blended and opaque passes taking turns; a bind on Turnip
@@ -247,7 +251,10 @@ void VulkanGpu::Record(F&& record, int line) {
 inline bool VulkanGpu::Retire(int slot, const char* why) {
     if (!in_flight_[slot]) return true;
     const auto start = std::chrono::steady_clock::now();
+    const auto fence_waiting = std::chrono::steady_clock::now();
     const bool ok = vkWaitForFences(device, 1, &fences[slot], VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    g_gpu_wait_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - fence_waiting).count()), std::memory_order_relaxed);
     const auto end = std::chrono::steady_clock::now();
     const double waited = std::chrono::duration<double>(end - start).count();
     g_wait_seconds += waited;
@@ -302,7 +309,10 @@ inline bool VulkanGpu::Flush() {
     vkResetFences(device, 1, &fences[current_]);
     bool ok;
     {
+        const auto waiting = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> hold(g_queue_lock);
+        g_queue_wait_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - waiting).count()), std::memory_order_relaxed);
         ok = vkQueueSubmit(queue, 1, &submit, fences[current_]) == VK_SUCCESS;
     }
     ++g_submits;

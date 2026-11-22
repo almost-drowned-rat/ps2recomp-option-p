@@ -360,6 +360,8 @@ private:
     // (with one, every present waited for all the GPU had been given - the
     // GS thread, which presents, in step with the GPU once a vertical blank).
     static constexpr int kInFlight = 3;
+    int lag_index_ = -1;                        // PS2HOST_PRESENT_LAG: the picture submitted, shown at the next turn
+    VkFence lag_fence_ = VK_NULL_HANDLE;
     VkCommandBuffer cmds_[kInFlight] = {};
     VkSemaphore acquireds_[kInFlight] = {};
     VkFence fences_[kInFlight] = {};
@@ -766,6 +768,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
 }
 
 bool VulkanDisplay::CreateSwapchain() {
+    lag_index_ = -1;                            // (an image of the old swapchain: not shown)
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu_, surface_, &caps);
     int w = 0, h = 0;
@@ -2683,9 +2686,74 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
     present.pImageIndices = &index;
     VkResult r;
     {
+        // PS2HOST_HITCH: the queue held longer than 4 ms by this submit + present (the renderer waits for it - one
+        // queue on Turnip), and which of the two took it.
+        static const bool hitch = std::getenv("PS2HOST_HITCH") != nullptr;
+        // The picture's copy waited for here, outside the queue's lock, and handed to present with nothing to wait
+        // on: given the semaphore, Turnip's Android present waited on the CPU for all the GPU had queued - ~20 ms
+        // a picture with the one queue locked, the renderer unable to submit meanwhile (the boss fight's present
+        // held the queue 18-20 ms every frame, 2026-11-22). PS2HOST_PRESENT_SEMAPHORE=1: as before.
+        // (Tried 2026-11-22: the picture's turn then waited for all the GPU had queued before its copy - 27-33
+        // pictures a second on the Odin. Kept behind PS2HOST_PRESENT_FENCE=1 for experiments; the semaphore is
+        // the default.)
+        static const bool semaphore = std::getenv("PS2HOST_PRESENT_FENCE") == nullptr &&
+                                      std::getenv("PS2HOST_PRESENT_LAG") == nullptr;
+        // PS2HOST_PRESENT_LAG=1: a picture behind - this one's copy submitted (nothing to signal), the one before
+        // presented with nothing to wait on (its copy done by now: its fence waited outside the lock, at once as a
+        // rule). The queue held for the present call alone; a picture (16.7 ms) more latency.
+        static const bool lag = std::getenv("PS2HOST_PRESENT_LAG") != nullptr;
+        if (lag) {
+            submit.signalSemaphoreCount = 0;
+            {
+                std::lock_guard<std::mutex> hold(g_queue_lock);
+                if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+            }
+            r = VK_SUCCESS;
+            const int behind = lag_index_;
+            const VkFence behind_fence = lag_fence_;
+            lag_index_ = int(index);
+            lag_fence_ = fence_;
+            if (behind < 0) return true;                // the first: nothing to show yet
+            vkWaitForFences(device_, 1, &behind_fence, VK_TRUE, UINT64_MAX);
+            std::uint32_t shown = std::uint32_t(behind);
+            present.waitSemaphoreCount = 0;
+            present.pImageIndices = &shown;
+            const auto locking = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> hold(g_queue_lock);
+            const auto locked = std::chrono::steady_clock::now();
+            r = vkQueuePresentKHR(queue_, &present);
+            if (hitch) {
+                const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count();
+                if (held > 4.0)
+                    std::fprintf(stderr, "[hitch] queue held %.1f ms by a present (lag; waited %.1f for it)\n", held,
+                                 std::chrono::duration<double, std::milli>(locked - locking).count());
+            }
+        } else if (!semaphore) {
+            submit.signalSemaphoreCount = 0;
+            present.waitSemaphoreCount = 0;
+            {
+                std::lock_guard<std::mutex> hold(g_queue_lock);
+                if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+            }
+            vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        }
+        if (!lag) {
+        const auto locking = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+        const auto locked = std::chrono::steady_clock::now();
+        if (semaphore && !Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+        const auto submitted = std::chrono::steady_clock::now();
         r = vkQueuePresentKHR(queue_, &present);
+        if (hitch) {
+            const auto done = std::chrono::steady_clock::now();
+            const double held = std::chrono::duration<double, std::milli>(done - locked).count();
+            if (held > 4.0)
+                std::fprintf(stderr, "[hitch] queue held %.1f ms by a present (submit %.1f, present %.1f; waited %.1f for it)\n",
+                             held, std::chrono::duration<double, std::milli>(submitted - locked).count(),
+                             std::chrono::duration<double, std::milli>(done - submitted).count(),
+                             std::chrono::duration<double, std::milli>(locked - locking).count());
+        }
+        }
     }
     if (shot_buffer_) ShotWrite();
     {

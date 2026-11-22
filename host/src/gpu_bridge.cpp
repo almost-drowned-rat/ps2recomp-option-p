@@ -44,6 +44,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <utility>
 #include <bitset>
 #include <cmath>
 #include <cstdarg>
@@ -354,6 +356,13 @@ Bridge* g_bridge = nullptr;
 // primitive with the registers of the one before draws as that one did
 // (OnDraw's fast path).
 u64 g_mutations = 0;
+std::atomic<u64> g_game_pictures{0};      // GamePictures
+// The game's pictures' times (steady ns), the last 256, and the longest wait between two per reader (0 the overlay,
+// 1 the log) - GamePicturesInLast / TakeLongestGamePictureGap.
+std::mutex g_picture_times_lock;
+u64 g_picture_times[256] = {};
+u64 g_picture_longest[2] = {};
+double g_game_picture_rate = 1e9 / 16683333.0;   // SetGamePictureRate (59.94)
 // Of those, the CLUT loads' (LoadClut); and why primitives missed the fast path (the summary's "fast path" line):
 // 0 none to repeat, 1 only CLUT loads since and the same registers, 2 only CLUT loads and TEX0 differing only in
 // its CLUT fields (CBP, CPSM, CSM, CSA, CLD), 3 other mutations, 4 other registers, 5 the rest.
@@ -3247,6 +3256,26 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
                 g_good = g_bridge->renderer->Scale();
             }
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
+            // The game's own pictures: a frame whose shown buffer differs from the last frame's is a new one (a
+            // double-buffered game's flip) - GamePictures, what the game's speed is when it moves a step a picture
+            // (the maintainer 2026-11-22: ZOE slows with its pictures while its blanks go on).
+            {
+                u32 shown_fbp = 0, shown_fbw = 0, shown_psm = 0;
+                static u32 last_shown = ~0u;
+                if (gs::TheGs().Displayed(&shown_fbp, &shown_fbw, &shown_psm) && shown_fbp != last_shown) {
+                    last_shown = shown_fbp;
+                    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+                    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+                    if (n) {
+                        const u64 gap = now - g_picture_times[(n - 1) & 255];
+                        for (u64& longest : g_picture_longest) longest = std::max(longest, gap);
+                    }
+                    g_picture_times[n & 255] = now;
+                    g_game_pictures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             g_present_frame = frame;
             g_present_waits = true;
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
@@ -3256,6 +3285,31 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;
 }
+
+u64 GamePictures() { return g_game_pictures.load(std::memory_order_relaxed); }
+
+int GamePicturesInLast(u64 window_ns) {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+    int count = 0;
+    for (u64 i = n; i > 0 && n - i < 256 && now - g_picture_times[(i - 1) & 255] <= window_ns; --i) ++count;
+    return count;
+}
+
+double TakeLongestGamePictureGap(int reader) {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+    u64 longest = std::exchange(g_picture_longest[reader & 1], 0);
+    if (n) longest = std::max(longest, now - g_picture_times[(n - 1) & 255]);    // a wait going on now counts
+    return double(longest) / 1e6;
+}
+
+void SetGamePictureRate(double per_second) { g_game_picture_rate = per_second; }
+double GamePictureRate() { return g_game_picture_rate; }
 
 bool GpuPrimary() { return g_bridge && g_bridge->primary; }
 

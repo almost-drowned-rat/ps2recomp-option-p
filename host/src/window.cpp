@@ -575,41 +575,33 @@ void RefreshOverlay() {
             text += part;
         };
         char part[48];
-        const double fps = g_display->PresentsPerSecond();
-        // FPS: the pictures really shown in the last whole second - a count, nothing extrapolated from half a
-        // second (the maintainer 2026-11-22: no averages; 62 from a half second's 31 is gone).
-        const long long last_second = g_display->PresentsLastSecond();
+        // All three from the game's own pictures (GamePictures: its flips, as ARMSX2's internal FPS) of the last
+        // whole second - what the player sees, nothing averaged (the maintainer 2026-11-22):
+        // FPS the pictures counted, SPEED them against the rate the game is made for (a game that moves a step a
+        // picture is that much slower), FRAME TIME the longest wait between two (a wait going on counts).
+        static int pictures = -1;
+        static double frame_ms = -1;
+        static auto measured = std::chrono::steady_clock::time_point{};
+        static auto started = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - measured >= std::chrono::milliseconds(450)) {
+            measured = now;
+            const bool whole_second = now - started >= std::chrono::seconds(1) && GamePictures() > 0;
+            pictures = whole_second ? GamePicturesInLast(1'000'000'000ull) : -1;
+            frame_ms = GamePictures() > 1 ? TakeLongestGamePictureGap(0) : -1;
+        }
         if (fps_on) {
-            if (last_second >= 0) std::snprintf(part, sizeof part, "FPS %lld", last_second);
+            if (pictures >= 0) std::snprintf(part, sizeof part, "FPS %d", pictures);
             else std::snprintf(part, sizeof part, "FPS --");
             add(part);
         }
-        // FRAME TIME: the longest picture of the last half second (a stutter shows, an average hid it - the
-        // maintainer 2026-11-22), the average where none was measured.
-        static double frame_ms = 0;
-        static auto frame_measured = std::chrono::steady_clock::time_point{};
-        if (std::chrono::steady_clock::now() - frame_measured >= std::chrono::milliseconds(450)) {
-            frame_ms = g_display->TakeLongestFrame();
-            frame_measured = std::chrono::steady_clock::now();
-        }
         if (time_on) {
-            if (frame_ms > 0) std::snprintf(part, sizeof part, "%.1f ms", frame_ms);
-            else if (fps > 0) std::snprintf(part, sizeof part, "%.1f ms", 1000.0 / fps);
+            if (frame_ms >= 0) std::snprintf(part, sizeof part, "%.1f ms", frame_ms);
             else std::snprintf(part, sizeof part, "-- ms");
             add(part);
         }
-        // SPEED over the last half second or more (a call sooner - F1, a notice - shows the last figure).
-        static GameSpeedMark mark;
-        static double speed = -1;
-        static auto measured = std::chrono::steady_clock::time_point{};
-        const auto now = std::chrono::steady_clock::now();
-        if (now - measured >= std::chrono::milliseconds(450)) {
-            double percent = 0;
-            speed = GameSpeed(&mark, &percent) ? percent : -1;
-            measured = now;
-        }
         if (speed_on) {
-            if (speed >= 0) std::snprintf(part, sizeof part, "SPEED %.0f %%", speed);
+            if (pictures >= 0) std::snprintf(part, sizeof part, "SPEED %.0f %%", 100.0 * pictures / GamePictureRate());
             else std::snprintf(part, sizeof part, "SPEED --");
             add(part);
         }

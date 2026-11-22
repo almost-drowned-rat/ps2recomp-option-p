@@ -793,6 +793,7 @@ void CountSpeed() {
     const double ran = 100.0 * (1.0 - double(stall_total - second_stall) / double(now - second_from));
     const double speed = virtual_time ? counted : std::max(0.0, std::min(counted, ran));     // what the player sees
     second_stall = stall_total;
+    const u64 second_from_log = second_from;
     second_from = now;
     second_frames = 0;
     // Each second too (the maintainer 2026-11-22: "nimm jede Sekunde auf").
@@ -806,8 +807,17 @@ void CountSpeed() {
             gap = display->TakeLongestPresentGap();
         }
         if (presents_before == ~0ull) presents_before = presents - std::min<u64>(presents, 60);   // (the first: no count)
-        std::fprintf(stderr, "[speed] second: %.1f %%, %llu pictures, longest gap %.1f ms\n", speed,
-                     (unsigned long long)(presents - presents_before), gap);
+        // The game's own pictures first (what the overlay shows: speed = them against the game's rate, the longest
+        // wait between two); then, to tell where a drop came from, the blanks' speed and the presents.
+        static u64 game_before = ~0ull;
+        const u64 game = GamePictures();
+        if (game_before == ~0ull) game_before = game;
+        const u64 game_pictures = game - game_before;
+        const double game_speed = 100.0 * double(game_pictures) / ((now - second_from_log) / 1e9) / GamePictureRate();
+        std::fprintf(stderr, "[speed] second: %.1f %%, %llu pictures, longest gap %.1f ms (blanks %.1f %%, %llu presents, "
+                     "longest %.1f ms)\n", game_speed, (unsigned long long)game_pictures, TakeLongestGamePictureGap(1),
+                     speed, (unsigned long long)(presents - presents_before), gap);
+        game_before = game;
         presents_before = presents;
     }
     // Each 5 s: the worst only - no average (the maintainer 2026-11-22: an average's window can be chosen until it
@@ -848,6 +858,22 @@ bool GameSpeed(GameSpeedMark* mark, double* percent) {
 
 void FrameDone(u64 frame) {
     CountSpeed();
+    // PS2HOST_PICTURES_AT=a,b: the game's pictures counted at those frames (its flips between two blanks: how many
+    // pictures a stretch of the game has when nothing holds it up - --virtual-time - against real time).
+    static const std::vector<u64> pictures_at = [] {
+        std::vector<u64> at;
+        if (const char* e = std::getenv("PS2HOST_PICTURES_AT"))
+            for (const char* p = e; *p;) {
+                at.push_back(std::strtoull(p, const_cast<char**>(&p), 10));
+                if (*p == ',') ++p;
+                else break;
+            }
+        return at;
+    }();
+    for (u64 at : pictures_at)
+        if (frame == at)
+            std::fprintf(stderr, "[pictures] frame %llu: %llu game pictures so far\n", (unsigned long long)frame,
+                         (unsigned long long)GamePictures());
     FrameTimes(frame);
     MusicBlank();
     timeline::Frame(frame);

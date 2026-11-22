@@ -337,6 +337,17 @@ struct GameSpeedMark {
     u64 frames = 0, ns = 0, stall_ns = 0;
 };
 bool GameSpeed(GameSpeedMark* mark, double* percent);
+/* The game's own pictures (gpu_bridge.cpp: a frame whose shown buffer changed - a flip, as ARMSX2's "internal
+   FPS"): since the start, in the last window (ns), and the longest wait between two since this reader's last call
+   (reader 0 the overlay, 1 the log; a wait going on counts), in ms. The PERFORMANCE OVERLAY's FPS, SPEED (against
+   SetGamePictureRate) and FRAME TIME all come from them (the maintainer 2026-11-22: what the player sees - a game
+   that moves a step a picture slows with its pictures while its blanks go on). */
+u64 GamePictures();
+int GamePicturesInLast(u64 window_ns);
+double TakeLongestGamePictureGap(int reader);
+/* The pictures a second the game is made for (a port's; 59.94 unless set - a 30-FPS game sets 29.97). */
+void SetGamePictureRate(double per_second);
+double GamePictureRate();
 /* The PERFORMANCE OVERLAY's setting ("performance_overlay": off, fps, frametime, speed, fps+frametime,
    fps+speed, frametime+speed, all - unset, the old "fps_counter"'s: on = fps, both = fps+frametime), and
    whether it shows a part ("fps", "frametime", "speed"). window.cpp. */
