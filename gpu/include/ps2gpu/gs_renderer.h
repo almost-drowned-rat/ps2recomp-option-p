@@ -431,7 +431,8 @@ std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
    before CreateGsRenderer; "" (a scripted run) keeps nothing. */
 /* The renderer's waits for the GPU queue's lock so far (ns): the present may hold it (the GPU thread log's). */
 std::uint64_t QueueWaitNanoseconds();
-std::uint64_t GpuWaitNanoseconds();     /* its waits for the GPU (fences) so far */
+std::uint64_t GpuWaitNanoseconds();
+std::uint64_t ShaderStandIns();         /* batches drawn by a stand-in or kept waiting for their pipeline so far */     /* its waits for the GPU (fences) so far */
 void SetPipelineCacheDir(const std::string& dir);
 /* Pipelines a game is known to draw with (keys as gpu_pipelines.txt has
    them), made by the renderer's worker from the start as the last runs'

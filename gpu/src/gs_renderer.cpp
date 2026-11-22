@@ -216,7 +216,11 @@ long long SteadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-void MarkBuilding() { g_building_at.store(SteadyMs(), std::memory_order_relaxed); }
+std::atomic<std::uint64_t> g_marked_building{0};   // MarkBuilding's calls (the GPU thread log's: stand-ins and waits)
+void MarkBuilding() {
+    g_marked_building.fetch_add(1, std::memory_order_relaxed);
+    g_building_at.store(SteadyMs(), std::memory_order_relaxed);
+}
 std::uint64_t g_batches = 0;            /* batches recorded (Flush with something pending) */
 /* The two-pass breaks by AFAIL (0 KEEP .. 3 RGB_ONLY) and ZTST (0 NEVER or no depth, 1 ALWAYS, 2 GEQUAL, 3 GREATER). */
 std::uint64_t g_two_pass_breaks[4][4] = {};
@@ -475,13 +479,20 @@ VkPipelineColorBlendAttachmentState Blending(std::uint32_t key, bool dual_source
 }
 
 bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
-    // Most primitives come with the very state of the one before (the
-    // bridge's fast path): the same bytes are the same fields, at once.
-    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     // PS2HOST_GPU_WHATIF_MERGE=1 (diagnosis only - WRONG pictures): texture, CLUT and FBMSK changes do not end a
     // batch, as state carried per primitive would let them; the GPU time and batch count it gives are what that
     // work could win at most.
     static const bool what_if = std::getenv("PS2HOST_GPU_WHATIF_MERGE") != nullptr;
+    // A few fields any batch must share, first: most asks are about another batch's state (ChooseBatch asks each
+    // open one), which these tell at once - the whole-state memcmp below ran to the end for each (the CLUT, last,
+    // differs a primitive): ~10 % of the renderer's thread (ZOE's boss fight, 2026-11-22). The same answer.
+    if (!what_if && (x.fbp != y.fbp || x.textured != y.textured || (x.textured && x.texture != y.texture) ||
+                     x.blend != y.blend || x.alpha_test != y.alpha_test || x.depth != y.depth || x.sprite != y.sprite ||
+                     x.fbmsk != y.fbmsk))
+        return false;
+    // Most primitives come with the very state of the one before (the
+    // bridge's fast path): the same bytes are the same fields, at once.
+    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     if (what_if) {
         GsDrawState a = x, b = y;
         b.fbmsk = a.fbmsk;
@@ -899,6 +910,37 @@ private:
         std::uint64_t order = 0;                            // when it was opened
     };
     std::vector<OpenBatch> parked_;                         // the open batches but the one being filled
+    // Batches closed, kept with their buffers (vertices, triangles, sprites, quads) for the next to open: an erase
+    // freed them and the next batch grew them again - ~9 % of the renderer's thread (ZOE's boss fight, 2026-11-22).
+    std::vector<OpenBatch> spare_batches_;
+    void DropParked(std::size_t i) {
+        OpenBatch& b = parked_[i];
+        // Its buffers kept (emptied), everything else as a new OpenBatch has it.
+        PendingVertices pending = std::move(b.pending);
+        std::vector<BatchTri> tris = std::move(b.tris);
+        std::vector<SpriteSpan> sprites = std::move(b.sprites);
+        std::vector<FlatQuad> quads = std::move(b.quads);
+        b = OpenBatch{};
+        pending.clear();
+        tris.clear();
+        sprites.clear();
+        quads.clear();
+        b.pending = std::move(pending);
+        b.tris = std::move(tris);
+        b.sprites = std::move(sprites);
+        b.quads = std::move(quads);
+        if (i + 1 != parked_.size()) std::swap(b, parked_.back());   // (the order is by `order`, not place)
+        spare_batches_.push_back(std::move(parked_.back()));
+        parked_.pop_back();
+    }
+    void ParkNew() {
+        if (spare_batches_.empty()) {
+            parked_.emplace_back();
+            return;
+        }
+        parked_.push_back(std::move(spare_batches_.back()));
+        spare_batches_.pop_back();
+    }
     float box_[4] = {1e30f, 1e30f, -1e30f, -1e30f};         // the batch being filled's (OpenBatch::box)
     std::uint64_t order_ = 0, next_order_ = 1;
     const int open_batches_ = [] {
@@ -3651,7 +3693,7 @@ void VulkanGsRenderer::Flush() {
         SwapBatch(*oldest);
         FlushOne();
         SwapBatch(*oldest);
-        parked_.erase(oldest);
+        DropParked(std::size_t(oldest - parked_.begin()));
     }
     FlushOne();
 }
@@ -3680,14 +3722,14 @@ void VulkanGsRenderer::ChooseBatch(const GsDrawState& state, const float* box) {
             if (i < 0) return;                  // the one being filled
             // It becomes the one being filled, that one parked in its place (an empty one dropped).
             SwapBatch(parked_[std::size_t(i)]);
-            if (parked_[std::size_t(i)].pending.empty()) parked_.erase(parked_.begin() + i);
+            if (parked_[std::size_t(i)].pending.empty()) DropParked(std::size_t(i));
             return;
         }
         if (covers(i < 0 ? box_ : parked_[std::size_t(i)].box)) break;
     }
     // A new batch, the newest; past open_batches_ open, the oldest recorded.
     if (!pending_.empty()) {
-        parked_.emplace_back();
+        ParkNew();
         SwapBatch(parked_.back());
         if (int(parked_.size()) >= open_batches_) {
             auto oldest = std::min_element(parked_.begin(), parked_.end(),
@@ -3695,7 +3737,7 @@ void VulkanGsRenderer::ChooseBatch(const GsDrawState& state, const float* box) {
             SwapBatch(*oldest);
             FlushOne();
             SwapBatch(*oldest);
-            parked_.erase(oldest);
+            DropParked(std::size_t(oldest - parked_.begin()));
         }
     }
     order_ = next_order_++;
@@ -4520,6 +4562,7 @@ std::string SubmitStats() {
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
 std::uint64_t QueueWaitNanoseconds() { return g_queue_wait_ns.load(std::memory_order_relaxed); }
 std::uint64_t GpuWaitNanoseconds() { return g_gpu_wait_ns.load(std::memory_order_relaxed); }
+std::uint64_t ShaderStandIns() { return g_marked_building.load(std::memory_order_relaxed); }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 void SetShaderCompileMode(int mode) {
     g_shader_mode.store(std::clamp(mode, int(kShaderOff), int(kShaderHybrid)), std::memory_order_relaxed);

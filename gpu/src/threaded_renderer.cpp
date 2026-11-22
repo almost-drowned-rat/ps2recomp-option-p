@@ -166,6 +166,10 @@ public:
                          (g - gpu_waited) / 60e6);
             queue_waited = q;
             gpu_waited = g;
+            static std::uint64_t stand_ins_before = 0;
+            const std::uint64_t si = ShaderStandIns();
+            std::fprintf(stderr, "; pipeline stand-ins / waits %llu", (unsigned long long)(si - stand_ins_before));
+            stand_ins_before = si;
             const unsigned wrong = wrong_.exchange(0);
             if (wrong) std::fprintf(stderr, "; %u write-backs answered wrong", wrong);
             std::fprintf(stderr, "\n");
@@ -509,9 +513,11 @@ private:
         const std::uint8_t* at = chunk.data();
         const std::uint8_t* const end = at + chunk.size();
         GsRenderer& r = *inner_;
-        // PS2HOST_GPU_THREAD_LOG: an op that took longer than 50 ms said (which, how long) - the boss fight's
+        // PS2HOST_GPU_SLOW_OPS: an op that took longer than 50 ms said (which, how long) - the boss fight's
         // occasional half-second stall (2026-11-22).
-        static const bool slow_log = std::getenv("PS2HOST_GPU_THREAD_LOG") != nullptr;
+        // (Its own switch, PS2HOST_GPU_SLOW_OPS: two clock reads an op cost the renderer a third of its time on the
+        // Odin 2, whose clock_gettime is ~1.5 us - the thread log must not measure itself, 2026-11-22.)
+        static const bool slow_log = std::getenv("PS2HOST_GPU_SLOW_OPS") != nullptr;
         while (at < end) {
             const std::uint32_t op = Take<std::uint32_t>(at);
             const std::uint32_t size = Take<std::uint32_t>(at);
