@@ -153,6 +153,10 @@ struct GsDrawState {
     std::uint32_t csa = 0;
     bool palette_eight = true;                           /* 8-bit indices, else 4-bit at CSA */
     std::uint64_t clut_version = 0;
+    /* The texels' alpha, where the bridge knows it (a palette's CLUT rows as the GS model holds them): every
+       texel's within [tex_alpha_lo, tex_alpha_hi]; lo > hi unknown. Lets an alpha test the range decides be
+       folded away (DrawTriangles); not part of the batch's state. */
+    std::int32_t tex_alpha_lo = 1, tex_alpha_hi = 0;
 
     /* The alpha test (TEST.ATE, ATST, AREF, AFAIL). What a failing pixel
        writes: AFAIL 0 KEEP nothing, 1 FB_ONLY its colour (not depth), 2

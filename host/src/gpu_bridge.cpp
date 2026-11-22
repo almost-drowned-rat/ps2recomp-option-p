@@ -2561,6 +2561,28 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                     state.palette_eight = tpsm == gs::PSMT8 || tpsm == gs::PSMT8H;
                     state.csa = Bits(c.tex0, 56, 5);
                     state.clut_version = sent_version;
+                    // The texels' alpha range: the rows it reads, where the GS model holds them (not the GPU only).
+                    const u32 rows = ClutRowsOf(tpsm, state.csa);
+                    if (rows && !(rows & ~s.clut_cpu)) {
+                        static u64 ranged = ~0ull;
+                        static int row_lo[16], row_hi[16];
+                        if (gs::TheGs().clut_changes() != ranged) {
+                            ranged = gs::TheGs().clut_changes();
+                            const auto& entries = gs::TheGs().Clut();
+                            for (u32 r = 0; r < 16; ++r) {
+                                row_lo[r] = 255, row_hi[r] = 0;
+                                for (u32 i = 0; i < 16; ++i) {
+                                    const int a = int(entries[r * 16 + i] >> 24);
+                                    row_lo[r] = std::min(row_lo[r], a), row_hi[r] = std::max(row_hi[r], a);
+                                }
+                            }
+                        }
+                        int lo = 255, hi = 0;
+                        for (u32 r = 0; r < 16; ++r)
+                            if (rows >> r & 1) lo = std::min(lo, row_lo[r]), hi = std::max(hi, row_hi[r]);
+                        state.tex_alpha_lo = lo;
+                        state.tex_alpha_hi = hi;
+                    }
                 }
             } else {
                 // Decoded again when the texture's registers change, local memory

@@ -3184,9 +3184,26 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
     // pixels' between theirs): all pass - no test (one pass, no two-pass batch break); all fail with AFAIL
     // FB_ONLY - the colour without the test, depth not written. The same pixels (ZOE's boss fight, 2026-11-22:
     // ~58 % of its ~720 two-pass breaks a frame were TCC 0 at vertex alpha 0x80 against GEQUAL 0x40).
-    if (state.alpha_test && state.atst != 1 && count >= 3 && (!state.textured || !state.tcc)) {
+    // (PS2HOST_GPU_NO_TEXEL_ALPHA_FOLD=1: only the vertices' - no texel alpha.)
+    // With texel alpha whose range the bridge knows (a palette's CLUT rows): the pixel's alpha's range from the
+    // texels' and the vertices' by TFX - MODULATE At * Af / 128, DECAL and HIGHLIGHT2 At, HIGHLIGHT At + Af -
+    // widened by one each way (the shader's rounding).
+    const bool texel_alpha = state.textured && state.tcc;
+    static const bool no_texel_fold = std::getenv("PS2HOST_GPU_NO_TEXEL_ALPHA_FOLD") != nullptr;
+    if (state.alpha_test && state.atst != 1 && count >= 3 &&
+        (!texel_alpha || (!no_texel_fold && state.tex_alpha_lo <= state.tex_alpha_hi))) {
         int amin = 255, amax = 0;
         for (std::size_t i = 0; i < count; ++i) amin = std::min<int>(amin, v[i].a), amax = std::max<int>(amax, v[i].a);
+        if (texel_alpha) {
+            const int tlo = state.tex_alpha_lo, thi = state.tex_alpha_hi;
+            switch (state.tfx) {
+                case TextureFunction::Modulate: amin = tlo * amin / 128, amax = thi * amax / 128; break;
+                case TextureFunction::Highlight: amin = tlo + amin, amax = thi + amax; break;
+                default: amin = tlo, amax = thi; break;
+            }
+            amin = std::clamp(amin - 1, 0, 255);
+            amax = std::clamp(amax + 1, 0, 255);
+        }
         const auto passes = [&](int a) {
             const int ref = int(state.aref & 0xFF);
             switch (state.atst) {
