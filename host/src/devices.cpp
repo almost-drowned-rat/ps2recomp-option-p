@@ -766,12 +766,15 @@ u64 SteadyNs() {
 }
 
 void CountSpeed() {
-    if (VirtualClock()) return;
+    // (Under --virtual-time too, as an emulator's fast-forward shows: the blanks a real second, above 100 % when it
+    // runs ahead - the maintainer 2026-11-22. Its stalls are no player's: only real time counts them.)
+    const bool virtual_time = VirtualClock();
     const u64 now = SteadyNs();
     {
         std::lock_guard<std::mutex> lock(g_speed_mutex);
         ++g_speed_frames;
-        if (g_speed_last_ns && now - g_speed_last_ns > kBlankNs * 3 / 2) g_speed_stall_ns += now - g_speed_last_ns - kBlankNs;
+        if (!virtual_time && g_speed_last_ns && now - g_speed_last_ns > kBlankNs * 3 / 2)
+            g_speed_stall_ns += now - g_speed_last_ns - kBlankNs;
         g_speed_last_ns = now;
     }
     // The log's: whole seconds of blanks, five of them a line.
@@ -788,7 +791,7 @@ void CountSpeed() {
         stall_total = g_speed_stall_ns;
     }
     const double ran = 100.0 * (1.0 - double(stall_total - second_stall) / double(now - second_from));
-    const double speed = std::max(0.0, std::min(counted, ran));     // what the player sees
+    const double speed = virtual_time ? counted : std::max(0.0, std::min(counted, ran));     // what the player sees
     second_stall = stall_total;
     second_from = now;
     second_frames = 0;
@@ -830,12 +833,12 @@ bool GameSpeed(GameSpeedMark* mark, double* percent) {
     // far counted as stopped, the rest of it when its blank comes).
     const u64 now = SteadyNs();
     const u64 to = last && now - last < 100'000'000ull ? last : now;
-    if (last && now - last > kBlankNs * 3 / 2 && to == now) stall += now - last - kBlankNs;
+    if (!VirtualClock() && last && now - last > kBlankNs * 3 / 2 && to == now) stall += now - last - kBlankNs;
     const bool known = mark->ns && frames >= mark->frames && to > mark->ns && stall >= mark->stall_ns;
     if (known) {
         const double counted = 100.0 * double(frames - mark->frames) / ((to - mark->ns) / 1e9) / kGuestRate;
         const double ran = 100.0 * (1.0 - double(stall - mark->stall_ns) / double(to - mark->ns));
-        *percent = std::max(0.0, std::min(counted, ran));
+        *percent = VirtualClock() ? counted : std::max(0.0, std::min(counted, ran));
     }
     mark->frames = frames;
     mark->ns = to;
