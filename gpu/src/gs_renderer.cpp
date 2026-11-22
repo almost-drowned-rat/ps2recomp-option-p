@@ -220,6 +220,7 @@ void MarkBuilding() { g_building_at.store(SteadyMs(), std::memory_order_relaxed)
 std::uint64_t g_batches = 0;            /* batches recorded (Flush with something pending) */
 /* The two-pass breaks by AFAIL (0 KEEP .. 3 RGB_ONLY) and ZTST (0 NEVER or no depth, 1 ALWAYS, 2 GEQUAL, 3 GREATER). */
 std::uint64_t g_two_pass_breaks[4][4] = {};
+std::map<std::string, std::uint64_t> g_two_pass_kinds;   /* PS2HOST_GPU_COUNT: what the two-pass breakers are */
 std::uint64_t g_two_pass_kept = 0;      /* two-pass primitives kept in the batch: boxes touched, triangles not */
 /* Target breaks by what changed: 0 FBP, 1 FBW/PSM only, 2 FBMSK only; 3: FBP back to the one before the last
    (A, B, A). Texture breaks: 0 only the texture differs (the rest of the state equal), 1 sampling a target is
@@ -3179,6 +3180,44 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
 }
 
 void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, std::size_t count) {
+    // An alpha test the vertices decide (no texel alpha: untextured, or TCC 0 - the alpha is the vertex's, the
+    // pixels' between theirs): all pass - no test (one pass, no two-pass batch break); all fail with AFAIL
+    // FB_ONLY - the colour without the test, depth not written. The same pixels (ZOE's boss fight, 2026-11-22:
+    // ~58 % of its ~720 two-pass breaks a frame were TCC 0 at vertex alpha 0x80 against GEQUAL 0x40).
+    if (state.alpha_test && state.atst != 1 && count >= 3 && (!state.textured || !state.tcc)) {
+        int amin = 255, amax = 0;
+        for (std::size_t i = 0; i < count; ++i) amin = std::min<int>(amin, v[i].a), amax = std::max<int>(amax, v[i].a);
+        const auto passes = [&](int a) {
+            const int ref = int(state.aref & 0xFF);
+            switch (state.atst) {
+                case 0: return false;
+                case 2: return a < ref;
+                case 3: return a <= ref;
+                case 4: return a == ref;
+                case 5: return a >= ref;
+                case 6: return a > ref;
+                case 7: return a != ref;
+                default: return true;
+            }
+        };
+        bool all_pass = true, all_fail = true;
+        for (int a = amin; a <= amax; ++a) {
+            const bool p = passes(a);
+            all_pass = all_pass && p;
+            all_fail = all_fail && !p;
+        }
+        static const bool off = std::getenv("PS2HOST_GPU_NO_ATEST_FOLD") != nullptr;
+        if (!off && (all_pass || (all_fail && state.afail == 1))) {
+            GsDrawState folded = state;
+            folded.alpha_test = false;
+            folded.atst = 1;
+            folded.aref = 0;
+            folded.afail = 0;
+            if (!all_pass) folded.depth_write = false;
+            DrawTriangles(folded, v, count);
+            return;
+        }
+    }
     RecordShuffle();
     // What it covers, and the open batch it goes to (ChooseBatch: the one being filled after it).
     float box[4] = {1e30f, 1e30f, -1e30f, -1e30f};
@@ -3286,8 +3325,28 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
         if (reads_drawn || (shader_blend && overlaps(x0, y0, x1, y1)) || two_pass_real) {
             if (!pending_.empty()) {
                 ++g_batch_breaks[reads_drawn ? kBreakOverlapFeedback : shader_blend ? kBreakOverlap : kBreakOverlapTwoPass];
-                if (!reads_drawn && !shader_blend)
+                if (!reads_drawn && !shader_blend) {
                     ++g_two_pass_breaks[state.afail & 3u][state.depth ? (state.ztst & 3u) : 0u];
+                    static const bool count_kinds = std::getenv("PS2HOST_GPU_COUNT") != nullptr;
+                    if (count_kinds) {
+                        int amin = 255, amax = 0;
+                        std::uint32_t zmin = ~0u, zmax = 0;
+                        for (std::size_t i = 0; i < count; ++i) {
+                            amin = std::min<int>(amin, v[i].a), amax = std::max<int>(amax, v[i].a);
+                            zmin = std::min(zmin, v[i].z), zmax = std::max(zmax, v[i].z);
+                        }
+                        char k[200];
+                        std::snprintf(k, sizeof k, "%s%s tfx%u tcc%d atst%u aref%02X va%02X-%02X blend%d %s %s tris%zu",
+                                      !state.textured ? "untex" : state.texture_target ? "target" : state.palette
+                                          ? (state.palette_eight ? "pal8" : "pal4") : "fmt",
+                                      state.textured && !state.palette && !state.texture_target
+                                          ? std::to_string(state.tex_format).c_str() : "",
+                                      unsigned(state.tfx), int(state.tcc), state.atst, state.aref, amin, amax,
+                                      int(state.blend), zmin == zmax ? "zconst" : "zvar",
+                                      state.sprite_prim ? "sprite" : "tri", count / 3);
+                        ++g_two_pass_kinds[k];
+                    }
+                }
             }
             Flush();
         }
@@ -4343,6 +4402,15 @@ std::string RendererCounters() {
             last_two[a][z] = g_two_pass_breaks[a][z];
             if (n) out += " " + std::to_string(a) + "/" + std::to_string(z) + "=" + std::to_string(n);
         }
+    {
+        std::vector<std::pair<std::uint64_t, std::string>> kinds;
+        for (const auto& [k, n] : g_two_pass_kinds) kinds.emplace_back(n, k);
+        std::sort(kinds.rbegin(), kinds.rend());
+        out += "; two-pass breakers:";
+        for (std::size_t i = 0; i < kinds.size() && i < 10; ++i)
+            out += " [" + kinds[i].second + "]=" + std::to_string(kinds[i].first);
+        g_two_pass_kinds.clear();
+    }
     static std::uint64_t last_kept = 0;
     out += "; two-pass kept in their batch (boxes only touched): " + std::to_string(g_two_pass_kept - last_kept);
     last_kept = g_two_pass_kept;
