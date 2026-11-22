@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -575,13 +576,25 @@ void RefreshOverlay() {
         };
         char part[48];
         const double fps = g_display->PresentsPerSecond();
+        // FPS: the pictures really shown in the last whole second - a count, nothing extrapolated from half a
+        // second (the maintainer 2026-11-22: no averages; 62 from a half second's 31 is gone).
+        const long long last_second = g_display->PresentsLastSecond();
         if (fps_on) {
-            if (fps > 0) std::snprintf(part, sizeof part, "FPS %.1f", fps);
+            if (last_second >= 0) std::snprintf(part, sizeof part, "FPS %lld", last_second);
             else std::snprintf(part, sizeof part, "FPS --");
             add(part);
         }
+        // FRAME TIME: the longest picture of the last half second (a stutter shows, an average hid it - the
+        // maintainer 2026-11-22), the average where none was measured.
+        static double frame_ms = 0;
+        static auto frame_measured = std::chrono::steady_clock::time_point{};
+        if (std::chrono::steady_clock::now() - frame_measured >= std::chrono::milliseconds(450)) {
+            frame_ms = g_display->TakeLongestFrame();
+            frame_measured = std::chrono::steady_clock::now();
+        }
         if (time_on) {
-            if (fps > 0) std::snprintf(part, sizeof part, "%.1f ms", 1000.0 / fps);
+            if (frame_ms > 0) std::snprintf(part, sizeof part, "%.1f ms", frame_ms);
+            else if (fps > 0) std::snprintf(part, sizeof part, "%.1f ms", 1000.0 / fps);
             else std::snprintf(part, sizeof part, "-- ms");
             add(part);
         }

@@ -123,6 +123,18 @@ public:
     double PresentsPerSecond() const override { return fps_.load(); }
     std::uint64_t PresentCount() const override { return present_count_.load(std::memory_order_relaxed); }
     double TakeLongestPresentGap() override { return longest_gap_.exchange(0.0); }
+    double TakeLongestFrame() override { return longest_frame_.exchange(0.0); }
+    int PresentsLastSecond() const override {
+        std::lock_guard<std::mutex> hold(pacing_lock_);
+        const auto now = std::chrono::steady_clock::now();
+        if (present_times_.empty() || now - first_present_ < std::chrono::seconds(1)) return -1;
+        int n = 0;
+        for (auto it = present_times_.rbegin(); it != present_times_.rend() && now - *it <= std::chrono::seconds(1); ++it) ++n;
+        return n;
+    }
+    std::deque<std::chrono::steady_clock::time_point> present_times_;     // the last second's (pacing_lock_)
+    std::chrono::steady_clock::time_point first_present_{};
+    std::atomic<double> longest_frame_{0.0};
     std::atomic<std::uint64_t> present_count_{0};
     std::atomic<double> longest_gap_{0.0};
     std::atomic<double> fps_{0.0};
@@ -564,7 +576,7 @@ private:
     std::thread present_thread_;
     std::mutex present_lock_;               // the swapchain and cmds_: the present thread, or Present
     // Present times (TakePacing): intervals since the last take.
-    std::mutex pacing_lock_;
+    mutable std::mutex pacing_lock_;
     std::chrono::steady_clock::time_point last_present_{};
     std::uint64_t presents_ = 0;
     double interval_sum_ = 0, interval_squares_ = 0, interval_longest_ = 0;
@@ -2686,6 +2698,7 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             interval_squares_ += ms * ms;
             interval_longest_ = std::max(interval_longest_, ms);
             if (ms > longest_gap_.load(std::memory_order_relaxed)) longest_gap_.store(ms, std::memory_order_relaxed);
+            if (ms > longest_frame_.load(std::memory_order_relaxed)) longest_frame_.store(ms, std::memory_order_relaxed);
             static const bool hitch = std::getenv("PS2HOST_HITCH") != nullptr;
             if (hitch && ms > 25.0)
                 std::fprintf(stderr, "[hitch] present: %.1f ms since the last\n", ms);
@@ -2695,6 +2708,10 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
         if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
             ++fps_presents_;
             present_count_.fetch_add(1, std::memory_order_relaxed);
+            if (present_times_.empty() && first_present_ == std::chrono::steady_clock::time_point{}) first_present_ = now;
+            present_times_.push_back(now);
+            while (!present_times_.empty() && now - present_times_.front() > std::chrono::milliseconds(1100))
+                present_times_.pop_front();
         }
         const double counted = std::chrono::duration<double>(now - fps_since_).count();
         if (counted >= 0.5) {

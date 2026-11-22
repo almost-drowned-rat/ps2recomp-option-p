@@ -66,6 +66,10 @@ public:
        the per-second log's (GAME SPEED's, 2026-11-22: 60 FPS without a drop). */
     virtual std::uint64_t PresentCount() const { return 0; }
     virtual double TakeLongestPresentGap() { return 0.0; }
+    /* The same for the overlay's FRAME TIME (its own, so the log and the overlay take nothing from each other). */
+    virtual double TakeLongestFrame() { return 0.0; }
+    /* Pictures shown in the last whole second, counted (the overlay's FPS; -1: not yet a second). */
+    virtual int PresentsLastSecond() const { return -1; }
 
     /* Vertical sync: each picture waits for the screen's refresh (no
        tearing, FIFO), or goes at once (IMMEDIATE, or MAILBOX where that is

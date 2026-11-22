@@ -329,10 +329,12 @@ void SetGsTraceFrame(long long frame);
    GPU has it) - to set beside another run's (engine/tools/gsmem.py). */
 void SetGsDumpFrame(long long frame);
 void FrameDone(u64 frame);
-/* GAME SPEED (devices.cpp): the vertical blanks the game took a real second since the mark, in % of the
-   console's 59.94; false until a mark is set (the first call) or under --virtual-time. Moves the mark on. */
+/* GAME SPEED (devices.cpp) since the mark, in %: what the player sees (the maintainer 2026-11-22) - the share of
+   the time the game ran, a wait between two blanks longer than 1.5 of the console's (59.94 Hz) counted as
+   stopped (the owed blanks caught up after it do not make up for it), and never above the blanks taken a real
+   second against 59.94. False until a mark is set (the first call) or under --virtual-time. Moves the mark on. */
 struct GameSpeedMark {
-    u64 frames = 0, ns = 0;
+    u64 frames = 0, ns = 0, stall_ns = 0;
 };
 bool GameSpeed(GameSpeedMark* mark, double* percent);
 /* The PERFORMANCE OVERLAY's setting ("performance_overlay": off, fps, frametime, speed, fps+frametime,
