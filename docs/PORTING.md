@@ -112,12 +112,17 @@ It is a windowed program, so no console opens beside it: started from a
 terminal it writes to that one, and started with no arguments to a log named
 after it (`burnout3.log`), which an error message points to.
 
-F1 shows or hides an FPS counter (the pictures shown a second; setting
-`fps_counter`, off by default). F9 opens the engine's PC settings panel - for
+F1 shows or hides the performance overlay (setting `performance_overlay`:
+`off` by default, or `fps`, `frametime`, `speed` joined by `+`, or `all`; an
+old `fps_counter` is read when it is unset). FPS = the pictures shown a second,
+SPEED = the vertical blanks the game took a real second against the console's
+59.94 (100 % = full speed; `PS2HOST_SPEED_LOG=1` or the overlay showing it logs
+each 5 s's average and slowest second as `[speed]`). F9 opens the engine's PC settings panel - for
 debugging; the player's settings are the port's RECOMP OPTIONS page in the
 game's own menu, no controller combination opens the panel - over
 any game (`host/src/pc_menu.cpp`): resolution, aspect ratio, fullscreen,
-v-sync, frame pacing and the texture pack, applied at once and saved in
+v-sync, the overlay's figures and the texture pack (frame pacing only in
+the file: `frame_pacing`, unset = automatic), applied at once and saved in
 `pc_settings.ini`; the game gets no input while it is open. A port can also
 put its settings in the game's own menus (Burnout 3's PC SETTINGS).
 

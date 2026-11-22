@@ -329,6 +329,19 @@ void SetGsTraceFrame(long long frame);
    GPU has it) - to set beside another run's (engine/tools/gsmem.py). */
 void SetGsDumpFrame(long long frame);
 void FrameDone(u64 frame);
+/* GAME SPEED (devices.cpp): the vertical blanks the game took a real second since the mark, in % of the
+   console's 59.94; false until a mark is set (the first call) or under --virtual-time. Moves the mark on. */
+struct GameSpeedMark {
+    u64 frames = 0, ns = 0;
+};
+bool GameSpeed(GameSpeedMark* mark, double* percent);
+/* The PERFORMANCE OVERLAY's setting ("performance_overlay": off, fps, frametime, speed, fps+frametime,
+   fps+speed, frametime+speed, all - unset, the old "fps_counter"'s: on = fps, both = fps+frametime), and
+   whether it shows a part ("fps", "frametime", "speed"). window.cpp. */
+std::string SettingPerformanceOverlay();
+bool SettingOverlayShows(const char* part);
+/* One part of the overlay on or off (the menu's switches), the others kept. */
+void SetOverlayPart(const char* part, bool on);
 /* The window (window.cpp): opened with --window, presented each frame. */
 bool OpenWindow(const wchar_t* title, int width, int height);
 /* The game's name, for the window's title (instead of the host's own, "PS2
@@ -483,7 +496,7 @@ void UpdateSelectMenu();
    its next value (step 1) or the one before (-1), applied and saved. */
 struct PcSetting {
     std::string label, value, help;
-    std::string page;           // "" (the list), "POST PROCESSING" or "FRAME RATE": the panel's page it is on
+    std::string page;           // "" (the list), "POST PROCESSING" or "PERFORMANCE": the panel's page it is on
     bool restart = false;       // taken at the next start (RESTART NEEDED)
     std::vector<std::string> values;    // its values as shown (none for a line whose list is not fixed)
 };

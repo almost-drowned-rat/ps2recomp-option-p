@@ -746,7 +746,71 @@ void FinishCapture(u64 frame) {
 
 void RequestCapture() { g_capture_request = true; }
 
+// GAME SPEED (the PERFORMANCE OVERLAY's SPEED, the maintainer 2026-11-22): the vertical blanks the game took a
+// real second, against the console's 59.94 - 100 % the game at its own pace, below it slowed (an EE behind
+// loses blanks past the owed ones, and the game's time with them). Counted here, as each is delivered; the
+// overlay reads it twice a second (GameSpeed), the log says each 5 s's average and its slowest second
+// (PS2HOST_SPEED_LOG=1 or the overlay showing SPEED). Not under --virtual-time: no real second to count in.
+namespace {
+constexpr double kGuestRate = 1e9 / 16683333.0;     // NTSC, 59.94 (the engine's blank, PAL discs too)
+std::mutex g_speed_mutex;
+u64 g_speed_frames = 0;                             // blanks counted, and when the last came (steady ns)
+u64 g_speed_last_ns = 0;
+bool g_speed_log = std::getenv("PS2HOST_SPEED_LOG") != nullptr;
+
+u64 SteadyNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void CountSpeed() {
+    if (VirtualClock()) return;
+    const u64 now = SteadyNs();
+    {
+        std::lock_guard<std::mutex> lock(g_speed_mutex);
+        ++g_speed_frames;
+        g_speed_last_ns = now;
+    }
+    // The log's: whole seconds of blanks, five of them a line.
+    static u64 second_from = 0, second_frames = 0;
+    static int seconds = 0;
+    static double sum = 0, slowest = 1e9;
+    if (!second_from) second_from = now;
+    ++second_frames;
+    if (now - second_from < 1'000'000'000ull) return;
+    const double speed = 100.0 * double(second_frames) / ((now - second_from) / 1e9) / kGuestRate;
+    second_from = now;
+    second_frames = 0;
+    sum += speed;
+    slowest = std::min(slowest, speed);
+    if (++seconds < 5) return;
+    if (g_speed_log || SettingOverlayShows("speed"))
+        std::fprintf(stderr, "[speed] 5 s: average %.1f %%, slowest second %.1f %%\n", sum / seconds, slowest);
+    seconds = 0;
+    sum = 0;
+    slowest = 1e9;
+}
+}  // namespace
+
+bool GameSpeed(GameSpeedMark* mark, double* percent) {
+    u64 frames, last;
+    {
+        std::lock_guard<std::mutex> lock(g_speed_mutex);
+        frames = g_speed_frames;
+        last = g_speed_last_ns;
+    }
+    // To the last blank - or to now, when none came for longer than a few would (the game held up).
+    const u64 now = SteadyNs();
+    const u64 to = last && now - last < 100'000'000ull ? last : now;
+    const bool known = mark->ns && frames >= mark->frames && to > mark->ns;
+    if (known) *percent = 100.0 * double(frames - mark->frames) / ((to - mark->ns) / 1e9) / kGuestRate;
+    mark->frames = frames;
+    mark->ns = to;
+    return known && frames > 0;
+}
+
 void FrameDone(u64 frame) {
+    CountSpeed();
     FrameTimes(frame);
     MusicBlank();
     timeline::Frame(frame);

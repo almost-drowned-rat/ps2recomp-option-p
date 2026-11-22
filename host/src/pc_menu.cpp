@@ -51,7 +51,8 @@ struct Choice {
     int page = 0;                           // kMain, or the page it is on (kPost, kRate)
 };
 
-// The panel's pages (porting guide 4b, Orta's RECOMP OPTIONS): the list, POST PROCESSING's and FRAME RATE's.
+// The panel's pages (porting guide 4b, Orta's RECOMP OPTIONS): the list, POST PROCESSING's and PERFORMANCE's
+// (FRAME RATE's until 2026-11-22).
 enum Page { kMain, kPost, kRate };
 int g_page = kMain;
 
@@ -59,7 +60,8 @@ std::string OnOff(bool on) { return on ? "on" : "off"; }
 
 const std::vector<Choice>& Choices() {
     // In the ports' RECOMP OPTIONS order (porting guide 4b): POST PROCESSING (its page: antialiasing, upscaling),
-    // display mode, resolution, aspect, FRAME RATE (its page: V-sync, frame pacing, FPS counter), textures,
+    // display mode, resolution, aspect, PERFORMANCE (its page: V-sync, FPS, frame time,
+    // game speed), textures,
     // language (no boot animation line for the PS2 ports: boot_video.h, hidden). Rows() puts the pages' rows in.
     static const std::vector<Choice> choices = {
         {"Display mode", {"windowed", "fullscreen", "borderless"}, {"Windowed", "Fullscreen", "Borderless"},
@@ -148,18 +150,22 @@ const std::vector<Choice>& Choices() {
          [] { return OnOff(WindowVsync()); },
          [](const std::string& v) { SetWindowVsync(v == "on"); },
          "V-SYNC", {"OFF", "ON"}, "Wait for the screen's refresh: no tearing.", kRate},
-        // Frame pacing (Orta's two): TIMER = pictures at a steady 60 Hz timer (the "frame_pacing" setting on),
-        // DISPLAY = each shown as it is done, in step with the monitor (off).
-        {"Frame pacing", {"on", "off"}, {"Timer", "Display"},
-         [] { return OnOff(SettingOn("frame_pacing", FramePacingDefault())); },
-         [](const std::string& v) { SetSettingOn("frame_pacing", v == "on"); },
-         "PACING", {"TIMER", "DISPLAY"},
-         "TIMER: pictures at a steady 60 Hz. DISPLAY: in step with the monitor.", kRate},
-        {"FPS counter", {"off", "on", "frametime", "both"}, {"Off", "FPS", "Frame time", "Both"},
-         [] { return Setting("fps_counter", "off"); },
-         [](const std::string& v) { SetSetting("fps_counter", v); },
-         "FPS COUNTER", {"OFF", "FPS", "FRAME TIME", "BOTH"},
-         "The game's pictures a second, the time a picture, or both, in a corner (F1).", kRate},
+        // (FRAME PACING left the menus, the maintainer 2026-11-22: "frame_pacing" in the settings file only.)
+        // PERFORMANCE OVERLAY (was FPS COUNTER; the maintainer 2026-11-22): a switch for each figure, in a corner
+        // together ("performance_overlay": fps, frametime, speed joined by +, all, off; unset, "fps_counter"'s).
+        {"FPS", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("fps")); },
+         [](const std::string& v) { SetOverlayPart("fps", v == "on"); },
+         "FPS", {"OFF", "ON"}, "The pictures shown a second, in a corner (F1: the overlay on or off).", kRate},
+        {"Frame time", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("frametime")); },
+         [](const std::string& v) { SetOverlayPart("frametime", v == "on"); },
+         "FRAME TIME", {"OFF", "ON"}, "The time a picture takes, in milliseconds, in a corner.", kRate},
+        {"Game speed", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("speed")); },
+         [](const std::string& v) { SetOverlayPart("speed", v == "on"); },
+         "GAME SPEED", {"OFF", "ON"}, "The game's own speed in a corner: 100 % as on the console, below it slowed.",
+         kRate},
         // SHADER COMPILE (4b, option-c's four): while a kind of draw's pipeline is made - OFF the frame waits for
         // it, SKIP the draw is left out, WAIT the frame waits up to 2.5 ms then leaves it out, HYBRID the whole
         // shader draws it meanwhile (the same picture). At once; SHADER NOTICE says so on the screen.
@@ -220,11 +226,11 @@ std::string DefaultValue(const std::string& label) {
     if (label == "Aspect ratio") return "4:3";
     if (label == "Field of view") return "0";
     if (label == "Antialiasing" || label == "Anisotropic" || label == "Bloom" || label == "V-sync" ||
-        label == "FPS counter" || label == "Texture pack")
+        label == "FPS" || label == "Frame time" ||
+        label == "Game speed" || label == "Texture pack")
         return "off";
     if (label == "Bloom strength") return "5";
     if (label == "Upscaling") return "linear";
-    if (label == "Frame pacing") return OnOff(FramePacingDefault());
     if (label == "Shader compile") return "hybrid";
     if (label == "Shader notice") return "on";
     if (label == "Language" || label == "Dub") return "en";
@@ -274,6 +280,10 @@ void Step(const Choice& c, int step) {
 bool Shown(const Choice& c) {
     const std::string label = c.label;
     if (label == "Texture pack" && TexturePacks().empty()) return false;
+#ifdef __ANDROID__
+    // Android: always the whole screen - no window, fullscreen or borderless to choose (the maintainer 2026-11-22).
+    if (label == "Display mode") return false;
+#endif
     if (label == "Language" && Languages().size() < 2) return false;
     if (label == "Dub" && (Dubs().size() < 2 || !g_dubs_available || !g_dubs_available())) return false;
     if ((label == "Aspect ratio" || label == "Field of view" || label == "Stretch cutscenes") && !WidescreenSupported())
@@ -284,7 +294,7 @@ bool Shown(const Choice& c) {
     return true;
 }
 
-// The rows of a page: the list's - POST PROCESSING >, its own lines (FRAME RATE > after the aspect ratio's),
+// The rows of a page: the list's - POST PROCESSING >, its own lines (PERFORMANCE > after the aspect ratio's),
 // CONTROLS >, Close; a page's - its lines, then Back.
 constexpr int kCloseRow = -1, kControlsRow = -2, kPostRow = -3, kRateRow = -4, kBackRow = -5;
 // A port's own debug lines (AddDebugLine: ZOE's subtitle timing of the scene playing), rows kPortBase - n.
@@ -302,7 +312,7 @@ std::vector<int> Rows(int page = g_page) {
     std::vector<int> rows;
     if (page == kMain) rows.push_back(kPostRow);
     const auto& c = Choices();
-    std::size_t rate_at = rows.size();      // FRAME RATE > after render resolution, aspect ratio, field of view
+    std::size_t rate_at = rows.size();      // PERFORMANCE > after render resolution, aspect ratio, field of view
     for (int i = 0; i < int(c.size()); ++i) {
         if (c[i].page != page || !Shown(c[i])) continue;
         rows.push_back(i);
@@ -334,7 +344,7 @@ std::vector<int> AllChoices() {
 
 void Draw(bool force = false) {
     std::vector<std::string> lines = {g_page == kPost   ? "RECOMP OPTIONS > POST PROCESSING   (Esc back)"
-                                      : g_page == kRate ? "RECOMP OPTIONS > FRAME RATE   (Esc back)"
+                                      : g_page == kRate ? "RECOMP OPTIONS > PERFORMANCE   (Esc back)"
                                                         : "RECOMP OPTIONS   (F9 closes)"};
     const std::vector<int> rows = Rows();
     for (int r = 0; r < int(rows.size()); ++r) {
@@ -344,7 +354,7 @@ void Draw(bool force = false) {
         } else if (rows[r] == kPostRow) {
             text = "Post processing >";
         } else if (rows[r] == kRateRow) {
-            text = "Frame rate >";
+            text = "Performance >";
         } else if (rows[r] == kBackRow) {
             text = "Back";
         } else if (rows[r] <= kPortBase) {
@@ -743,7 +753,7 @@ std::vector<PcSetting> PcSettings() {
         for (std::size_t v = 0; v < c.values.size(); ++v)
             if (c.values[v] == now) value = c.game_values[v];
         settings.push_back({c.game_label, value, c.help,
-                            c.page == kPost ? "POST PROCESSING" : c.page == kRate ? "FRAME RATE" : "",
+                            c.page == kPost ? "POST PROCESSING" : c.page == kRate ? "PERFORMANCE" : "",
                             NeedsRestart(c), {}});
         for (std::size_t v = 0; v < c.values.size() && v < c.game_values.size(); ++v)
             if (Allowed(c, c.values[v])) settings.back().values.push_back(c.game_values[v]);
