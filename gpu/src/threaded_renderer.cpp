@@ -500,10 +500,24 @@ private:
         const std::uint8_t* at = chunk.data();
         const std::uint8_t* const end = at + chunk.size();
         GsRenderer& r = *inner_;
+        // PS2HOST_GPU_THREAD_LOG: an op that took longer than 50 ms said (which, how long) - the boss fight's
+        // occasional half-second stall (2026-11-22).
+        static const bool slow_log = std::getenv("PS2HOST_GPU_THREAD_LOG") != nullptr;
         while (at < end) {
             const std::uint32_t op = Take<std::uint32_t>(at);
             const std::uint32_t size = Take<std::uint32_t>(at);
             const std::uint8_t* const next = at + size;
+            const auto op_from = slow_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            struct SlowOp {
+                bool on;
+                std::uint32_t op;
+                std::chrono::steady_clock::time_point from;
+                ~SlowOp() {
+                    if (!on) return;
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+                    if (ms > 50.0) std::fprintf(stderr, "[gpu thread] op %u took %.1f ms\n", unsigned(op), ms);
+                }
+            } slow_op{slow_log, op, op_from};
             switch (op) {
                 case kDraw:
                 case kDrawSame: {
