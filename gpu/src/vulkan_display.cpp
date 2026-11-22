@@ -364,7 +364,7 @@ private:
     double stamp_ns_ = 0;
     bool stamp_tried_ = false;
     bool present_stamped_[kInFlight] = {};
-    bool copy_stamped_[3] = {};
+    bool copy_stamped_[5] = {};
     void EnsureStamps();
     void TakeStamp(std::uint32_t first, std::atomic<std::uint64_t>& into);
     int slot_ = 0;
@@ -533,9 +533,13 @@ private:
     void RecordSmaa(VkImage source, std::uint32_t width, std::uint32_t height);
     void DestroySmaa();
     std::string describe_, error_;
-    // PresentImageAt's pictures: copies of the frames' targets, three, each
-    // its copy's command buffer and fence (the GS thread's own pool).
-    static constexpr int kPaced = 3;
+    // PresentImageAt's pictures: copies of the frames' targets, five, each
+    // its copy's command buffer and fence (the GS thread's own pool). Three
+    // were too few where the GPU is the limit (an Odin 2 in ZOE's boss
+    // fight): pictures came while all three waited or were shown, and the
+    // oldest lost its turn - 303 of 1,651 frames dropped, 160 with five
+    // (shown 45 -> 50 a second); agent L, 2026-11-22.
+    static constexpr int kPaced = 5;
     struct PacedPicture {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
