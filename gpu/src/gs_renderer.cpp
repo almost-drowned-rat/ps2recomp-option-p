@@ -62,7 +62,8 @@ struct PackedVertex {
     std::uint8_t fog, pad[3];
     float range[4];             // a sprite's S, T at its first and last pixels (gs.vert)
     std::uint32_t clut;         // a palettized texture's CLUT in the ring, CSA, 8-bit (gs.vert's; DrawTriangles)
-    float pad2[3];
+    std::uint32_t row;          // the batch's DrawRow in the row ring (gs.vert's; Flush)
+    float pad2[2];
 };
 /* Each primitive carries its CLUT (PackedVertex::clut), so a new CLUT - or CSA - ends no batch (agent L, 2026-11-22:
    ~70 % of ZOE's batches in a fight ended on a new CLUT, the Odin 2's GPU busy with ~4,500 draws a frame).
@@ -116,6 +117,20 @@ struct FragmentParams {
     std::uint32_t clut;         // tex_format 5: the CLUT's first entry in the ring (0-21), CSA (22-26), 8-bit (27)
 };
 static_assert(16 + sizeof(FragmentParams) <= 128, "push constants: 128 bytes is all Vulkan promises");
+/* A batch's fixed fragment state, in a storage buffer (gs.frag's DrawRow, set 1 binding 2): FragmentParams but the
+   fields that change from pass to pass (afail, pabe, logic, keep - still push constants) and the CLUT (each
+   primitive's own). Each vertex names its row (PackedVertex::row): draws with different state can then share a
+   batch (agent L, 2026-11-22; zoe_work/bench/RUNS_DESIGN.md). */
+struct DrawRow {
+    std::uint32_t textured, tfx, tcc, atst, aref, fix_factor, fix, fge, fogcol, bilinear, wms, wmt, minu, maxu, minv,
+        maxv, tw, th, tex_format, texa, image_size, scale, blend_ops, pad;
+    static DrawRow Of(const FragmentParams& f) {
+        return {f.textured, f.tfx, f.tcc, f.atst, f.aref, f.fix_factor, f.fix, f.fge, f.fogcol, f.bilinear, f.wms,
+                f.wmt, f.minu, f.maxu, f.minv, f.maxv, f.tw, f.th, f.tex_format, f.texa, f.image_size, f.scale,
+                f.blend_ops, 0};
+    }
+};
+static_assert(sizeof(DrawRow) == 96, "gs.frag's DrawRow: 24 words");
 constexpr std::uint32_t kFragmentOffset = 16;
 
 /* gs.frag's kFeatures: what a draw with these parameters may use (each bit
@@ -940,7 +955,17 @@ private:
     VkDeviceMemory clut_ring_memory_ = VK_NULL_HANDLE;
     std::uint32_t* clut_ring_mapped_ = nullptr;
     std::uint64_t clut_ring_recording_ = ~0ull;
-    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for  // the recording the part in use is filled for
+    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for
+    /* The rows (DrawRow): a part for each command buffer of the GPU's, kRowsPerRecording rows each, filled as
+       batches are recorded (host-visible: no copy, no barrier); a row the same as the last placed is not placed
+       again (RowEntry). */
+    static constexpr std::uint32_t kRowsPerRecording = 32768;
+    VkBuffer rows_ = VK_NULL_HANDLE;
+    VkDeviceMemory rows_memory_ = VK_NULL_HANDLE;
+    DrawRow* rows_mapped_ = nullptr;
+    std::uint64_t rows_recording_ = ~0ull;
+    std::uint32_t rows_used_ = 0;
+    std::uint32_t RowEntry(const DrawRow& row);  // the recording the part in use is filled for
     std::uint32_t clut_ring_used_ = 0;
     std::unordered_map<std::uint64_t, std::uint32_t> clut_ring_placed_;     // version -> its first entry
     std::uint64_t clut_version_ = 0;            // ClutVersion's latest, and its entries
@@ -1287,11 +1312,12 @@ bool VulkanGsRenderer::Init(std::string* error) {
     dli.pBindings = bindings;
     vkCreateDescriptorSetLayout(g_.device, &dli, nullptr, &set_layout_);
     // The GPU's CLUT and the ring of the GS model's (ClutVersion).
-    VkDescriptorSetLayoutBinding clut_bindings[2] = {
+    VkDescriptorSetLayoutBinding clut_bindings[3] = {
         {0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
-        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};
+        {1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}};     // the rows (DrawRow)
     VkDescriptorSetLayoutCreateInfo cli{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    cli.bindingCount = 2;
+    cli.bindingCount = 3;
     cli.pBindings = clut_bindings;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
     VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 8192},
@@ -1380,16 +1406,23 @@ bool VulkanGsRenderer::InitMemory(std::string* error) {
             if (error) *error = "no memory for the CLUT ring";
             return false;
         }
-        const VkDescriptorBufferInfo infos[2] = {{clut_, 0, VK_WHOLE_SIZE}, {clut_ring_, 0, VK_WHOLE_SIZE}};
-        VkWriteDescriptorSet writes[2] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
-        for (std::uint32_t i = 0; i < 2; ++i) {
+        if (!Buffer(VkDeviceSize(VulkanGpu::kSlots) * kRowsPerRecording * sizeof(DrawRow),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &rows_, &rows_memory_, reinterpret_cast<void**>(&rows_mapped_))) {
+            if (error) *error = "no memory for the draw rows";
+            return false;
+        }
+        const VkDescriptorBufferInfo infos[3] = {{clut_, 0, VK_WHOLE_SIZE}, {clut_ring_, 0, VK_WHOLE_SIZE},
+                                                 {rows_, 0, VK_WHOLE_SIZE}};
+        VkWriteDescriptorSet writes[3] = {{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}, {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET},
+                                          {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET}};
+        for (std::uint32_t i = 0; i < 3; ++i) {
             writes[i].dstSet = clut_set_;
             writes[i].dstBinding = i;
             writes[i].descriptorCount = 1;
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
             writes[i].pBufferInfo = &infos[i];
         }
-        vkUpdateDescriptorSets(g_.device, 2, writes, 0, nullptr);
+        vkUpdateDescriptorSets(g_.device, 3, writes, 0, nullptr);
     }
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     ci.codeSize = sizeof spirv_swizzle_comp;
@@ -2387,18 +2420,19 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attributes[7] = {
+    VkVertexInputAttributeDescription attributes[8] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PackedVertex, s)},
         {3, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, z)},
         {4, 0, VK_FORMAT_R8_UNORM, offsetof(PackedVertex, fog)},
         {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)},
-        {6, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, clut)}};
+        {6, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, clut)},
+        {7, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, row)}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     input.vertexBindingDescriptionCount = 1;
     input.pVertexBindingDescriptions = &binding;
-    input.vertexAttributeDescriptionCount = 7;
+    input.vertexAttributeDescriptionCount = 8;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -2958,11 +2992,31 @@ void VulkanGsRenderer::ClutVersion(std::uint64_t version, const std::uint32_t* e
     std::memcpy(clut_version_entries_, entries, sizeof clut_version_entries_);
 }
 
+/* `row` in the row ring's part for the recording under way: its index (gs.frag's rows[]). The same as the last placed:
+   that one. The part full (never seen - a frame's batches are a few thousand): its last row shared, said. */
+std::uint32_t VulkanGsRenderer::RowEntry(const DrawRow& row) {
+    const std::uint32_t part = std::uint32_t(g_.slot()) * kRowsPerRecording;
+    if (g_.filling_id() != rows_recording_) {
+        rows_recording_ = g_.filling_id();
+        rows_used_ = 0;
+    }
+    if (rows_used_ && std::memcmp(&rows_mapped_[part + rows_used_ - 1], &row, sizeof row) == 0)
+        return part + rows_used_ - 1;
+    if (rows_used_ == kRowsPerRecording) {
+        static int complaints = 0;
+        if (complaints++ < 3) std::fprintf(stderr, "[ps2gpu] the row ring's part is full (%u rows)\n", kRowsPerRecording);
+        rows_mapped_[part + rows_used_ - 1] = row;
+        return part + rows_used_ - 1;
+    }
+    rows_mapped_[part + rows_used_] = row;
+    return part + rows_used_++;
+}
+
 /* The current CLUT (ClutVersion) in the ring's part for the recording under way, placed there if it is
    not yet: its first entry. Called while recording (the recording's id is the one its draws go into). */
 std::uint32_t VulkanGsRenderer::ClutRingEntry() {
-    if (g_.recording_id() != clut_ring_recording_) {
-        clut_ring_recording_ = g_.recording_id();
+    if (g_.filling_id() != clut_ring_recording_) {
+        clut_ring_recording_ = g_.filling_id();
         clut_ring_used_ = 0;
         clut_ring_placed_.clear();
     }
@@ -3398,7 +3452,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
     std::uint32_t clut = 0;
     if (state.textured && state.palette && clut_ring_mapped_) {
         clut = ClutRingEntry() | (state.csa & 31u) << 22 | (state.palette_eight ? 1u : 0u) << 27;
-        pending_clut_recording_ = g_.recording_id();
+        pending_clut_recording_ = g_.filling_id();
     }
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
@@ -3484,7 +3538,7 @@ void VulkanGsRenderer::Flush() {
     if (pending_clut_recording_ != ~0ull) {
         // The batch's CLUTs were placed in the ring part of the recording they were drawn in: recorded in another,
         // a later recording could write over them while it reads them. Never seen (a submit flushes first); said.
-        if (!pending_.empty() && pending_clut_recording_ != g_.recording_id()) {
+        if (!pending_.empty() && pending_clut_recording_ != g_.filling_id()) {
             static int told = 0;
             if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a batch's CLUTs were placed for an earlier recording\n");
         }
@@ -3668,6 +3722,11 @@ void VulkanGsRenderer::Flush() {
     if (state_.textured && t->scale.Upscaled()) params.blend_ops |= 2u << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
     const std::uint32_t count = std::uint32_t(pending_.size());
+    {   // The batch's row, named by each of its vertices (copied to the ring above: written there).
+        const std::uint32_t row = RowEntry(DrawRow::Of(params));
+        PackedVertex* written = static_cast<PackedVertex*>(vertex_data);
+        for (std::uint32_t i = 0; i < count; ++i) written[i].row = row;
+    }
     static int complaints = 0;
     if (!set && complaints < 5) {
         ++complaints;
@@ -4063,6 +4122,9 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (clut_ring_memory_) vkUnmapMemory(g_.device, clut_ring_memory_);
     if (clut_ring_) vkDestroyBuffer(g_.device, clut_ring_, nullptr);
     if (clut_ring_memory_) vkFreeMemory(g_.device, clut_ring_memory_, nullptr);
+    if (rows_memory_) vkUnmapMemory(g_.device, rows_memory_);
+    if (rows_) vkDestroyBuffer(g_.device, rows_, nullptr);
+    if (rows_memory_) vkFreeMemory(g_.device, rows_memory_, nullptr);
     if (layout_) vkDestroyPipelineLayout(g_.device, layout_, nullptr);
     if (vert_) vkDestroyShaderModule(g_.device, vert_, nullptr);
     if (frag_) vkDestroyShaderModule(g_.device, frag_, nullptr);

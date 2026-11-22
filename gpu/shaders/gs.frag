@@ -19,7 +19,11 @@ layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
 layout(location = 2) noperspective in float fog;
 layout(location = 3) flat in vec4 range;   // a sprite's S, T at its first and last pixels (gs.vert)
-layout(location = 4) flat in uint draw_clut;    // the primitive's CLUT in the ring (gs.vert; was p.clut)
+// The primitive's CLUT in the ring (x; was p.clut) and its row in `rows` (y), from gs.vert - one varying: a second
+// flat one moved the other varyings' interpolation on Turnip (sprites a pixel off in ZOE's city lights).
+layout(location = 4) flat in uvec2 draw_state;
+#define draw_clut draw_state.x
+#define draw_row draw_state.y
 
 layout(set = 0, binding = 0) uniform sampler2D texture_image;
 // The same image's texels as 32-bit words (R in bits 0-7, A in 24-31): the
@@ -33,7 +37,39 @@ layout(std430, set = 1, binding = 0) readonly buffer Clut { uint clut[256]; };
 // palettized texture decoded as indices (tex_format 5) looks its texels up in the draw's (p.clut).
 layout(std430, set = 1, binding = 1) readonly buffer ClutRing { uint ring[]; };
 
-layout(push_constant) uniform Params {
+// The draw's fragment state: the batch's fixed part from its row (DrawRow, a storage buffer - each primitive names
+// its own, so draws with different state can share a batch), what changes from pass to pass (afail, pabe, logic,
+// keep) from the push constants; put together once (main) and read as p everywhere (agent L, 2026-11-22).
+struct Params {
+    uint textured;
+    uint tfx;           // 0 MODULATE, 1 DECAL, 2 HIGHLIGHT, 3 HIGHLIGHT2
+    uint tcc;           // the texel's alpha counts
+    uint atst;          // 0 NEVER, 1 ALWAYS, 2 LESS, 3 LEQUAL, 4 EQUAL, 5 GEQUAL, 6 GREATER, 7 NOTEQUAL
+    uint aref;
+    uint fix_factor;    // blend with FIX rather than the source alpha
+    uint fix;
+    uint afail;         // which pixels this pass draws: 0 passing, 1 failing, 2 all
+    uint fge;           // fog
+    uint fogcol;        // FOGCOL, R G B in bytes 0-2
+    uint pabe;          // which pixels this pass draws: 0 all, 1 As >= 0x80, 2 As < 0x80
+    uint bilinear;      // bit 0: the four texels around, else the nearest; bits 1 and on: Mip
+    uint wms, wmt;      // CLAMP: 0 REPEAT, 1 CLAMP, 2 REGION_CLAMP, 3 REGION_REPEAT
+    uint minu, maxu, minv, maxv;
+    uint tw, th;        // TEX0's size (0: the image's own)
+    uint tex_format;    // a target read as 0 32-bit, 1 24-bit, 2 16-bit texels, 4 PSMT8H through the CLUT
+    uint texa;          // TEXA: TA0 in bits 0-7, TA1 8-15, AEM 16
+    uint image_size;    // the bound image's size in its pixels, width in bits 0-15, height 16-31 - not
+                        // asked of the image (textureSize: a sampler's message per pixel on some GPUs)
+    uint logic;         // FBMSK masking part of a channel: 1 the AND pass, 2 the OR pass, 0 neither
+    uint keep;          // ...the bits FBMSK keeps, RGBA bytes as the target holds them
+    uint scale;         // a target drawn larger (the internal resolution): its pixels to a GS texel, in
+                        // 1/1024ths (scale.glsl), columns in bits 0-15, rows 16-31
+    uint blend_ops;     // bits 0-7, SHADER_BLEND: ALPHA's A, B, C, D, two bits each; 8-15: Snap (2: on);
+                        // 16: a 16-bit target (five bits a channel stored)
+    uint clut;          // tex_format 5: the CLUT's first entry in `ring` (bits 0-21), CSA (22-26), 8-bit indices (27)
+};
+Params p;
+layout(push_constant) uniform PushParams {
     layout(offset = 16) uint textured;
     uint tfx;           // 0 MODULATE, 1 DECAL, 2 HIGHLIGHT, 3 HIGHLIGHT2
     uint tcc;           // the texel's alpha counts
@@ -60,7 +96,22 @@ layout(push_constant) uniform Params {
     uint blend_ops;     // bits 0-7, SHADER_BLEND: ALPHA's A, B, C, D, two bits each; 8-15: Snap (2: on);
                         // 16: a 16-bit target (five bits a channel stored)
     uint clut;          // tex_format 5: the CLUT's first entry in `ring` (bits 0-21), CSA (22-26), 8-bit indices (27)
-} p;
+} pc;
+// The rows: the fields of Params but the per-pass ones, in their order (gs_renderer.cpp's DrawRow).
+struct DrawRow {
+    uint textured, tfx, tcc, atst, aref, fix_factor, fix, fge, fogcol, bilinear, wms, wmt, minu, maxu, minv, maxv,
+         tw, th, tex_format, texa, image_size, scale, blend_ops, pad;
+};
+layout(std430, set = 1, binding = 2) readonly buffer Rows { DrawRow rows[]; };
+void LoadParams() {
+    const DrawRow r = rows[draw_row];
+    p.textured = r.textured; p.tfx = r.tfx; p.tcc = r.tcc; p.atst = r.atst; p.aref = r.aref;
+    p.fix_factor = r.fix_factor; p.fix = r.fix; p.fge = r.fge; p.fogcol = r.fogcol; p.bilinear = r.bilinear;
+    p.wms = r.wms; p.wmt = r.wmt; p.minu = r.minu; p.maxu = r.maxu; p.minv = r.minv; p.maxv = r.maxv;
+    p.tw = r.tw; p.th = r.th; p.tex_format = r.tex_format; p.texa = r.texa; p.image_size = r.image_size;
+    p.scale = r.scale; p.blend_ops = r.blend_ops;
+    p.afail = pc.afail; p.pabe = pc.pabe; p.logic = pc.logic; p.keep = pc.keep; p.clut = draw_clut;
+}
 
 // What a draw may use, from its parameters (gs_renderer.cpp's Features): a
 // pipeline made for a kind of draw leaves out the rest - the same results,
@@ -327,6 +378,7 @@ layout(location = 0, index = 1) out vec4 factor;
 #endif
 
 void main() {
+    LoadParams();
     vec4 v = round(shade * 255.0);
     vec4 c = v;
     if (Has(kTextured) && p.textured != 0u) {

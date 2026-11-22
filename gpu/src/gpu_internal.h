@@ -157,6 +157,11 @@ public:
     }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
+    /* The recording the next recorded work goes into: the open one, or the one the next Record begins - for what
+       is placed for it ahead (the GS renderer's CLUT and row rings, filled as primitives arrive): recording_id()
+       is the next one's only once it has begun (agent L, 2026-11-22: a batch's row placed before the frame's first
+       recording began was written over by the recording's own rows). */
+    std::uint64_t filling_id() const { return open_ ? recordings_ : recordings_ + 1; }
     static constexpr int kSlots = 3;
     /* The command buffer recording goes into (or will). */
     int slot() const { return current_; }

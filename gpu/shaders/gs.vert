@@ -14,6 +14,8 @@ layout(location = 5) in vec4 range;
 // A palettized texture's CLUT: its first entry in the ring, CSA, 8-bit (gs.frag's draw_clut) - each primitive its
 // own, so draws with different CLUTs share a batch (agent L, 2026-11-22: ZOE ended ~70 % of its batches on a new CLUT).
 layout(location = 6) in uint clut;
+// The batch's row of fixed fragment state (gs.frag's DrawRow): each primitive its own.
+layout(location = 7) in uint row;
 
 layout(push_constant) uniform Target {
     vec2 size;          // the target, in pixels
@@ -25,7 +27,7 @@ layout(location = 0) out vec4 shade;
 layout(location = 1) noperspective out vec3 coordinate;
 layout(location = 2) noperspective out float fog_out;
 layout(location = 3) flat out vec4 range_out;
-layout(location = 4) flat out uint clut_out;
+layout(location = 4) flat out uvec2 state_out;     // the CLUT, the row (gs.frag's draw_state)
 
 void main() {
     vec2 ndc = (position + 0.5) / target.size * 2.0 - 1.0;
@@ -34,5 +36,5 @@ void main() {
     coordinate = stq;
     fog_out = fog;
     range_out = range;
-    clut_out = clut;
+    state_out = uvec2(clut, row);
 }
