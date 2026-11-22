@@ -61,8 +61,13 @@ struct PackedVertex {
     std::uint32_t z;
     std::uint8_t fog, pad[3];
     float range[4];             // a sprite's S, T at its first and last pixels (gs.vert)
-    float pad2[4];
+    std::uint32_t clut;         // a palettized texture's CLUT in the ring, CSA, 8-bit (gs.vert's; DrawTriangles)
+    float pad2[3];
 };
+/* Each primitive carries its CLUT (PackedVertex::clut), so a new CLUT - or CSA - ends no batch (agent L, 2026-11-22:
+   ~70 % of ZOE's batches in a fight ended on a new CLUT, the Odin 2's GPU busy with ~4,500 draws a frame).
+   PS2HOST_GPU_CLUT_FLUSH=1: a batch per CLUT, as before (to compare). */
+const bool g_clut_per_primitive = std::getenv("PS2HOST_GPU_CLUT_FLUSH") == nullptr;
 // The vertex ring hands out 256-byte aligned runs, a batch's first vertex
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
@@ -508,7 +513,8 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
            x.texture_target == y.texture_target && x.tex_fbp == y.tex_fbp && x.tex_fbw == y.tex_fbw &&
            x.tex_target_psm == y.tex_target_psm && x.tex_format == y.tex_format && x.ta0 == y.ta0 &&
            x.ta1 == y.ta1 && x.aem == y.aem && x.palette == y.palette &&
-           (!x.palette || (x.csa == y.csa && x.palette_eight == y.palette_eight && x.clut_version == y.clut_version)))) &&
+           (!x.palette || g_clut_per_primitive ||
+            (x.csa == y.csa && x.palette_eight == y.palette_eight && x.clut_version == y.clut_version)))) &&
            x.alpha_test == y.alpha_test && (!x.alpha_test || (x.atst == y.atst && x.aref == y.aref && x.afail == y.afail)) &&
            // PipelineKey's inputs compared rather than two keys built a
            // primitive: the format, mask, width and sprite kind are compared
@@ -933,7 +939,8 @@ private:
     VkBuffer clut_ring_ = VK_NULL_HANDLE;
     VkDeviceMemory clut_ring_memory_ = VK_NULL_HANDLE;
     std::uint32_t* clut_ring_mapped_ = nullptr;
-    std::uint64_t clut_ring_recording_ = ~0ull;  // the recording the part in use is filled for
+    std::uint64_t clut_ring_recording_ = ~0ull;
+    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for  // the recording the part in use is filled for
     std::uint32_t clut_ring_used_ = 0;
     std::unordered_map<std::uint64_t, std::uint32_t> clut_ring_placed_;     // version -> its first entry
     std::uint64_t clut_version_ = 0;            // ClutVersion's latest, and its entries
@@ -2380,17 +2387,18 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attributes[6] = {
+    VkVertexInputAttributeDescription attributes[7] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PackedVertex, s)},
         {3, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, z)},
         {4, 0, VK_FORMAT_R8_UNORM, offsetof(PackedVertex, fog)},
-        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)}};
+        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)},
+        {6, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, clut)}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     input.vertexBindingDescriptionCount = 1;
     input.pVertexBindingDescriptions = &binding;
-    input.vertexAttributeDescriptionCount = 6;
+    input.vertexAttributeDescriptionCount = 7;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -2942,8 +2950,10 @@ void VulkanGsRenderer::ClutRows(const std::uint32_t* clut, std::uint32_t rows) {
 void VulkanGsRenderer::ClutVersion(std::uint64_t version, const std::uint32_t* entries) {
     if (version == clut_version_) return;
     static const bool what_if = std::getenv("PS2HOST_GPU_WHATIF_MERGE") != nullptr;    // (SameBatch's)
-    if (!pending_.empty() && !what_if) ++g_clut_flushes;
-    if (!what_if) Flush();          // what is pending draws with the CLUT before
+    if (!g_clut_per_primitive) {    // (each primitive's own otherwise: PackedVertex::clut)
+        if (!pending_.empty() && !what_if) ++g_clut_flushes;
+        if (!what_if) Flush();      // what is pending draws with the CLUT before
+    }
     clut_version_ = version;
     std::memcpy(clut_version_entries_, entries, sizeof clut_version_entries_);
 }
@@ -3384,6 +3394,12 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    // The primitive's CLUT in the ring, placed for this recording now (Flush checks the batch is recorded in it).
+    std::uint32_t clut = 0;
+    if (state.textured && state.palette && clut_ring_mapped_) {
+        clut = ClutRingEntry() | (state.csa & 31u) << 22 | (state.palette_eight ? 1u : 0u) << 27;
+        pending_clut_recording_ = g_.recording_id();
+    }
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
         for (int k = 0; k < 3; ++k, ++out) {
@@ -3402,6 +3418,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             out->z = p.z;
             out->fog = p.fog;
             for (int n = 0; n < 4; ++n) out->range[n] = range[n];
+            out->clut = clut;
         }
     }
 }
@@ -3464,6 +3481,15 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
 
 void VulkanGsRenderer::Flush() {
     RecordShuffle();
+    if (pending_clut_recording_ != ~0ull) {
+        // The batch's CLUTs were placed in the ring part of the recording they were drawn in: recorded in another,
+        // a later recording could write over them while it reads them. Never seen (a submit flushes first); said.
+        if (!pending_.empty() && pending_clut_recording_ != g_.recording_id()) {
+            static int told = 0;
+            if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a batch's CLUTs were placed for an earlier recording\n");
+        }
+        pending_clut_recording_ = ~0ull;
+    }
     drawn_any_ = false;
     batch_tris_.clear();
     sprites_.clear();

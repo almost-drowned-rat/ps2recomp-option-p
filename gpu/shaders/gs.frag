@@ -19,6 +19,7 @@ layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
 layout(location = 2) noperspective in float fog;
 layout(location = 3) flat in vec4 range;   // a sprite's S, T at its first and last pixels (gs.vert)
+layout(location = 4) flat in uint draw_clut;    // the primitive's CLUT in the ring (gs.vert; was p.clut)
 
 layout(set = 0, binding = 0) uniform sampler2D texture_image;
 // The same image's texels as 32-bit words (R in bits 0-7, A in 24-31): the
@@ -113,8 +114,8 @@ vec4 Expand(vec4 t) {
     }
     if (p.tex_format == 5u) {                       // indices: the draw's CLUT, a 4-bit one at CSA's row
         const uint i = uint(t.a) & 255u;
-        const uint at = ((p.clut >> 27) & 1u) != 0u ? i : (((p.clut >> 22) & 31u) * 16u + (i & 15u)) & 255u;
-        const uint c = ring[(p.clut & 0x3FFFFFu) + at];
+        const uint at = ((draw_clut >> 27) & 1u) != 0u ? i : (((draw_clut >> 22) & 31u) * 16u + (i & 15u)) & 255u;
+        const uint c = ring[(draw_clut & 0x3FFFFFu) + at];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
     }
     bool black = t.r + t.g + t.b == 0.0;
