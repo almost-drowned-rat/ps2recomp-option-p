@@ -715,6 +715,16 @@ void SetVuFastDefault(bool on);
    port defaults it off. */
 void SetFramePacingDefault(bool on);
 bool FramePacingDefault();
+/* FRAME PACING's four (the maintainer 2026-11-22; the "frame_pacing" setting, in the settings file only): where
+   the guest's vertical blank comes from - TIMER, the 59.94 Hz timer, or DISPLAY, every n-th blank of the display
+   itself (a 60 / 120 / 180 / 240 Hz one; a picture then stays exactly n refreshes) - and how the pictures go out -
+   PACED, evenly spaced (FrameDue), or IMMEDIATE, each as soon as it is done: timer+paced, timer+immediate,
+   display+paced, display+immediate. Unset or "auto": the best the device has - DISPLAY where the display's blank
+   can be had and its rate fits, TIMER otherwise, paced as the port's default says (SetFramePacingDefault). The
+   old values: on = timer+paced, off = timer+immediate (option-p), timer / display = that source, paced (option-c). */
+std::string FramePacingSetting();           // one of the four, or "auto"
+bool FramePacingDisplaySource();            // DISPLAY wanted (auto: where it can be had)
+bool FramePacingPaced();
 /* SHADER COMPILE (the "shader_compile" setting: off / skip / wait / hybrid, hybrid unless chosen) handed to the
    renderer (ps2gpu::SetShaderCompileMode), at the start and when RECOMP OPTIONS changes it. */
 void ApplyShaderCompileSetting();

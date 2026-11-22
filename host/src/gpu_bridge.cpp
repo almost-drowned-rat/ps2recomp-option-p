@@ -3256,7 +3256,7 @@ void PresentWaiting() {
     if (!g_present_waits) return;
     g_present_waits = false;
     if (ps2gpu::Display* display = WindowDisplay()) {
-        const bool pace = !VirtualClock() && SettingOn("frame_pacing", FramePacingDefault());    // (PC SETTINGS)
+        const bool pace = !VirtualClock() && FramePacingPaced();    // (FRAME PACING: PACED or IMMEDIATE)
         PresentGpuPicture(*display, pace ? FrameDue(g_present_frame) : 0);
     }
 }

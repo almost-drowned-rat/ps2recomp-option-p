@@ -528,6 +528,25 @@ bool g_frame_pacing_default = true;
 void SetFramePacingDefault(bool on) { g_frame_pacing_default = on; }
 bool FramePacingDefault() { return g_frame_pacing_default; }
 
+std::string FramePacingSetting() {
+    const std::string v = Setting("frame_pacing", "auto");
+    if (v == "timer+paced" || v == "timer+immediate" || v == "display+paced" || v == "display+immediate") return v;
+    if (v == "on" || v == "timer") return "timer+paced";
+    if (v == "off") return "timer+immediate";
+    if (v == "display") return "display+paced";
+    return "auto";
+}
+
+bool FramePacingDisplaySource() {
+    const std::string v = FramePacingSetting();
+    return v == "auto" || v.rfind("display", 0) == 0;
+}
+
+bool FramePacingPaced() {
+    const std::string v = FramePacingSetting();
+    return v == "auto" ? g_frame_pacing_default : v.size() > 6 && v.compare(v.size() - 6, 6, "+paced") == 0;
+}
+
 Stats& RunStats() {
     static Stats stats;
     return stats;

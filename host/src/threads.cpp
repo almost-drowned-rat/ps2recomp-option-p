@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdlib>
 #include <mutex>
 #include <cstdio>
@@ -442,9 +443,11 @@ std::thread& TimerThread() {
     static std::thread thread;
     return thread;
 }
+std::thread& DisplayThread();
 void StopTimer() {
     g_timer_stop = true;
     if (TimerThread().joinable()) TimerThread().join();
+    if (DisplayThread().joinable()) DisplayThread().join();    // (its wait ends within a refresh, 100 ms at most)
 }
 
 // Takes a due vertical blank, leaving the next one due at once if one is owed.
@@ -522,11 +525,112 @@ bool SpareCores() {
     return spare.load(std::memory_order_relaxed);
 }
 
+// FRAME PACING's DISPLAY source (FramePacingDisplaySource): the display's own blanks, watched by a thread of their
+// own (ps2platform::WaitDisplayVblank) - the last one's time, its count, the refresh period measured. The timer
+// below then puts each guest blank on every n-th of them (n = the display's rate / 59.94: 1 at 60 Hz, 2 at 120 Hz),
+// predicted from the last one seen; the 59.94 Hz timer whenever they do not come (the app in the background) or the
+// rate fits no n (a 75 or 144 Hz display).
+struct DisplayClock {
+    std::mutex mutex;
+    u64 last_ns = 0;        // the last blank seen (steady clock)
+    u64 seq = 0;            // blanks counted (missed ones too, by their time)
+    double period_ns = 0;   // the refresh period, measured
+    int samples = 0;        // blanks in a row at that period
+};
+DisplayClock g_display_clock;
+std::thread& DisplayThread() {
+    static std::thread thread;
+    return thread;
+}
+
+void WatchDisplayBlanks() {
+    if (!ps2platform::OpenDisplayVblank()) {
+        std::fprintf(stderr, "[pacing] no display vblank here - the 59.94 Hz timer\n");
+        return;
+    }
+    timeline::NameThread("display blanks");
+    while (!StopRequested() && !g_timer_stop) {
+        u64 t = 0;
+        if (!ps2platform::WaitDisplayVblank(&t)) {
+            std::lock_guard<std::mutex> lock(g_display_clock.mutex);
+            g_display_clock.samples = 0;
+            continue;
+        }
+        std::lock_guard<std::mutex> lock(g_display_clock.mutex);
+        DisplayClock& d = g_display_clock;
+        if (d.last_ns && t > d.last_ns) {
+            const double dt = double(t - d.last_ns);
+            if (d.period_ns <= 0) {
+                if (dt > 2.5e6 && dt < 45e6) d.period_ns = dt;
+            } else {
+                const long long k = std::max(1LL, std::llround(dt / d.period_ns));
+                const double one = dt / double(k);
+                if (std::abs(one - d.period_ns) < d.period_ns * 0.25) {
+                    d.period_ns += (one - d.period_ns) / 32.0;
+                    ++d.samples;
+                } else {
+                    d.period_ns = dt;       // another rate: measured again
+                    d.samples = 0;
+                }
+                d.seq += u64(k - 1);
+            }
+        }
+        ++d.seq;
+        d.last_ns = t;
+    }
+}
+
+// The time of the guest blank after `prev_ns` (the one just raised) on the display's: true with it in *next_ns,
+// false when the timer should go on (no display blanks, or a rate no whole n fits).
+bool DisplayBlankAfter(u64 prev_ns, u64* next_ns) {
+    static u64 target = 0;          // the display blank the last guest blank was put on
+    static int locked_n = -1;       // for the log: the n in use, 0 the timer
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    int n = 0;
+    u64 last = 0, seq = 0;
+    double period = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_display_clock.mutex);
+        const DisplayClock& d = g_display_clock;
+        if (d.samples >= 60 && d.period_ns > 0 && now < d.last_ns + u64(3 * d.period_ns)) {
+            const double hz = 1e9 / d.period_ns;
+            const long long k = std::llround(hz / 59.94);
+            if (k >= 1 && k <= 4 && std::abs(hz / double(k) - 59.94) < 59.94 * 0.01) n = int(k);
+        }
+        last = d.last_ns;
+        seq = d.seq;
+        period = d.period_ns;
+    }
+    if (n != locked_n) {
+        if (n) std::fprintf(stderr, "[pacing] the guest's blank on the display's: every %d of %.2f Hz\n", n, 1e9 / period);
+        else if (locked_n > 0) std::fprintf(stderr, "[pacing] the display's blanks stopped or changed - the 59.94 Hz timer\n");
+        if (locked_n != n) target = 0;
+        locked_n = n;
+    }
+    if (!n) return false;
+    // The display blank nearest the one just raised, unless we follow them already; then n on.
+    const auto at = [&](u64 s) { return double(last) + (double(s) - double(seq)) * period; };
+    if (!target || std::abs(at(target) - double(prev_ns)) > period / 2)
+        target = u64(std::max(1.0, double(seq) + std::round((double(prev_ns) - double(last)) / period)));
+    target += u64(n);
+    // Behind (a stall): from the next display blank on.
+    if (at(target) < double(now) - period) target = seq + u64(std::max(1.0, std::ceil((double(now) - double(last)) / period)));
+    *next_ns = u64(std::max(0.0, at(target)));
+    return true;
+}
+
 void VblankTimer() {
     using clock = std::chrono::steady_clock;
     const auto period = std::chrono::microseconds(16683);      // NTSC, 59.94 Hz
     const auto margin = std::chrono::microseconds(700);    // the precise sleep's (SleepUntil), then a spin
     auto next = clock::now() + period;
+    const bool display_source = FramePacingDisplaySource();
+    std::fprintf(stderr, "[pacing] frame pacing %s (%s source, %s pictures)\n", FramePacingSetting().c_str(),
+                 display_source ? "display" : "timer", FramePacingPaced() ? "paced" : "immediate");
+    if (display_source && !DisplayThread().joinable()) {
+        DisplayThread() = std::thread(WatchDisplayBlanks);      // (joined by StopTimer)
+    }
     while (!StopRequested() && !g_timer_stop) {
         // Sleep to the next vertical blank, or to an EE timer's interrupt if that
         // comes first.
@@ -586,8 +690,15 @@ void VblankTimer() {
                                    std::memory_order_relaxed);
             unsigned factor = g_fast_forward.load(std::memory_order_relaxed);
             if (S().frames < g_fast_until.load(std::memory_order_relaxed)) factor = std::max(factor, g_fast_until_factor.load(std::memory_order_relaxed));
+            const auto raised = next;
             next += factor > 1 ? period / factor : period;
             if (clock::now() >= next + period) next = clock::now() + period;   // a stall: start again from now
+            // FRAME PACING DISPLAY: on the display's own blank instead (not while fast-forwarding).
+            u64 display_ns = 0;
+            if (display_source && factor <= 1 &&
+                DisplayBlankAfter(u64(std::chrono::duration_cast<std::chrono::nanoseconds>(raised.time_since_epoch()).count()),
+                                  &display_ns))
+                next = clock::time_point(std::chrono::duration_cast<clock::duration>(std::chrono::nanoseconds(display_ns)));
             if (g_hitch_blanks && !s.vblank_due.load())
                 g_blank_due_ns.store(ClockNs(), std::memory_order_relaxed);
             if (s.vblank_due.exchange(true)) {

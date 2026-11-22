@@ -122,7 +122,10 @@ debugging; the player's settings are the port's RECOMP OPTIONS page in the
 game's own menu, no controller combination opens the panel - over
 any game (`host/src/pc_menu.cpp`): resolution, aspect ratio, fullscreen,
 v-sync, the overlay's figures and the texture pack (frame pacing only in
-the file: `frame_pacing`, unset = automatic), applied at once and saved in
+the file: `frame_pacing` = `timer+paced`, `timer+immediate`, `display+paced`,
+`display+immediate` - the guest's blank from the 59.94 Hz timer or every n-th
+blank of a 60/120/180/240 Hz display, pictures evenly paced or at once; unset
+or `auto` = the display's blank where it can be had, the port's pacing default), applied at once and saved in
 `pc_settings.ini`; the game gets no input while it is open. A port can also
 put its settings in the game's own menus (Burnout 3's PC SETTINGS).
 

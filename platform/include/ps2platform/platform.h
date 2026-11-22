@@ -128,6 +128,15 @@ bool DrawTextPanel(const std::vector<std::string>& lines, int line_px, const std
                    std::uint32_t panel, int max_width, int max_height, std::vector<std::uint32_t>* pixels, int* width,
                    int* height);
 
+// ---- The display's vertical blank (FRAME PACING's DISPLAY source, the maintainer 2026-11-22; option-c's
+// host_vblank as the model): the guest's blank on the display's own instead of a 59.94 Hz timer, so a picture
+// stays exactly n refreshes on the screen. Linux: DRM's wait for the vblank on the first active CRTC; Android: the
+// Choreographer's frame callbacks; Windows: D3DKMTWaitForVerticalBlankEvent (gdi32) on the primary display.
+// Open once, then one thread waits; *steady_ns = the blank's time on std::chrono::steady_clock. False: none on this
+// system or display (or it stopped coming) - the caller keeps its timer.
+bool OpenDisplayVblank();
+bool WaitDisplayVblank(std::uint64_t* steady_ns);
+
 // ---- The fallback window (no Vulkan device to be had): the picture drawn by the system itself.
 // Windows: a GDI window. Elsewhere none - false, and the port runs without a window (SDL3 and Vulkan are the way).
 bool OpenFallbackWindow(const wchar_t* title, int width, int height);

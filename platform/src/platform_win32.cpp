@@ -12,6 +12,7 @@
 #include <intrin.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -520,5 +521,59 @@ bool ScanCodeName(std::uint16_t scan_code, std::string* name) {
 }
 
 bool SystemKeyDown(int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; }
+
+// ---- The display's vertical blank (platform.h): D3DKMTWaitForVerticalBlankEvent on the primary display's VidPn
+// source, gdi32's kernel thunks loaded at run time (option-c's host_vblank.c the model; d3dkmthk.h is the WDK's,
+// its structs here). The wait gives no time: the steady clock's when it returns.
+namespace {
+using KmtHandle = UINT;
+struct KmtOpenAdapterFromHdc {
+    HDC hDc;
+    KmtHandle hAdapter;
+    LUID AdapterLuid;
+    UINT VidPnSourceId;
+};
+struct KmtWaitForVerticalBlankEvent {
+    KmtHandle hAdapter;
+    KmtHandle hDevice;
+    UINT VidPnSourceId;
+};
+using PfnKmtOpen = LONG(APIENTRY*)(KmtOpenAdapterFromHdc*);
+using PfnKmtWait = LONG(APIENTRY*)(const KmtWaitForVerticalBlankEvent*);
+PfnKmtWait g_kmt_wait = nullptr;
+KmtWaitForVerticalBlankEvent g_kmt_vb{};
+bool g_kmt_open = false;
+}  // namespace
+
+bool OpenDisplayVblank() {
+    if (g_kmt_open) return true;
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi) gdi = LoadLibraryW(L"gdi32.dll");
+    if (!gdi) return false;
+    const auto open_fn = reinterpret_cast<PfnKmtOpen>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTOpenAdapterFromHdc")));
+    g_kmt_wait = reinterpret_cast<PfnKmtWait>(reinterpret_cast<void*>(GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent")));
+    if (!open_fn || !g_kmt_wait) return false;
+    const HMONITOR monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof info;
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return false;
+    KmtOpenAdapterFromHdc open{};
+    open.hDc = CreateDCW(nullptr, info.szDevice, nullptr, nullptr);
+    if (!open.hDc) return false;
+    const LONG status = open_fn(&open);
+    DeleteDC(open.hDc);
+    if (status != 0) return false;
+    g_kmt_vb.hAdapter = open.hAdapter;
+    g_kmt_vb.VidPnSourceId = open.VidPnSourceId;
+    g_kmt_open = true;
+    return true;
+}
+
+bool WaitDisplayVblank(std::uint64_t* steady_ns) {
+    if (!g_kmt_open || g_kmt_wait(&g_kmt_vb) != 0) return false;
+    *steady_ns = std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now().time_since_epoch()).count());
+    return true;
+}
 
 }  // namespace ps2platform
