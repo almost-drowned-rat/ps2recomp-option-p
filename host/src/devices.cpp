@@ -781,6 +781,8 @@ void CountSpeed() {
     const double speed = 100.0 * double(second_frames) / ((now - second_from) / 1e9) / kGuestRate;
     second_from = now;
     second_frames = 0;
+    // Each second too (the maintainer 2026-11-22: "nimm jede Sekunde auf").
+    if (g_speed_log || SettingOverlayShows("speed")) std::fprintf(stderr, "[speed] second: %.1f %%\n", speed);
     sum += speed;
     slowest = std::min(slowest, speed);
     if (++seconds < 5) return;

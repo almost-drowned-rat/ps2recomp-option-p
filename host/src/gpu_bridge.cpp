@@ -3144,7 +3144,10 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     // The pipeline cache beside the PC settings - a player's only: a scripted
     // run's settings are beside its memory card, in %TEMP% (what every
     // game's runs there would share), and it makes every pipeline at once.
-    if (!SettingsPath().empty() && !VirtualClock())
+    // (PS2HOST_PLAYER_PIPELINES=1: a scripted run with the player's cache too - a benchmark measuring what a
+    // player meets, not every pipeline made cold in the middle of a fight; 2026-11-22.)
+    static const bool player_pipelines = std::getenv("PS2HOST_PLAYER_PIPELINES") != nullptr;
+    if (!SettingsPath().empty() && (!VirtualClock() || player_pipelines))
         ps2gpu::SetPipelineCacheDir(std::filesystem::path(SettingsPath()).parent_path().u8string());
     ApplyShaderCompileSetting();        // SHADER COMPILE (RECOMP OPTIONS; a scripted run makes all at once anyway)
     ApplyAnisotropySetting();           // ANISOTROPIC FILTER (off unless chosen)
