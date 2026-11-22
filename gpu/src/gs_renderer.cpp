@@ -2961,8 +2961,8 @@ void VulkanGsRenderer::ClutVersion(std::uint64_t version, const std::uint32_t* e
 /* The current CLUT (ClutVersion) in the ring's part for the recording under way, placed there if it is
    not yet: its first entry. Called while recording (the recording's id is the one its draws go into). */
 std::uint32_t VulkanGsRenderer::ClutRingEntry() {
-    if (g_.recording_id() != clut_ring_recording_) {
-        clut_ring_recording_ = g_.recording_id();
+    if (g_.filling_id() != clut_ring_recording_) {
+        clut_ring_recording_ = g_.filling_id();
         clut_ring_used_ = 0;
         clut_ring_placed_.clear();
     }
@@ -3398,7 +3398,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
     std::uint32_t clut = 0;
     if (state.textured && state.palette && clut_ring_mapped_) {
         clut = ClutRingEntry() | (state.csa & 31u) << 22 | (state.palette_eight ? 1u : 0u) << 27;
-        pending_clut_recording_ = g_.recording_id();
+        pending_clut_recording_ = g_.filling_id();
     }
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
@@ -3484,7 +3484,7 @@ void VulkanGsRenderer::Flush() {
     if (pending_clut_recording_ != ~0ull) {
         // The batch's CLUTs were placed in the ring part of the recording they were drawn in: recorded in another,
         // a later recording could write over them while it reads them. Never seen (a submit flushes first); said.
-        if (!pending_.empty() && pending_clut_recording_ != g_.recording_id()) {
+        if (!pending_.empty() && pending_clut_recording_ != g_.filling_id()) {
             static int told = 0;
             if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a batch's CLUTs were placed for an earlier recording\n");
         }
