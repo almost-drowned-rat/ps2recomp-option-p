@@ -1370,7 +1370,9 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th,
     // looked up in the draw (GsDrawState::palette) - a new CLUT (ZOE's explosions animate theirs, ~800 a
     // picture) is no new decode. Keyed without the CLUT, and without CSA (the indices are the same).
     // PS2HOST_GPU_BAKED_CLUT=1: the CLUT decoded into the texels, as tier E does.
-    static const bool baked = TierESwitch("PS2HOST_GPU_BAKED_CLUT");
+    // (Honoured in every build since 2026-11-22: the CLUT baked into RGBA texels, sampled without a CLUT lookup a
+    // texel - the Odin 2's pixel cost.)
+    static const bool baked = std::getenv("PS2HOST_GPU_BAKED_CLUT") != nullptr;
     // PS2HOST_GPU_PALETTE_RANGE=<first>-<last>: the palette path only for primitives in that range (bisecting).
     static const std::pair<u64, u64> palette_range = [] {
         unsigned long long lo = 0, hi = ~0ull;
