@@ -45,6 +45,38 @@ inline std::uint64_t g_submits = 0;
    submissions, presents and the device's wait-idle from one thread at a
    time, and the display presents from a thread of its own. */
 inline std::mutex g_queue_lock;
+/* VK_EXT_extended_dynamic_state3's colour blending - enable, equation, write mask - as dynamic state: the GS
+   renderer's pipelines then differ by shader only, not by each draw's blending (agent L, 2026-11-22: ZOE's boss
+   fight bound a pipeline every third draw, the alpha-blended and opaque passes taking turns; a bind on Turnip
+   copies its program state, ~20 % of the renderer's thread). Taken where the device offers all three, unless
+   PS2HOST_GPU_DYNAMIC_BLEND=0; set by whoever makes the device (the window's, or VulkanGpu's own). */
+inline std::atomic<bool> g_dynamic_blend{false};
+/* The device's offer: true with `f3` filled in (all three on) and the extension's name added to `extensions` - the
+   caller chains `f3` into its features and enables them, then sets g_dynamic_blend. */
+inline bool OfferDynamicBlend(VkPhysicalDevice gpu, VkPhysicalDeviceExtendedDynamicState3FeaturesEXT* f3,
+                              std::vector<const char*>* extensions) {
+    if (const char* e = std::getenv("PS2HOST_GPU_DYNAMIC_BLEND"); e && e[0] == '0') return false;
+    std::uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> offered(count);
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, offered.data());
+    bool has = false;
+    for (const auto& e : offered) has = has || std::string(e.extensionName) == VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME;
+    if (!has) return false;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &query;
+    vkGetPhysicalDeviceFeatures2(gpu, &f2);
+    if (!query.extendedDynamicState3ColorBlendEnable || !query.extendedDynamicState3ColorBlendEquation ||
+        !query.extendedDynamicState3ColorWriteMask)
+        return false;
+    *f3 = VkPhysicalDeviceExtendedDynamicState3FeaturesEXT{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    f3->extendedDynamicState3ColorBlendEnable = VK_TRUE;
+    f3->extendedDynamicState3ColorBlendEquation = VK_TRUE;
+    f3->extendedDynamicState3ColorWriteMask = VK_TRUE;
+    extensions->push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    return true;
+}
 inline double g_wait_seconds = 0;
 inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 /* The GPU's time on the command buffers handed over, in all (timestamps at

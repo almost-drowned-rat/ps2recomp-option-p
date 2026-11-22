@@ -646,6 +646,14 @@ private:
     std::vector<VkDeviceMemory> image_blocks_;
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
+    /* g_dynamic_blend: blending and the write mask (a key's bits 0-12) set per draw, not made into the pipeline -
+       a key's pipeline without them (Pipeline); the functions from the device. */
+    static constexpr std::uint32_t kDynamicBlendBits = (1u << 13) - 1;
+    bool dynamic_blend_ = false;
+    PFN_vkCmdSetColorBlendEnableEXT set_blend_enable_ = nullptr;
+    PFN_vkCmdSetColorBlendEquationEXT set_blend_equation_ = nullptr;
+    PFN_vkCmdSetColorWriteMaskEXT set_write_mask_ = nullptr;
+    std::uint32_t Pipeline(std::uint32_t key) const { return dynamic_blend_ ? key & ~kDynamicBlendBits : key; }
     /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
        through it; the keys PipelineFor has made, kept to make again at the
        next start (WarmPipelines); written back now and then as they grow
@@ -945,6 +953,7 @@ private:
         VkRect2D scissor{};
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
+        std::uint32_t blend_key = ~0u;      // dynamic blending: the key bits 0-12 (+ 13-15) last set
     } drawn_;
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
@@ -1228,6 +1237,17 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
+    if (g_dynamic_blend.load()) {
+        set_blend_enable_ = reinterpret_cast<PFN_vkCmdSetColorBlendEnableEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorBlendEnableEXT"));
+        set_blend_equation_ = reinterpret_cast<PFN_vkCmdSetColorBlendEquationEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorBlendEquationEXT"));
+        set_write_mask_ = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorWriteMaskEXT"));
+        dynamic_blend_ = set_blend_enable_ && set_blend_equation_ && set_write_mask_;
+    }
+    std::fprintf(stderr, "[gpu] blending: %s\n", dynamic_blend_ ? "dynamic state (VK_EXT_extended_dynamic_state3)"
+                                                               : "in each pipeline");
     OpenPipelineCache();
     {
         VkPhysicalDeviceProperties properties;
@@ -2105,15 +2125,17 @@ void VulkanGsRenderer::WarmPipelines() {
     std::string word;
     std::vector<std::uint32_t> keys;
     while (in && in >> word) {
-        const std::uint32_t key = std::uint32_t(std::strtoul(word.c_str(), nullptr, 16));
+        const std::uint32_t key = Pipeline(std::uint32_t(std::strtoul(word.c_str(), nullptr, 16)));
         if (pipelines_.count(key) || !pipelines_asked_.insert(key).second) continue;
         known_keys_.insert(key);
         keys.push_back(key);
     }
     // The game's own list after (SetPipelineHints): kept in the file only
     // once drawn with.
-    for (std::uint32_t key : g_pipeline_hints)
+    for (std::uint32_t hint : g_pipeline_hints) {
+        const std::uint32_t key = Pipeline(hint);
         if (!pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
+    }
     if (keys.empty()) return;
     // The whole shader's (a blend's, no features) first: every draw of a
     // kind not made yet stands in with one of them, and the GS thread makes
@@ -2232,6 +2254,7 @@ void VulkanGsRenderer::SavePipelineCache() {
 }
 
 VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
+    key = Pipeline(key);
     // Batch after batch asks for the same one.
     if (key == last_pipeline_key_ && last_pipeline_) return last_pipeline_;
     // SHADER COMPILE's wish (SetShaderCompileMode) taken.
@@ -2395,9 +2418,11 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     depth.back = depth.front;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE};
+                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                       VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 6;
+    dynamic.dynamicStateCount = dynamic_blend_ ? 9 : 6;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -3784,6 +3809,24 @@ void VulkanGsRenderer::Flush() {
                         if (d.pipeline != chosen) {
                             d.pipeline = chosen;
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
+                        }
+                        if (dynamic_blend_ && d.blend_key != (full_key & 0xFFFFu)) {
+                            // The blending this key's pipeline would have had, set: what changed of it.
+                            const VkPipelineColorBlendAttachmentState was =
+                                Blending(d.blend_key == ~0u ? ~0u : d.blend_key, g_.dual_source);
+                            const VkPipelineColorBlendAttachmentState b = Blending(full_key, g_.dual_source);
+                            const bool fresh = d.blend_key == ~0u;
+                            if (fresh || was.blendEnable != b.blendEnable) set_blend_enable_(cmd, 0, 1, &b.blendEnable);
+                            const VkColorBlendEquationEXT eq{b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
+                                                             b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
+                            const VkColorBlendEquationEXT eq_was{was.srcColorBlendFactor, was.dstColorBlendFactor,
+                                                                 was.colorBlendOp, was.srcAlphaBlendFactor,
+                                                                 was.dstAlphaBlendFactor, was.alphaBlendOp};
+                            if (fresh || (b.blendEnable && std::memcmp(&eq, &eq_was, sizeof eq) != 0))
+                                set_blend_equation_(cmd, 0, 1, &eq);
+                            if (fresh || was.colorWriteMask != b.colorWriteMask)
+                                set_write_mask_(cmd, 0, 1, &b.colorWriteMask);
+                            d.blend_key = full_key & 0xFFFFu;
                         }
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         if (d.depth_write != depth_write)
