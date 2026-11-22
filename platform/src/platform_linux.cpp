@@ -354,6 +354,81 @@ bool HoldToCores(std::uint64_t mask) {
     return any || sched_setaffinity(0, sizeof set, &set) == 0;
 }
 
+namespace {
+std::atomic<std::uint64_t> g_prime_mask{0};     // PreferPrimeCore's core(s), kept from the others' PreferFastCores
+std::uint64_t PrimeMask() {
+    static const std::uint64_t mask = [] {
+        if (const char* e = std::getenv("PS2HOST_PRIME_CORE"); e && e[0] == '0') return std::uint64_t(0);
+        long top[64] = {}, fastest = 0;
+        int cores = 0;
+        for (int i = 0; i < 64; ++i) {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+            if (!(f >> top[i])) break;
+            fastest = std::max(fastest, top[i]);
+            cores = i + 1;
+        }
+        std::uint64_t prime = 0;
+        int n = 0, below = 0;
+        for (int i = 0; i < cores; ++i) {
+            if (top[i] == fastest) prime |= std::uint64_t(1) << i, ++n;
+            else ++below;
+        }
+        return n <= 2 && below >= 4 ? prime : std::uint64_t(0);    // a lone fastest tier, enough cores besides
+    }();
+    return mask;
+}
+}  // namespace
+
+void PreferPrimeCore() {
+    const std::uint64_t prime = PrimeMask();
+    if (!prime) {
+        PreferFastCores();
+        return;
+    }
+    g_prime_mask = prime;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; ++i)
+        if (prime >> i & 1) CPU_SET(i, &set);
+    sched_setaffinity(0, sizeof set, &set);
+    std::fprintf(stderr, "[host] prime core: mask 0x%llX\n", (unsigned long long)prime);
+}
+
+void PreferFastCores() {
+    static const std::uint64_t mask = [] {
+        if (const char* e = std::getenv("PS2HOST_FAST_CORES"); e && e[0] == '0') return std::uint64_t(0);
+        // Every core but the slowest cluster's (a phone's efficiency cores): the Odin 2's big 2.8 GHz and prime
+        // 3.2 GHz cores, not its 2.0 GHz A510s. (90 % of the fastest kept the prime core alone - every busy thread
+        // on one core, 625 pictures of 1634, 2026-11-22.)
+        long top[64] = {};
+        long slowest = 0;
+        int cores = 0;
+        for (int i = 0; i < 64; ++i) {
+            std::ifstream f("/sys/devices/system/cpu/cpu" + std::to_string(i) + "/cpufreq/cpuinfo_max_freq");
+            if (!(f >> top[i])) break;
+            slowest = slowest ? std::min(slowest, top[i]) : top[i];
+            cores = i + 1;
+        }
+        std::uint64_t fast = 0;
+        for (int i = 0; i < cores; ++i)
+            if (top[i] > slowest) fast |= std::uint64_t(1) << i;
+        if (__builtin_popcountll(fast) < 4) fast = 0;      // too few to hold the busy threads apart
+        // Alike (all fast) or unknown: no mask.
+        if (!fast || fast == (cores >= 64 ? ~std::uint64_t(0) : (std::uint64_t(1) << cores) - 1)) return std::uint64_t(0);
+        std::fprintf(stderr, "[host] fast cores: mask 0x%llX of %d\n", (unsigned long long)fast, cores);
+        return fast;
+    }();
+    if (!mask) return;
+    // Off the prime core when it is held for one thread (PreferPrimeCore; its mask known from the start).
+    const std::uint64_t prime = PrimeMask();
+    const std::uint64_t use = (mask & ~prime) ? (mask & ~prime) : mask;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    for (int i = 0; i < 64; ++i)
+        if (use >> i & 1) CPU_SET(i, &set);
+    sched_setaffinity(0, sizeof set, &set);
+}
+
 // ---- Files and the process.
 std::filesystem::path ExePath() {
 #ifdef __ANDROID__

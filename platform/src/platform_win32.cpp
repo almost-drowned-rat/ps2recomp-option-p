@@ -576,4 +576,7 @@ bool WaitDisplayVblank(std::uint64_t* steady_ns) {
     return true;
 }
 
+void PreferFastCores() {}
+void PreferPrimeCore() {}
+
 }  // namespace ps2platform

@@ -13,6 +13,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include "ps2platform/platform.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -166,6 +167,7 @@ public:
                          (g - gpu_waited) / 60e6);
             queue_waited = q;
             gpu_waited = g;
+            std::fprintf(stderr, "; handing pictures to the window %.2f ms a frame", display_ns_.exchange(0) / 60e6);
             static std::uint64_t stand_ins_before = 0;
             const std::uint64_t si = ShaderStandIns();
             std::fprintf(stderr, "; pipeline stand-ins / waits %llu", (unsigned long long)(si - stand_ins_before));
@@ -481,6 +483,10 @@ private:
     }
 
     void Run() {
+        // As busy as the EE (it draws all the GS thread hands on; ~16 ms a frame in ZOE's boss fight): its priority,
+        // and the fast cores - at the default it ran mostly off a core or on an efficiency one (2026-11-22).
+        ps2platform::SetThreadPriority(ps2platform::Priority::kHighest);
+        ps2platform::PreferFastCores();
         std::unique_lock<std::mutex> hold(lock_);
         for (;;) {
             wake_.wait(hold, [this] { return stop_ || !full_.empty(); });
@@ -552,6 +558,15 @@ private:
                 case kFlush: r.Flush(); break;
                 case kKick: r.Kick(); break;
                 case kDisplayThen: {
+                    const auto display_from = std::chrono::steady_clock::now();   // (a picture's: a clock read a frame)
+                    struct DisplayTimed {
+                        std::chrono::steady_clock::time_point from;
+                        std::atomic<std::uint64_t>* sum;
+                        ~DisplayTimed() {
+                            sum->fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
+                        }
+                    } display_timed{display_from, &display_ns_};
                     const auto fbp = Take<std::uint32_t>(at), fbw = Take<std::uint32_t>(at), psm = Take<std::uint32_t>(at);
                     std::unique_ptr<DisplayThen> then(Take<DisplayThen*>(at));
                     std::uint64_t image = 0;
@@ -686,7 +701,8 @@ private:
         "ReadTargetFull", "queue full"};
     mutable unsigned drains_[kWhys] = {};
     mutable std::uint64_t waited_ns_[kWhys] = {};       // the caller's time in those waits
-    std::atomic<std::uint64_t> played_ns_{0};           // the renderer's thread in Play
+    std::atomic<std::uint64_t> played_ns_{0};
+    std::atomic<std::uint64_t> display_ns_{0};          // of it in kDisplayThen (the picture handed to the window)           // the renderer's thread in Play
     unsigned kicks_ = 0;
     // The caller's side.
     mutable Bytes open_;

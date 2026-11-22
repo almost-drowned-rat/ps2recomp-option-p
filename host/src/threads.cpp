@@ -1625,6 +1625,7 @@ u64 LastMoviePictureNs() { return g_last_movie_ns.load(std::memory_order_relaxed
 
 void FastThread() {
     ps2platform::NoPowerThrottling();
+    ps2platform::PreferFastCores();
     // Above the rest only with cores to spare (SpareCores): on a machine
     // with few, the EE, the GS thread and VIF1's worker together keep every
     // core busy, and at a higher priority the threads they depend on - the

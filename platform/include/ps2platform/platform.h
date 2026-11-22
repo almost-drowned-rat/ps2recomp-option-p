@@ -75,6 +75,15 @@ std::uint64_t ProcessCpuNs();
 int ProcessCores();
 // The process held to the logical cores in `mask` (bit n: core n); false if not done.
 bool HoldToCores(std::uint64_t mask);
+// The calling thread on the system's fast cores only (a phone's big and prime cores: every core but the slowest
+// cluster's, when that leaves four or more) - the emulation's busy threads, never on an efficiency core (Android placed the
+// renderer's on one, the Odin 2's A510s at 2.0 GHz). A machine whose cores are alike: nothing done. PS2HOST_
+// FAST_CORES=0 turns it off. Windows: nothing (its scheduler's own).
+void PreferFastCores();
+// The calling thread on the fastest core(s) alone (a phone's prime core) and every other PreferFastCores thread off
+// them - for the one stage of the emulation that is busiest (VIF1's worker running VU1: ~14 ms a frame in ZOE's boss
+// fight). Without a lone fastest tier: PreferFastCores. PS2HOST_PRIME_CORE=0 turns it off.
+void PreferPrimeCore();
 
 // ---- Files and the process.
 // The running executable's own path; its folder is where a port keeps its settings, saves, boot.mpg.

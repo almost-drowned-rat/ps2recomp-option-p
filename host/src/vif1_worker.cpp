@@ -37,6 +37,7 @@
 #include <string>
 #include <thread>
 
+#include "ps2platform/platform.h"
 #include "ps2host/profile.h"
 #include "ps2host/timeline.h"
 #include "ps2host/run.h"
@@ -65,6 +66,8 @@ struct Worker {
     void Run() {
         t_on_worker = true;
         FastThread();
+        // The busiest stage (VU1, ~14 ms a frame in ZOE's boss fight): the prime core to itself, where there is one.
+        ps2platform::PreferPrimeCore();
         if (SampleVif1Thread()) StartSampler();
         for (;;) {
             std::function<void()> command;
