@@ -195,6 +195,19 @@ struct VuCore {
         out.lanes = dest;
         std::memcpy(out.value, q, 16);
     }
+    /* LQ / LQI / LQD straight into VF `it` where the pair's upper neither reads nor writes it (vurecomp.py's
+       direct_loads): held to the pair's end (Load, Finish) it would land the same - the same fields, ready at
+       the issue cycle + 4 as Finish stamps them - without the Pending and its blend (2026-11-23). VF0 stays. */
+    static PS2HOST_VU_INLINE void LoadNow(Vu& v, u64 cycle, u32 address, int it, u32 dest) {
+        if (it <= 0) return;
+        const u32* q = Quad(v, address);
+        const u64 ready = cycle + kFmacLatency;
+        for (int lane = 0; lane < 4; ++lane)
+            if (dest & (8u >> lane)) {
+                v.regs.vf[it][lane] = q[lane];
+                v.vf_ready_[it][lane] = ready;
+            }
+    }
     /* Whether Clean leaves all four fields as they are: no infinity or NaN
        exponent, and no denormal (a zero exponent with a mantissa). */
     static PS2HOST_VU_INLINE bool Clean4(const u32* q) {
@@ -590,8 +603,14 @@ struct VuCore {
         const __m128 x = _mm_mul_ps(
             _mm_castsi128_ps(lifted::CleanLanes(_mm_loadu_si128(reinterpret_cast<const __m128i*>(v.regs.vf[fs])))),
             _mm_set1_ps(kScaleF[Shift]));
+#if PS2RT_VU_SSE2NEON
+        // (NEON's conversion saturates by itself: 0x7FFFFFFF for the positives, 0x80000000 for the negatives -
+        // the x86 fix-up below turned the positives back to 0x80000000)
+        const __m128i value = _mm_cvttps_epi32(x);
+#else
         const __m128i over = _mm_castps_si128(_mm_cmpge_ps(x, _mm_set1_ps(2147483648.0f)));
         const __m128i value = _mm_xor_si128(_mm_cvttps_epi32(x), over);
+#endif
         __m128i* to = reinterpret_cast<__m128i*>(v.regs.vf[ft]);
         if constexpr (Dest == 15) _mm_storeu_si128(to, value);
         else _mm_storeu_si128(to, Blend(LaneMask(Dest), value, _mm_loadu_si128(to)));

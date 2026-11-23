@@ -300,8 +300,12 @@ u64 g_chain_words = 0;
 
 // Walks a started transfer and leaves the registers as it would; returns a
 // note (when `describe`: a transfer is noted only the first time).
-std::string Walk(const Channel& ch, u32 chcr, bool describe) {
+u32 g_last_dropped_at = 0;      // the last Walk's dropped unwritten tag (dma.h DmaOutcome::dropped_at), 0 none
+
+std::string Walk(const Channel& ch, u32 chcr, bool describe, int unwritten = kUnwrittenSend, bool* waiting = nullptr) {
     Memory& m = GuestMemory();
+    if (waiting) *waiting = false;
+    g_last_dropped_at = 0;
     if (ch.base == 0x1000D000u || ch.base == 0x1000D400u) return Scratchpad(ch, chcr, describe);
     DmaChannelState state{chcr, u32(m.Read(ch.base + kMadr, 4)), u32(m.Read(ch.base + kQwc, 4)),
                           u32(m.Read(ch.base + kTadr, 4)), u32(m.Read(ch.base + kAsr0, 4)),
@@ -338,7 +342,9 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
         Timed timed(Section::Dma);      // (VU1 and the GS, which it drives, timed apart)
         // The GIF takes no chain tags (TTE): dma.h.
         const bool tags = ch.base != 0x1000A000u;
-        const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags);
+        const DmaOutcome outcome = SendDmaBlocks(state, sink, 1u << 16, tags, unwritten);
+        if (waiting) *waiting = outcome.waiting;
+        g_last_dropped_at = outcome.dropped ? outcome.dropped_at : 0u;
         if (describe)
             std::snprintf(text, sizeof text, "%llu quadwords, %u tags%s",
                       static_cast<unsigned long long>(outcome.quadwords), outcome.tags,
@@ -385,6 +391,49 @@ std::string Walk(const Channel& ch, u32 chcr, bool describe) {
     *Register(ch.base) = state.chcr;
     return text;
 }
+
+// A VIF1 transfer stopped at a tag the game has not written yet (dma.h UnwrittenTag, Walk's `waiting`).
+struct Vif1Waiting {
+    bool on = false;
+    u64 since_frame = 0;
+} g_vif1_waiting;
+u64 g_vif1_waits = 0;       // transfers that waited (the frames line's diagnosis)
+u64 g_frames_done = 0;      // FrameDone's count, for how long one waits
+
+// What VIF1's chain does at an unwritten tag (dma.h): PS2HOST_DMA_UNWRITTEN=send (as before 2026-11-23: its upper
+// half sent, the VIF out of step), wait (the transfer waits for the tag, at most two frames), drop (the default:
+// the chain ends there at once, the upper half not sent - ZOE never writes the tag: waiting cost two pictures).
+int UnwrittenMode() {
+    static const int mode = [] {
+        const char* e = std::getenv("PS2HOST_DMA_UNWRITTEN");
+        const std::string v = e ? e : "drop";
+        return v == "send" ? kUnwrittenSend : v == "wait" ? kUnwrittenWait : kUnwrittenDrop;
+    }();
+    return mode;
+}
+
+// The waiting transfer walked on from its tag: ended now if the tag is written (or `force`: to the end whatever it
+// holds - a new start of the channel, or two frames waited), its STR cleared and its interrupt posted as at a start.
+void ResumeVif1Dma(bool force, const char* why = "") {
+    if (!g_vif1_waiting.on) return;
+    const Channel& ch = kChannels[1];
+    static int said = 0;
+    if (force && said++ < 6)
+        std::fprintf(stderr, "[dma] VIF1's waiting chain walked on regardless (%s, %llu frames waited): tag at 0x%08X now "
+                     "%016llX\n", why, static_cast<unsigned long long>(g_frames_done - g_vif1_waiting.since_frame),
+                     unsigned(*Register(ch.base + kTadr)),
+                     static_cast<unsigned long long>(GuestMemory().Read(*Register(ch.base + kTadr), 8)));
+    bool waiting = false;
+    // Given up waiting: the chain ends at the tag as it stands, its upper half not sent (kUnwrittenDrop) - VIF1
+    // owed no data by a command that never gets it.
+    Walk(ch, *Register(ch.base), false, force ? kUnwrittenDrop : kUnwrittenWait, &waiting);
+    if (waiting) return;
+    g_vif1_waiting.on = false;
+    *Register(ch.base) &= ~0x100u;
+    SetDStat(d_stat | (1u << ch.status_bit));
+    PostDmac(ch.status_bit);
+}
+
 constexpr u32 kVif0Fifo = 0x10004000u;
 constexpr u32 kVif1Fifo = 0x10005000u;
 
@@ -746,8 +795,138 @@ void FinishCapture(u64 frame) {
 
 void RequestCapture() { g_capture_request = true; }
 
+// GAME SPEED (the PERFORMANCE OVERLAY's SPEED, the maintainer 2026-11-22): the vertical blanks the game took a
+// real second, against the console's 59.94 - 100 % the game at its own pace, below it slowed (an EE behind
+// loses blanks past the owed ones, and the game's time with them). Counted here, as each is delivered; the
+// overlay reads it twice a second (GameSpeed), the log says each second and each 5 s's slowest
+// (PS2HOST_SPEED_LOG=1 or the overlay showing SPEED). Not under --virtual-time: no real second to count in.
+namespace {
+constexpr double kGuestRate = 1e9 / 16683333.0;     // NTSC, 59.94 (the engine's blank, PAL discs too)
+std::mutex g_speed_mutex;
+u64 g_speed_frames = 0;                             // blanks counted, and when the last came (steady ns)
+u64 g_speed_last_ns = 0;
+u64 g_speed_stall_ns = 0;                           // waits between blanks past 1.5 periods: their time past one
+constexpr u64 kBlankNs = 16683333;
+bool g_speed_log = std::getenv("PS2HOST_SPEED_LOG") != nullptr;
+
+u64 SteadyNs() {
+    return u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+void CountSpeed() {
+    // (Under --virtual-time too, as an emulator's fast-forward shows: the blanks a real second, above 100 % when it
+    // runs ahead - the maintainer 2026-11-22. Its stalls are no player's: only real time counts them.)
+    const bool virtual_time = VirtualClock();
+    const u64 now = SteadyNs();
+    {
+        std::lock_guard<std::mutex> lock(g_speed_mutex);
+        ++g_speed_frames;
+        if (!virtual_time && g_speed_last_ns && now - g_speed_last_ns > kBlankNs * 3 / 2)
+            g_speed_stall_ns += now - g_speed_last_ns - kBlankNs;
+        g_speed_last_ns = now;
+    }
+    // The log's: whole seconds of blanks, five of them a line.
+    static u64 second_from = 0, second_frames = 0, second_stall = 0;
+    static int seconds = 0;
+    static double slowest = 1e9;
+    if (!second_from) second_from = now;
+    ++second_frames;
+    if (now - second_from < 1'000'000'000ull) return;
+    const double counted = 100.0 * double(second_frames) / ((now - second_from) / 1e9) / kGuestRate;
+    u64 stall_total;
+    {
+        std::lock_guard<std::mutex> lock(g_speed_mutex);
+        stall_total = g_speed_stall_ns;
+    }
+    const double ran = 100.0 * (1.0 - double(stall_total - second_stall) / double(now - second_from));
+    const double speed = virtual_time ? counted : std::max(0.0, std::min(counted, ran));     // what the player sees
+    second_stall = stall_total;
+    const u64 second_from_log = second_from;
+    second_from = now;
+    second_frames = 0;
+    // Each second too (the maintainer 2026-11-22: "nimm jede Sekunde auf").
+    if (g_speed_log || SettingOverlayShows("speed")) {
+        // ...with the pictures shown in it and the longest wait between two (60 and ~16.7 ms: no drop).
+        static u64 presents_before = ~0ull;
+        u64 presents = 0;
+        double gap = 0;
+        if (ps2gpu::Display* display = WindowDisplay()) {
+            presents = display->PresentCount();
+            gap = display->TakeLongestPresentGap();
+        }
+        if (presents_before == ~0ull) presents_before = presents - std::min<u64>(presents, 60);   // (the first: no count)
+        // The game's own pictures first (what the overlay shows: speed = them against the game's rate, the longest
+        // wait between two); then, to tell where a drop came from, the blanks' speed and the presents.
+        static u64 game_before = ~0ull;
+        const u64 game = GamePictures();
+        if (game_before == ~0ull) game_before = game;
+        const u64 game_pictures = game - game_before;
+        const double game_speed = 100.0 * double(game_pictures) / ((now - second_from_log) / 1e9) / GamePictureRate();
+        std::fprintf(stderr, "[speed] second: %.1f %%, %llu pictures, longest gap %.1f ms (blanks %.1f %%, %llu presents, "
+                     "longest %.1f ms)\n", game_speed, (unsigned long long)game_pictures, TakeLongestGamePictureGap(1),
+                     speed, (unsigned long long)(presents - presents_before), gap);
+        game_before = game;
+        presents_before = presents;
+    }
+    // Each 5 s: the worst only - no average (the maintainer 2026-11-22: an average's window can be chosen until it
+    // says what one wants).
+    slowest = std::min(slowest, speed);
+    if (++seconds < 5) return;
+    if (g_speed_log || SettingOverlayShows("speed"))
+        std::fprintf(stderr, "[speed] 5 s: slowest second %.1f %%\n", slowest);
+    seconds = 0;
+    slowest = 1e9;
+}
+}  // namespace
+
+bool GameSpeed(GameSpeedMark* mark, double* percent) {
+    u64 frames, last, stall;
+    {
+        std::lock_guard<std::mutex> lock(g_speed_mutex);
+        frames = g_speed_frames;
+        last = g_speed_last_ns;
+        stall = g_speed_stall_ns;
+    }
+    // To the last blank - or to now, when none came for longer than a few would (the game held up: that wait so
+    // far counted as stopped, the rest of it when its blank comes).
+    const u64 now = SteadyNs();
+    const u64 to = last && now - last < 100'000'000ull ? last : now;
+    if (!VirtualClock() && last && now - last > kBlankNs * 3 / 2 && to == now) stall += now - last - kBlankNs;
+    const bool known = mark->ns && frames >= mark->frames && to > mark->ns && stall >= mark->stall_ns;
+    if (known) {
+        const double counted = 100.0 * double(frames - mark->frames) / ((to - mark->ns) / 1e9) / kGuestRate;
+        const double ran = 100.0 * (1.0 - double(stall - mark->stall_ns) / double(to - mark->ns));
+        *percent = VirtualClock() ? counted : std::max(0.0, std::min(counted, ran));
+    }
+    mark->frames = frames;
+    mark->ns = to;
+    mark->stall_ns = stall;
+    return known && frames > 0;
+}
+
 void FrameDone(u64 frame) {
+    CountSpeed();
+    // PS2HOST_PICTURES_AT=a,b: the game's pictures counted at those frames (its flips between two blanks: how many
+    // pictures a stretch of the game has when nothing holds it up - --virtual-time - against real time).
+    static const std::vector<u64> pictures_at = [] {
+        std::vector<u64> at;
+        if (const char* e = std::getenv("PS2HOST_PICTURES_AT"))
+            for (const char* p = e; *p;) {
+                at.push_back(std::strtoull(p, const_cast<char**>(&p), 10));
+                if (*p == ',') ++p;
+                else break;
+            }
+        return at;
+    }();
+    for (u64 at : pictures_at)
+        if (frame == at)
+            std::fprintf(stderr, "[pictures] frame %llu: %llu game pictures so far\n", (unsigned long long)frame,
+                         (unsigned long long)GamePictures());
     FrameTimes(frame);
+    // A VIF1 transfer waiting at an unwritten tag: tried again each frame, walked to its end after two.
+    ++g_frames_done;
+    if (g_vif1_waiting.on) ResumeVif1Dma(g_frames_done - g_vif1_waiting.since_frame >= 2, "two frames");
     MusicBlank();
     timeline::Frame(frame);
     SampleFrame(frame);
@@ -912,13 +1091,45 @@ void InstallDevices() {
                               unsigned(memory.Read(qwc, 4)), unsigned(memory.Read(ch.base + kTadr, 4)));
             if (traced) std::fprintf(gs::TheGs().trace_out, "[dma] %s\n", text);
             if (ch.base == 0x10009000u) ++g_vif1_transfers;
-            const std::string walked = ch.walked ? Walk(ch, u32(value), describe) : std::string();
+            // A VIF1 transfer still waiting at an unwritten tag goes on first (to its end, whatever the tag holds).
+            if (ch.base == 0x10009000u && g_vif1_waiting.on) ResumeVif1Dma(true, "started again");
+            bool waiting = false;
+            const int unwritten = ch.base == 0x10009000u ? UnwrittenMode() : kUnwrittenSend;
+            const std::string walked = ch.walked ? Walk(ch, u32(value), describe, unwritten, &waiting) : std::string();
+            // (Dropped: said the first times, as a wait is - the walk tells, Walk's `dropped_at`. Read back from TADR
+            // here before, it faulted on a normal-mode transfer's TADR 0: ps2autotests dma/vif/basic hung.)
+            static int dropped_said = 0;
+            if (g_last_dropped_at && dropped_said < 3) {
+                ++dropped_said;
+                std::fprintf(stderr, "[dma] VIF1's chain ended at a tag not written (TADR 0x%08X), its VIFcodes left out\n",
+                             unsigned(g_last_dropped_at));
+            }
             if (describe) Note(key, ch.walked ? std::string(text) + ": " + walked : std::string(text));
+            if (waiting) {
+                // Stopped at a tag the game has not written yet (dma.h UnwrittenTag): the transfer runs on - STR
+                // set, no interrupt yet -, taken up again when the game looks at the channel, starts it again,
+                // or at the next frames (ResumeVif1Dma).
+                g_vif1_waiting.on = true;
+                g_vif1_waiting.since_frame = g_frames_done;
+                if (g_vif1_waits++ < 3)
+                    std::fprintf(stderr, "[dma] VIF1's chain waits at a tag not written yet (TADR 0x%08X), goes on when "
+                                 "it is\n", unsigned(*Register(ch.base + kTadr)));
+                return;
+            }
             *Register(chcr) &= ~0x100u;                         // done
             SetDStat(d_stat | (1u << ch.status_bit));
             PostDmac(ch.status_bit);
         });
     }
+    // VIF1's CHCR read while its transfer waits at an unwritten tag: the walk tries again first (the game polls
+    // STR for the transfer's end - it has written the tag by then, as on the console the DMA reaches it later).
+    m.OnRead(0x10009000u, [](u32, u64 stored) {
+        if (g_vif1_waiting.on) {
+            ResumeVif1Dma(false);
+            return u64(*Register(0x10009000u));
+        }
+        return stored;
+    });
     m.OnWrite(kDStat, [](u32, u64 value) {
         const u32 written = u32(value);
         SetDStat((d_stat & ~(written & 0xFFFFu)) ^ (written & 0xFFFF0000u));
@@ -1009,6 +1220,18 @@ void InstallDevices() {
         }
         else if (value & 8) Vif1Run([] { Vif1().Continue(); });
     });
+    // The VIFs' registers read: what Words left due mirrored first (vif.h MirrorIfDue) - VIF1's after its worker
+    // is done (Memory::Read joins it for these addresses before the read, so this runs with the worker idle).
+    for (u32 base : {0x10003800u, 0x10003C00u})
+        for (u32 offset = 0; offset < 0x180u; offset += 0x10u)
+            m.OnRead(base + offset, [base](u32 address, u64 stored) {
+                VifStream& vif = base == 0x10003C00u ? Vif1() : Vif0();
+                if (!vif.mirror_due_) return stored;
+                vif.MirrorIfDue();
+                u64 value = 0;
+                std::memcpy(&value, GuestMemory().Translate(address, 4), 4);
+                return value;
+            });
     // VIFn_MARK written: STAT.MRK cleared.
     m.OnWrite(0x10003830u, [](u32, u64) { Vif0().MarkWritten(); });
     m.OnWrite(0x10003C30u, [](u32, u64) { Vif1Run([] { Vif1().MarkWritten(); }); });

@@ -19,11 +19,15 @@
 #ifdef _WIN32
 #include <windows.h>
 #else
+#include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
+#include <sys/types.h>
 #endif
 
 #define LP 1024
 #define MAX_ARGS 256
+#define MAX_PROCS 72
 #define TRAILER_MAGIC "XRPAYLD1"            /* the Xbox launcher's trailer: one release script for both */
 #define TRAILER_SIZE 48                     /* magic (8), payload offset (8, LE), release (32, NUL padded) */
 #define WRONG_DISC 3                        /* player_build.py's exit code: not the game's disc */
@@ -46,6 +50,14 @@ typedef struct {
     SDL_IOStream *log;
     double base, span;
     char step[128];
+    /* the player quit during the installation (the window's close box / Alt+F4, "Quit anyway?" answered Yes - the
+     * maintainer 2026-11-23): the build's running tools stopped, no further step, the half-made game removed */
+    SDL_AtomicInt cancel;
+    SDL_Mutex *proc_mx;
+    SDL_Process *procs[MAX_PROCS];          /* the build's tools running now (compilers: up to 64 at once) */
+#ifdef _WIN32
+    HANDLE job;                             /* they and the processes they start: stopped together */
+#endif
 } L;
 
 /* ── small helpers ─────────────────────────────────────────────────────── */
@@ -193,14 +205,122 @@ static int split_tabs(char *line, char **argv, int max)
     return n;
 }
 
+/* ── quitting during the installation: the build's tools stopped (the maintainer 2026-11-23) ───────────── */
+
+static int cancelled(L *l) { return SDL_GetAtomicInt(&l->cancel) != 0; }
+
+/* a started tool into the list (and on Windows into the job, so the processes it starts - clang's linker - are
+ * stopped with it); 0: the player quit meanwhile - the caller stops it */
+static int proc_add(L *l, SDL_Process *proc)
+{
+    int i, ok = 0;
+    SDL_LockMutex(l->proc_mx);
+#ifdef _WIN32
+    if (l->job) {
+        HANDLE h = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, FALSE,
+                               (DWORD)SDL_GetNumberProperty(SDL_GetProcessProperties(proc), SDL_PROP_PROCESS_PID_NUMBER, 0));
+        if (h) {
+            if (!AssignProcessToJobObject(l->job, h))
+                lg(l, "a tool not in the launcher's job (error %lu)", (unsigned long)GetLastError());
+            CloseHandle(h);
+        }
+    }
+#endif
+    for (i = 0; i < MAX_PROCS; i++)
+        if (!l->procs[i]) {
+            l->procs[i] = proc;
+            ok = 1;
+            break;
+        }
+    if (!ok)
+        lg(l, "more than %d tools at once: one not in the list", MAX_PROCS);
+    ok = !cancelled(l);
+    SDL_UnlockMutex(l->proc_mx);
+    return ok;
+}
+
+static void proc_remove(L *l, SDL_Process *proc)
+{
+    int i;
+    SDL_LockMutex(l->proc_mx);
+    for (i = 0; i < MAX_PROCS; i++)
+        if (l->procs[i] == proc)
+            l->procs[i] = NULL;
+    SDL_UnlockMutex(l->proc_mx);
+}
+
+#ifndef _WIN32
+/* Linux: pid and every process below it (by /proc/<n>/stat's parent field) - the parent held first (SIGSTOP), so
+ * it starts no new one, then the children, then it */
+static void kill_tree(pid_t pid, int depth)
+{
+    DIR *d;
+    struct dirent *e;
+    if (pid <= 1 || depth > 16)
+        return;
+    kill(pid, SIGSTOP);
+    if ((d = opendir("/proc"))) {
+        while ((e = readdir(d))) {
+            char p[64], buf[512], *close_paren;
+            FILE *f;
+            long child = strtol(e->d_name, NULL, 10);
+            if (child <= 1)
+                continue;
+            snprintf(p, sizeof p, "/proc/%ld/stat", child);
+            if (!(f = fopen(p, "r")))
+                continue;
+            buf[0] = 0;
+            if (!fgets(buf, sizeof buf, f))
+                buf[0] = 0;
+            fclose(f);
+            /* "pid (comm) state ppid ...": comm may hold spaces and parentheses - after the last ')' */
+            if ((close_paren = strrchr(buf, ')'))) {
+                char state;
+                long ppid;
+                if (sscanf(close_paren + 1, " %c %ld", &state, &ppid) == 2 && ppid == (long)pid)
+                    kill_tree((pid_t)child, depth + 1);
+            }
+        }
+        closedir(d);
+    }
+    kill(pid, SIGKILL);
+}
+#endif
+
+/* the player quit: every running tool (and what it started) stopped; the steps see cancelled() and end */
+static void stop_build_tools(L *l)
+{
+    int i, n = 0;
+    SDL_SetAtomicInt(&l->cancel, 1);
+    SDL_LockMutex(l->proc_mx);
+#ifdef _WIN32
+    if (l->job)
+        TerminateJobObject(l->job, 1);
+#endif
+    for (i = 0; i < MAX_PROCS; i++)
+        if (l->procs[i]) {
+#ifndef _WIN32
+            kill_tree((pid_t)SDL_GetNumberProperty(SDL_GetProcessProperties(l->procs[i]), SDL_PROP_PROCESS_PID_NUMBER, 0), 0);
+#endif
+            SDL_KillProcess(l->procs[i], true);
+            n++;
+        }
+    SDL_UnlockMutex(l->proc_mx);
+    lg(l, "quit during \"%s\" (the player): %d running tool(s) stopped", l->step, n);
+}
+
 /* runs argv in cwd, stdout + stderr appended to log_path (NULL: dropped); the exit code, -1 when it could not
- * start */
+ * start (or the player quit) */
 static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 {
-    SDL_PropertiesID p = SDL_CreateProperties();
-    SDL_IOStream *out = log_path ? SDL_IOFromFile(log_path, "ab") : NULL;
+    SDL_PropertiesID p;
+    SDL_IOStream *out;
     SDL_Process *proc;
     int code = -1;
+    if (cancelled(l))
+        return -1;
+    p = SDL_CreateProperties();
+    out = log_path ? SDL_IOFromFile(log_path, "ab") : NULL;
     SDL_SetPointerProperty(p, SDL_PROP_PROCESS_CREATE_ARGS_POINTER, argv);
     if (cwd)
         SDL_SetStringProperty(p, SDL_PROP_PROCESS_CREATE_WORKING_DIRECTORY_STRING, cwd);
@@ -224,6 +344,8 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
     if (!proc) {
         lg(l, "cannot start %s: %s", argv[0], SDL_GetError());
     } else {
+        if (!proc_add(l, proc))
+            SDL_KillProcess(proc, true);    /* (the player quit while it started) */
 #ifdef _WIN32
         /* SDL gives a background process's exit code as 0 on Windows too (SDL_process.c SDL_WaitProcess: found
            2026-11-21 by a forced failure - a crashed translation passed as "done"). The real code from our own handle:
@@ -245,7 +367,10 @@ static int run_proc(L *l, char **argv, const char *cwd, const char *log_path)
 #else
         SDL_WaitProcess(proc, true, &code);
 #endif
+        proc_remove(l, proc);
         SDL_DestroyProcess(proc);
+        if (cancelled(l))
+            code = -1;                      /* stopped by the player: never "done" */
     }
     if (out)
         SDL_CloseIO(out);
@@ -298,6 +423,13 @@ static int run_job(L *l, const char *step, double base, double span, int (*fn)(L
     snprintf(l->step, sizeof l->step, "%s", step);
     l->base = base;
     l->span = span;
+    /* the player quit between two steps: no further one */
+    if (cancelled(l) || (l->ui && xr_setup_ui_cancelled(l->ui))) {
+        if (!cancelled(l))
+            stop_build_tools(l);
+        lg(l, "%s: not started (the player quit)", step);
+        return 1;
+    }
     lg(l, "%s", step);
     t = SDL_CreateThread(job_main, "launcher step", &j);
     if (!t)
@@ -306,12 +438,19 @@ static int run_job(L *l, const char *step, double base, double span, int (*fn)(L
         char e[64];
         unsigned s = (unsigned)((SDL_GetTicks() - t0) / 1000);
         snprintf(e, sizeof e, "%u:%02u", s / 60, s % 60);
-        ui_say(l, progress ? progress(arg) : 0.0, e);
+        ui_say(l, progress ? progress(arg) : 0.0, cancelled(l) ? "stopping" : e);   /* (the window kept alive) */
+        /* the close box answered Yes ("Quit anyway?"): the running tools stopped, the step ends by itself */
+        if (!cancelled(l) && l->ui && xr_setup_ui_cancelled(l->ui))
+            stop_build_tools(l);
         SDL_Delay(100);
     }
     SDL_WaitThread(t, NULL);
-    lg(l, "%s: %s (code %d) after %u s", step, j.rc ? "FAILED" : "done", j.rc,
-       (unsigned)((SDL_GetTicks() - t0) / 1000));
+    if (!cancelled(l) && l->ui && xr_setup_ui_cancelled(l->ui))
+        stop_build_tools(l);                /* (answered while the step ended) */
+    if (cancelled(l) && !j.rc)
+        j.rc = 1;
+    lg(l, "%s: %s (code %d) after %u s", step, cancelled(l) ? "STOPPED (the player quit)" : j.rc ? "FAILED" : "done",
+       j.rc, (unsigned)((SDL_GetTicks() - t0) / 1000));
     return j.rc;
 }
 
@@ -974,7 +1113,7 @@ static int lift_job(L *l, void *a)
             lines++;
     la->p.total = lines ? lines : 1;
     join(logp, sizeof logp, l->build, "lift.log");
-    for (line = SDL_strtok_r(text, "\r\n", &save); line && !rc; line = SDL_strtok_r(NULL, "\r\n", &save)) {
+    for (line = SDL_strtok_r(text, "\r\n", &save); line && !rc && !cancelled(l); line = SDL_strtok_r(NULL, "\r\n", &save)) {
         static char exp[MAX_ARGS][LP];
         char *raw[MAX_ARGS], *argv[MAX_ARGS + 4];
         int n = split_tabs(line, raw, MAX_ARGS), i, k = 0;
@@ -1094,7 +1233,7 @@ static int SDLCALL compile_worker(void *p)
     for (;;) {
         int n = SDL_AddAtomicInt(&b->next, 1), i, k = 0, j;
         char *argv[MAX_ARGS + 8], logp[LP];
-        if (n >= b->nsrc)
+        if (n >= b->nsrc || cancelled(w->l))
             break;
         i = w->order[n];
         argv[k++] = w->l->clang;
@@ -1108,7 +1247,8 @@ static int SDLCALL compile_worker(void *p)
         snprintf(logp, sizeof logp, "%s.log", b->objp[i]);
         SDL_RemovePath(logp);
         if (run_proc(w->l, argv, w->l->root, logp) != 0) {
-            lg(w->l, "compile failed: %s - see %s", b->src[i], logp);
+            if (!cancelled(w->l))
+                lg(w->l, "compile failed: %s - see %s", b->src[i], logp);
             SDL_AddAtomicInt(&b->failed, 1);
         }
         SDL_AddAtomicInt(&b->p.done_n, 1);
@@ -1331,6 +1471,14 @@ static int unpack_disc(L *l, const char *what, const char *mode, const char *fro
     }
     u.argv[k] = NULL;
     if (run_job(l, what, base, 0.01, unpack_disc_job, &u, unpack_disc_frac)) {
+        if (cancelled(l)) {
+            /* the player quit: the half-unpacked folder goes (ours - never the source: same_dir checked by the caller),
+               a later start or a backup must not take it as a whole disc */
+            if (!rm_tree(to))
+                lg(l, "cannot remove the half-unpacked %s", to);
+            SDL_RemovePath(u.progress);
+            return 0;
+        }
         lg(l, "%s failed - see %s", what, u.log);
         return 0;
     }
@@ -1557,7 +1705,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
 {
     static L l;
     const char *image = NULL, *base;
-    int repair = 0, no_start = 0, setup = 0, i, ok = 0, rc, found_image = 0, form = -1, go = 0, copy = 1;
+    int repair = 0, no_start = 0, setup = 0, i, ok = 0, rc, found_image = 0, form = -1, go = 0, copy = 1, building = 0;
     char extra[LP] = "", target[LP] = "", file[LP] = "";
     const char *extra_arg = NULL, *file_arg = NULL;
     char p[LP], stamp_want[LP + 128], *stamp_have, logp[LP];
@@ -1622,6 +1770,16 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     snprintf(l.jobs, sizeof l.jobs, "%d", compile_jobs());
     SDL_CreateDirectory(l.data);
     l.log_mx = SDL_CreateMutex();
+    l.proc_mx = SDL_CreateMutex();
+#ifdef _WIN32
+    /* the build's tools in one job: stopped together when the player quits, and gone with the launcher if it dies */
+    if ((l.job = CreateJobObjectW(NULL, NULL))) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION jl;
+        memset(&jl, 0, sizeof jl);
+        jl.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(l.job, JobObjectExtendedLimitInformation, &jl, sizeof jl);
+    }
+#endif
     join(logp, sizeof logp, l.data, "launcher.log");
     l.log = SDL_IOFromFile(logp, "wb");
     lg(&l, "%s launcher in %s", cfg->window_title, l.root);
@@ -1748,6 +1906,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     }
     if (!ensure_toolchain(&l))
         goto out;
+    building = 1;                           /* (from here a quit removes the half-made game) */
     rm_tree(l.build);
     SDL_CreateDirectory(l.build);
     SDL_CreateDirectory(l.obj);
@@ -1865,6 +2024,8 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
             if (extra[0] && !same_dir(extra, extra_dir)) {
                 if (unpack_disc(&l, "Unpacking the second disc", "--unpack-extra", extra, extra_dir, disc_dir, 0.99))
                     snprintf(extra, sizeof extra, "%s", extra_dir);
+                else if (cancelled(&l))
+                    goto out;
                 else
                     xr_setup_ui_message(l.ui, 0, "The second disc could not be unpacked (see data\\build\\unpack.log) - "
                                         "the game reads it where it is.");
@@ -1884,6 +2045,23 @@ out:
     /* a CHD's .iso for the build: ours, gone with it (rm_tree keeps disc images - a player's own - so by name) */
     if (l.lift_iso[0] && SDL_RemovePath(l.lift_iso))
         lg(&l, "removed %s", l.lift_iso);
+    if (cancelled(&l)) {
+        /* the player quit during the installation: nothing half-made stays that a later start (or the player) could
+           take as the game - no stamp was written; the game's exe, the translated sources and the objects go; the
+           next start builds again from the beginning */
+        if (building) {
+            rm_tree(l.work);
+            rm_tree(l.obj);
+            if (is_file(l.out) && !SDL_RemovePath(l.out))
+                lg(&l, "cannot remove %s", l.out);
+        }
+        lg(&l, "the installation was stopped by the player; the next start begins it again");
+        ok = 0;
+    }
+#ifdef _WIN32
+    if (l.job)
+        CloseHandle(l.job);
+#endif
     xr_setup_ui_close(l.ui);
     if (l.log)
         SDL_CloseIO(l.log);

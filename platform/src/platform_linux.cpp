@@ -11,11 +11,18 @@
 #include <SDL3/SDL.h>
 
 #include <dirent.h>
+#ifdef __ANDROID__
+#include <android/choreographer.h>
+#include <android/looper.h>
+#else
+#include <drm/drm.h>
+#endif
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <pthread.h>
 #include <sched.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -35,6 +42,9 @@
 #include <sstream>
 #include <thread>
 #include <utility>
+#include <condition_variable>
+#include <mutex>
+#include <string>
 
 #if defined(__x86_64__)
 #include <cpuid.h>
@@ -346,6 +356,17 @@ bool HoldToCores(std::uint64_t mask) {
 
 // ---- Files and the process.
 std::filesystem::path ExePath() {
+#ifdef __ANDROID__
+    // No executable of the game's own (the app's process): its folder is the app's external files dir (saves,
+    // settings, logs, the unpacked discs - reachable by adb and file managers), the name the game library's
+    static std::filesystem::path path = [] {
+        // (PS2HOST_HOME: a folder of its own for a run outside the app - adb shell tests, replays)
+        if (const char* home = std::getenv("PS2HOST_HOME"); home && *home) return std::filesystem::path(home) / "zoe_us";
+        const char* dir = SDL_GetAndroidExternalStoragePath();
+        return std::filesystem::path(dir && *dir ? dir : "/sdcard") / "zoe_us";
+    }();
+    return path;
+#endif
     char exe[4096] = {};
     const ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
     if (n <= 0) return {};
@@ -753,5 +774,97 @@ bool ScanCodeName(std::uint16_t scan_code, std::string* name) {
 
 // Only the fallback window reads keys this way, and Linux has none.
 bool SystemKeyDown(int) { return false; }
+
+// ---- The display's vertical blank (platform.h).
+#ifdef __ANDROID__
+// The Choreographer's frame callbacks on a thread of their own (its looper); each one's frame time (the vsync's,
+// CLOCK_MONOTONIC - steady_clock's) handed to the waiter.
+namespace {
+std::mutex g_vsync_mutex;
+std::condition_variable g_vsync_cv;
+std::uint64_t g_vsync_ns = 0, g_vsync_count = 0;
+bool g_vsync_running = false;
+
+void VsyncCallback(int64_t frame_ns, void* choreographer) {
+    {
+        std::lock_guard<std::mutex> lock(g_vsync_mutex);
+        g_vsync_ns = std::uint64_t(frame_ns);
+        ++g_vsync_count;
+    }
+    g_vsync_cv.notify_all();
+    AChoreographer_postFrameCallback64(static_cast<AChoreographer*>(choreographer), VsyncCallback, choreographer);
+}
+}  // namespace
+
+bool OpenDisplayVblank() {
+    std::lock_guard<std::mutex> lock(g_vsync_mutex);
+    if (g_vsync_running) return true;
+    g_vsync_running = true;
+    std::thread([] {
+        NameThread("display vsync");
+        ALooper_prepare(0);
+        AChoreographer* choreographer = AChoreographer_getInstance();
+        if (!choreographer) return;
+        AChoreographer_postFrameCallback64(choreographer, VsyncCallback, choreographer);
+        for (;;) ALooper_pollOnce(-1, nullptr, nullptr, nullptr);
+    }).detach();
+    return true;
+}
+
+bool WaitDisplayVblank(std::uint64_t* steady_ns) {
+    std::unique_lock<std::mutex> lock(g_vsync_mutex);
+    const std::uint64_t seen = g_vsync_count;
+    // (None for 100 ms: the app in the background, its frame callbacks held - the caller's timer meanwhile.)
+    if (!g_vsync_cv.wait_for(lock, std::chrono::milliseconds(100), [&] { return g_vsync_count != seen; }))
+        return false;
+    *steady_ns = g_vsync_ns;
+    return true;
+}
+#else
+// DRM_IOCTL_WAIT_VBLANK on the first CRTC that answers (a pipe index: the high-CRTC bits; the primary node, no
+// master needed). Its reply's time is CLOCK_MONOTONIC's (steady_clock's).
+namespace {
+int g_drm_fd = -1;
+unsigned g_drm_pipe = 0;
+
+bool DrmWait(int fd, unsigned pipe, std::uint64_t* ns) {
+    drm_wait_vblank_t w;
+    std::memset(&w, 0, sizeof w);
+    w.request.type = drm_vblank_seq_type(_DRM_VBLANK_RELATIVE |
+                                         ((pipe << _DRM_VBLANK_HIGH_CRTC_SHIFT) & _DRM_VBLANK_HIGH_CRTC_MASK));
+    w.request.sequence = 1;
+    int r;
+    do {
+        r = ioctl(fd, DRM_IOCTL_WAIT_VBLANK, &w);
+    } while (r != 0 && errno == EINTR);
+    if (r != 0) return false;
+    *ns = std::uint64_t(w.reply.tval_sec) * 1000000000ull + std::uint64_t(w.reply.tval_usec) * 1000ull;
+    return true;
+}
+}  // namespace
+
+bool OpenDisplayVblank() {
+    if (g_drm_fd >= 0) return true;
+    for (int card = 0; card < 8; ++card) {
+        const std::string path = "/dev/dri/card" + std::to_string(card);
+        const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+        if (fd < 0) continue;
+        for (unsigned pipe = 0; pipe < 8; ++pipe) {
+            std::uint64_t ns = 0;
+            if (!DrmWait(fd, pipe, &ns)) continue;
+            g_drm_fd = fd;
+            g_drm_pipe = pipe;
+            std::fprintf(stderr, "[pacing] display vblank: %s, CRTC %u\n", path.c_str(), pipe);
+            return true;
+        }
+        close(fd);
+    }
+    return false;
+}
+
+bool WaitDisplayVblank(std::uint64_t* steady_ns) {
+    return g_drm_fd >= 0 && DrmWait(g_drm_fd, g_drm_pipe, steady_ns);
+}
+#endif
 
 }  // namespace ps2platform

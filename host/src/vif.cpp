@@ -22,10 +22,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "ps2host/dma.h"
 #include "ps2host/memory.h"
 #include "ps2host/vu.h"
+
+namespace ps2host {
+bool OnVif1Worker();            // run.h's (not included here: its Stats would meet this file's)
+}
 
 namespace ps2host {
 
@@ -415,7 +420,7 @@ void VifStream::Words(const std::uint32_t* words, std::uint32_t count, std::uint
         g_dma_source = from + 4 * i;
         Word(words[i++]);
     }
-    Mirror();
+    mirror_due_ = true;             // mirrored when the registers are read (MirrorIfDue)
 }
 
 void VifStream::Reset() {
@@ -445,9 +450,28 @@ void VifStream::Stall() {
         stat_flags_ &= ~kStatVis;
     } else {
         stalled_ = true;
-        if (stalls_++ == 0)
+        if (stalls_++ == 0) {
             std::fprintf(stderr, "[vif] VIF%d stalled by a VIFcode's interrupt bit (0x%08X) - goes on at FBRST.STC\n",
                          register_base == 0x10003C00u ? 1 : 0, unsigned(code_));
+            // The codes before it, oldest first, with where they came from: a code read out of data (a stream
+            // out of step) shows as an unknown command after an UNPACK / DIRECT whose size was wrong.
+            std::string recent;
+            for (std::uint32_t k = 0; k < 8; ++k) {
+                const std::uint32_t at = (recent_at_ + k) & 7;
+                if (!recent_codes_[at] && !recent_from_[at]) continue;
+                char one[40];
+                std::snprintf(one, sizeof one, " %08X@%08X", unsigned(recent_codes_[at]), unsigned(recent_from_[at]));
+                recent += one;
+            }
+            std::fprintf(stderr, "[vif]   the VIFcodes before it (code@memory):%s; worker %s\n", recent.c_str(),
+                         OnVif1Worker() ? "yes" : "no");
+            // (The tags as of now on the EE's thread: with the worker, the chains walked since this data was copied.)
+            const std::uint32_t last_from = recent_from_[(recent_at_ - 1) & 7];
+            std::fprintf(stderr, "[vif]   DMA tags walked lately at or towards %08X +-1 KB (#n tag@TADR):%s\n",
+                         unsigned(last_from), RecentDmaTags(last_from, 0x400).c_str());
+            std::fprintf(stderr, "[dma trace] the last tags walked in PS2HOST_DMA_TRACE's range:%s\n",
+                         RangedDmaTags(40).c_str());
+        }
     }
     if (on_interrupt) on_interrupt();
 }
@@ -469,11 +493,14 @@ void VifStream::Continue() {
 }
 
 void VifStream::Mirror() {
+    mirror_due_ = false;
     if (!register_base) return;
     // The register block (0x180 bytes, one window) translated once, and a register written only when it changes:
     // this runs after every DMA chunk (~8,000 a second in ZOE's fight) and the EE's thread reads the same cache
     // lines - rewriting all 22 every time was 7.8 % of a core on VIF1's worker (P-Gate 3 profile, 2026-11-17).
-    std::uint8_t* const regs = GuestMemory().Translate(register_base, 0x180);
+    // (Guest memory's blocks stay where they are for the run: translated once.)
+    if (!mirror_bytes_) mirror_bytes_ = GuestMemory().Translate(register_base, 0x180);
+    std::uint8_t* const regs = mirror_bytes_;
     if (!regs) return;
     auto put = [regs](std::uint32_t offset_in, std::uint32_t value) {
         std::uint32_t old;
@@ -544,6 +571,27 @@ void VifStream::Word(std::uint32_t word) {
     data_index_ = 0;
     ++commands_;
     code_ = word;
+    recent_codes_[recent_at_ & 7] = word;
+    recent_from_[recent_at_ & 7] = g_dma_source;
+    ++recent_at_;
+    {
+        // PS2HOST_VIF_TRACE_AT=<hex address> (diagnosis): a VIFcode read from there, and the 6 after it, said with
+        // where each came from and the stream's STCYCL (the first 4 times).
+        static const std::uint32_t trace_at = [] {
+            const char* e = std::getenv("PS2HOST_VIF_TRACE_AT");
+            return e ? std::uint32_t(std::strtoul(e, nullptr, 16)) : 0u;
+        }();
+        static int tracing = 0, traces = 0;
+        if (trace_at && g_dma_source == trace_at && traces < 4) {
+            ++traces;
+            tracing = 7;
+        }
+        if (tracing > 0) {
+            --tracing;
+            std::fprintf(stderr, "[vif trace] %08X@%08X CL %u WL %u%s\n", unsigned(word), unsigned(g_dma_source),
+                         unsigned(cycle_length_), unsigned(write_length_), tracing == 0 ? " (end)" : "");
+        }
+    }
     const std::uint32_t command = (word >> 24) & 0x7F;
     ++by_command_[command];
     const std::uint32_t num = (word >> 16) & 0xFF;

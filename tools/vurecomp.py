@@ -492,7 +492,7 @@ HELD_WRITES = {"Load": (-2, -1), "Move": (-3, -1), "Mr32": (-3, -1), "Mfir": (-3
 
 
 def lower_writes(lines: list) -> list:
-    """(register, lanes) the lower's held write may land in, from its C++."""
+    """(register, lanes) the lower's held write may land in, from its C++ (a direct load's too: LoadNow)."""
     out = []
     for line in lines:
         line = line.strip()
@@ -500,7 +500,26 @@ def lower_writes(lines: list) -> list:
             if line.startswith("C::%s(v, pd, " % name):
                 args = line[len("C::%s(" % name):].rstrip(");").split(", ")
                 out.append((int(args[it]), int(args[dest].rstrip("u"))))
+        if line.startswith("C::LoadNow(v, cyc, "):
+            args = line[len("C::LoadNow("):].rstrip(");").split(", ")
+            out.append((int(args[-2]), int(args[-1].rstrip("u"))))
     return out
+
+
+def direct_loads(lower_lines: list, upper: int, upper_written: int) -> bool:
+    """Whether the pair's held write is a load alone (LQ, LQI, LQD: nothing else uses the Pending) into a VF the
+    upper neither reads nor writes - then it may land at once (LoadNow): held, it lands at the pair's end, after
+    the upper read its operands, where the upper's own fields win; with no upper read or write of that VF the
+    order cannot be seen."""
+    held = [line for line in lower_lines if "pd" in line]
+    if not held or not all(line.startswith("C::Load(v, pd, ") for line in held):
+        return False
+    upper_regs = {r for r, _ in upper_reads(upper)}
+    for line in held:
+        r = int(line[len("C::Load("):].rstrip(");").split(", ")[-2])
+        if r in upper_regs or r == upper_written:
+            return False
+    return True
 
 
 def needless_wait(r: int, lane: int, index: int, written: dict) -> bool:
@@ -661,6 +680,12 @@ def emit_pair(pc: int, lower: int, upper: int, mask: int, last: bool, index: int
         body.append("u32 branch = kNone;")
     body += lower_lines
     upper_lines, upper_written, lanes, set_flags = emit_upper(upper, clean)
+    if pending and direct_loads(lower_lines, upper, upper_written):
+        # The lower's only held write a load the upper never touches: straight into the register (LoadNow) -
+        # the same fields, ready at the same cycle - without the Pending and Finish's blend (2026-11-23).
+        body = [line.replace("C::Load(v, pd, ", "C::LoadNow(v, cyc, ") for line in body if line != "C::Pending pd;"]
+        lower_lines = [line.replace("C::Load(v, pd, ", "C::LoadNow(v, cyc, ") for line in lower_lines]
+        pending = False
     if no_flags and set_flags and not upper_lines[0].startswith("C::ClipJudge"):
         upper_lines = [line for line in upper_lines if not line.startswith("C::Flags<")]
         set_flags = False

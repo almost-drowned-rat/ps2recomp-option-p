@@ -13,7 +13,9 @@ if(NOT TARGET ps2platform)
         # high-resolution waitable timers); WaitOnAddress, timeBeginPeriod, the open-file dialog.
         target_compile_definitions(ps2platform PRIVATE _WIN32_WINNT=0x0A00 WINVER=0x0A00 _CRT_SECURE_NO_WARNINGS)
         target_link_libraries(ps2platform PRIVATE synchronization winmm comdlg32 gdi32 user32 ole32 advapi32)
-    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux" OR ANDROID)
+        # (Android: the same file - bionic has futex, clock_nanosleep and the AArch64 fiber switch; the differences
+        # are #ifdef __ANDROID__ inside)
         # Linux (agent L, 2026-11-21): fibers by a register switch, futex waits, SDL3's dialogs and sound; the
         # overlay's text by stb_truetype with the engine's Liberation Sans Bold (built in, as engine/host's).
         add_library(ps2platform STATIC ${CMAKE_CURRENT_LIST_DIR}/src/platform_linux.cpp
@@ -36,6 +38,9 @@ if(NOT TARGET ps2platform)
         find_package(Threads REQUIRED)
         # SDL3: the engine's own (engine/gpu's FetchContent; resolved when the build is generated).
         target_link_libraries(ps2platform PRIVATE SDL3::SDL3-static Threads::Threads)
+        if(ANDROID)
+            target_link_libraries(ps2platform PRIVATE log android)
+        endif()
     else()
         message(FATAL_ERROR "ps2platform: no platform layer for ${CMAKE_SYSTEM_NAME} yet - "
                             "src/platform_<system>.cpp implements include/ps2platform/platform.h and keys.h "

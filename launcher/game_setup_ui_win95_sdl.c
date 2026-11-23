@@ -682,8 +682,10 @@ static void command(XrSetupUi *ui, int id)
             ui->form_result = 1;
         break;
     case ID_QUIT:
-        ui->closed = ui->closed;        /* as WM_CLOSE */
-        if (!ui->in_form && !box(ui, SDL_MESSAGEBOX_INFORMATION, "The game is still being built. Stop and quit?", 1))
+        /* as WM_CLOSE: during the installation asked first (the maintainer 2026-11-23) - No goes on, Yes stops it
+           cleanly (launcher.c stop_build_tools); RECOMP_NO_DIALOGS=1 (the tests): Yes */
+        if (!ui->in_form && !ui->closed && !no_dialogs_env() &&
+            !box(ui, SDL_MESSAGEBOX_INFORMATION, "The installation is not finished. Quit anyway?", 1))
             break;
         ui->closed = 1;
         if (ui->in_form)
@@ -1186,8 +1188,8 @@ int xr_no_dialogs(void) { return no_dialogs_env(); }
 
 void xr_setup_ui_message(XrSetupUi *ui, int error, const char *msg)
 {
-    if (xr_no_dialogs())
-        return;
+    if (xr_no_dialogs() || (ui && ui->closed && !ui->in_form))
+        return;                         /* (the player quit during the installation: no "... failed" after it) */
     box(ui, error ? SDL_MESSAGEBOX_ERROR : SDL_MESSAGEBOX_WARNING, msg ? msg : "", 0);
 }
 

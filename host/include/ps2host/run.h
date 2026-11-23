@@ -329,6 +329,32 @@ void SetGsTraceFrame(long long frame);
    GPU has it) - to set beside another run's (engine/tools/gsmem.py). */
 void SetGsDumpFrame(long long frame);
 void FrameDone(u64 frame);
+/* GAME SPEED (devices.cpp) since the mark, in %: what the player sees (the maintainer 2026-11-22) - the share of
+   the time the game ran, a wait between two blanks longer than 1.5 of the console's (59.94 Hz) counted as
+   stopped (the owed blanks caught up after it do not make up for it), and never above the blanks taken a real
+   second against 59.94. False until a mark is set (the first call) or under --virtual-time. Moves the mark on. */
+struct GameSpeedMark {
+    u64 frames = 0, ns = 0, stall_ns = 0;
+};
+bool GameSpeed(GameSpeedMark* mark, double* percent);
+/* The game's own pictures (gpu_bridge.cpp: a frame whose shown buffer changed - a flip, as ARMSX2's "internal
+   FPS"): since the start, in the last window (ns), and the longest wait between two since this reader's last call
+   (reader 0 the overlay, 1 the log; a wait going on counts), in ms. The PERFORMANCE OVERLAY's FPS, SPEED (against
+   SetGamePictureRate) and FRAME TIME all come from them (the maintainer 2026-11-22: what the player sees - a game
+   that moves a step a picture slows with its pictures while its blanks go on). */
+u64 GamePictures();
+int GamePicturesInLast(u64 window_ns);
+double TakeLongestGamePictureGap(int reader);
+/* The pictures a second the game is made for (a port's; 59.94 unless set - a 30-FPS game sets 29.97). */
+void SetGamePictureRate(double per_second);
+double GamePictureRate();
+/* The PERFORMANCE OVERLAY's setting ("performance_overlay": off, fps, frametime, speed, fps+frametime,
+   fps+speed, frametime+speed, all - unset, the old "fps_counter"'s: on = fps, both = fps+frametime), and
+   whether it shows a part ("fps", "frametime", "speed"). window.cpp. */
+std::string SettingPerformanceOverlay();
+bool SettingOverlayShows(const char* part);
+/* One part of the overlay on or off (the menu's switches), the others kept. */
+void SetOverlayPart(const char* part, bool on);
 /* The window (window.cpp): opened with --window, presented each frame. */
 bool OpenWindow(const wchar_t* title, int width, int height);
 /* The game's name, for the window's title (instead of the host's own, "PS2
@@ -483,7 +509,7 @@ void UpdateSelectMenu();
    its next value (step 1) or the one before (-1), applied and saved. */
 struct PcSetting {
     std::string label, value, help;
-    std::string page;           // "" (the list), "POST PROCESSING" or "FRAME RATE": the panel's page it is on
+    std::string page;           // "" (the list), "POST PROCESSING" or "PERFORMANCE": the panel's page it is on
     bool restart = false;       // taken at the next start (RESTART NEEDED)
     std::vector<std::string> values;    // its values as shown (none for a line whose list is not fixed)
 };
@@ -702,6 +728,16 @@ void SetVuFastDefault(bool on);
    port defaults it off. */
 void SetFramePacingDefault(bool on);
 bool FramePacingDefault();
+/* FRAME PACING's four (the maintainer 2026-11-22; the "frame_pacing" setting, in the settings file only): where
+   the guest's vertical blank comes from - TIMER, the 59.94 Hz timer, or DISPLAY, every n-th blank of the display
+   itself (a 60 / 120 / 180 / 240 Hz one; a picture then stays exactly n refreshes) - and how the pictures go out -
+   PACED, evenly spaced (FrameDue), or IMMEDIATE, each as soon as it is done: timer+paced, timer+immediate,
+   display+paced, display+immediate. Unset or "auto": the best the device has - TIMER for now (DISPLAY held pictures on the Odin 2,
+   2026-11-22), paced as the port's default says (SetFramePacingDefault). The
+   old values: on = timer+paced, off = timer+immediate (option-p), timer / display = that source, paced (option-c). */
+std::string FramePacingSetting();           // one of the four, or "auto"
+bool FramePacingDisplaySource();            // DISPLAY wanted (auto: where it can be had)
+bool FramePacingPaced();
 /* SHADER COMPILE (the "shader_compile" setting: off / skip / wait / hybrid, hybrid unless chosen) handed to the
    renderer (ps2gpu::SetShaderCompileMode), at the start and when RECOMP OPTIONS changes it. */
 void ApplyShaderCompileSetting();
@@ -710,6 +746,10 @@ bool GpuBuildingShaders();
 /* ANISOTROPIC FILTER (the "anisotropic" setting: off / 2 / 4 / 8 / 16, off unless chosen) handed to the
    renderer (ps2gpu::SetAnisotropy), at the start and when RECOMP OPTIONS changes it. */
 void ApplyAnisotropySetting();
+/* TEXTURE FILTERING (the "texture_filtering" setting: accurate / fast / auto; a line on RENDERING, beside SHADER COMPILE / SHADER NOTICE): ACCURATE
+   the GS's own filter in the shader, bit for bit; FAST the GPU's sampler where it can (ps2gpu::SetTextureFiltering);
+   AUTO (unset) FAST on Android, ACCURATE elsewhere. At the start (the bridge's) and when the setting changes. */
+void ApplyTextureFilteringSetting();
 /* The GPU pipelines a game is known to draw with (the keys of a
    gpu_pipelines.txt a run kept beside its settings), made from the start in
    the background - none made in the middle of a player's first race

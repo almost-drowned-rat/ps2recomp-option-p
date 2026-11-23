@@ -10,7 +10,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -153,11 +155,27 @@ public:
         if (log && ++kicks_ % 60 == 0) {
             std::fprintf(stderr, "[gpu thread] last 60 frames, waits for the queue:");
             for (int i = 0; i < kWhys; ++i)
-                if (drains_[i]) std::fprintf(stderr, " %s %u", kWhyNames[i], drains_[i]);
+                if (drains_[i])
+                    std::fprintf(stderr, " %s %u (%.2f ms a frame)", kWhyNames[i], drains_[i], waited_ns_[i] / 60e6);
+            std::fprintf(stderr, "; the renderer's thread at work %.2f ms a frame", played_ns_.exchange(0) / 60e6);
+            static std::uint64_t queue_waited = 0;
+            const std::uint64_t q = QueueWaitNanoseconds();
+            static std::uint64_t gpu_waited = 0;
+            const std::uint64_t g = GpuWaitNanoseconds();
+            std::fprintf(stderr, " (waiting for the queue's lock %.2f ms, for the GPU %.2f ms of it)", (q - queue_waited) / 60e6,
+                         (g - gpu_waited) / 60e6);
+            queue_waited = q;
+            gpu_waited = g;
+            std::fprintf(stderr, "; handing pictures to the window %.2f ms a frame", display_ns_.exchange(0) / 60e6);
+            static std::uint64_t stand_ins_before = 0;
+            const std::uint64_t si = ShaderStandIns();
+            std::fprintf(stderr, "; pipeline stand-ins / waits %llu", (unsigned long long)(si - stand_ins_before));
+            stand_ins_before = si;
             const unsigned wrong = wrong_.exchange(0);
             if (wrong) std::fprintf(stderr, "; %u write-backs answered wrong", wrong);
             std::fprintf(stderr, "\n");
             std::memset(drains_, 0, sizeof drains_);
+            std::memset(waited_ns_, 0, sizeof waited_ns_);
         }
     }
     // Answered from what the queue has made by then (the images known),
@@ -364,6 +382,18 @@ public:
         Drain(10);
         return inner_->DisplayTarget(fbp, fbw, psm, image, layout, width, height);
     }
+    void DisplayTargetThen(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
+                           std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)> then) override {
+        // The call itself in the queue (its function by pointer, freed where it is played), handed over now: the
+        // frame's end, as Kick.
+        DisplayThen* call = new DisplayThen(std::move(then));
+        const std::uint32_t args[3] = {fbp, fbw, psm};
+        Op(kDisplayThen, sizeof args + sizeof call);
+        Put(args, sizeof args);
+        Put(&call, sizeof call);
+        End();
+        Submit();
+    }
     bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm, std::vector<std::uint32_t>* pixels,
                     std::uint32_t* width, std::uint32_t* height) override {
         Drain(11);
@@ -380,8 +410,9 @@ private:
         kDraw, kDrawSame, kFlush, kKick, kUploadTexture, kUseReplacement, kUploadDepth, kUploadTarget,
         kReleaseTexture, kMemoryWrite, kMemoryPatch, kTargetFromMemory, kDepthFromMemory, kTextureFromMemory,
         kClutFromMemory, kClutRows, kReloadKeepsColour, kTargetRowsFromMemory, kDepthRowsFromMemory,
-        kTargetToMemory, kDepthToMemory, kChannelShuffle, kClutVersion,
+        kTargetToMemory, kDepthToMemory, kChannelShuffle, kClutVersion, kDisplayThen,
     };
+    using DisplayThen = std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)>;
     // The images the queue has made by its end, as VulkanGsRenderer makes
     // them: a target by (FBP, FBW, PSM) at the size first asked for, a depth
     // buffer by (ZBP, width, height); all dropped by a new scale.
@@ -422,7 +453,10 @@ private:
             // rather than queue a frame after another without end.
             if (full_.size() >= kAhead) {
                 ++drains_[kWhys - 1];
+                const auto from = std::chrono::steady_clock::now();
                 drained_.wait(hold, [this] { return full_.size() < kAhead; });
+                waited_ns_[kWhys - 1] += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - from).count());
             }
             full_.push_back(std::move(open_));
             if (!spare_.empty()) {
@@ -440,8 +474,11 @@ private:
     void Drain(int why = kWhys - 1) const {
         ++drains_[why];
         Submit();
+        const auto from = std::chrono::steady_clock::now();
         std::unique_lock<std::mutex> hold(lock_);
         drained_.wait(hold, [this] { return full_.empty() && !busy_; });
+        waited_ns_[why] += std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - from).count());
     }
 
     void Run() {
@@ -453,7 +490,10 @@ private:
             full_.pop_front();
             busy_ = true;
             hold.unlock();
+            const auto from = std::chrono::steady_clock::now();
             Play(chunk);
+            played_ns_.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
             chunk.clear();
             hold.lock();
             spare_.push_back(std::move(chunk));
@@ -474,15 +514,37 @@ private:
         const std::uint8_t* at = chunk.data();
         const std::uint8_t* const end = at + chunk.size();
         GsRenderer& r = *inner_;
+        // PS2HOST_GPU_SLOW_OPS: an op that took longer than 50 ms said (which, how long) - the boss fight's
+        // occasional half-second stall (2026-11-22).
+        // (Its own switch, PS2HOST_GPU_SLOW_OPS: two clock reads an op cost the renderer a third of its time on the
+        // Odin 2, whose clock_gettime is ~1.5 us - the thread log must not measure itself, 2026-11-22.)
+        static const bool slow_log = std::getenv("PS2HOST_GPU_SLOW_OPS") != nullptr;
         while (at < end) {
             const std::uint32_t op = Take<std::uint32_t>(at);
             const std::uint32_t size = Take<std::uint32_t>(at);
             const std::uint8_t* const next = at + size;
+            const auto op_from = slow_log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            struct SlowOp {
+                bool on;
+                std::uint32_t op;
+                std::chrono::steady_clock::time_point from;
+                ~SlowOp() {
+                    if (!on) return;
+                    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - from).count();
+                    if (ms > 50.0) std::fprintf(stderr, "[gpu thread] op %u took %.1f ms\n", unsigned(op), ms);
+                }
+            } slow_op{slow_log, op, op_from};
             switch (op) {
                 case kDraw:
                 case kDrawSame: {
                     if (op == kDraw) std::memcpy(&played_, at, sizeof played_), at += sizeof played_;
                     const std::uint32_t n = Take<std::uint32_t>(at);
+                    // Read where they lie in the chunk when aligned (every op's size is whole words: always) -
+                    // a copy of every vertex was a tenth of this thread (ZOE's boss fight, 2026-11-22).
+                    if (reinterpret_cast<std::uintptr_t>(at) % alignof(GsVertex) == 0) {
+                        r.DrawTriangles(played_, reinterpret_cast<const GsVertex*>(at), n);
+                        break;
+                    }
                     vertices_.resize(n);
                     std::memcpy(vertices_.data(), at, n * sizeof(GsVertex));
                     r.DrawTriangles(played_, vertices_.data(), n);
@@ -490,6 +552,25 @@ private:
                 }
                 case kFlush: r.Flush(); break;
                 case kKick: r.Kick(); break;
+                case kDisplayThen: {
+                    const auto display_from = std::chrono::steady_clock::now();   // (a picture's: a clock read a frame)
+                    struct DisplayTimed {
+                        std::chrono::steady_clock::time_point from;
+                        std::atomic<std::uint64_t>* sum;
+                        ~DisplayTimed() {
+                            sum->fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                               std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed);
+                        }
+                    } display_timed{display_from, &display_ns_};
+                    const auto fbp = Take<std::uint32_t>(at), fbw = Take<std::uint32_t>(at), psm = Take<std::uint32_t>(at);
+                    std::unique_ptr<DisplayThen> then(Take<DisplayThen*>(at));
+                    std::uint64_t image = 0;
+                    int layout = 0;
+                    std::uint32_t w = 0, h = 0;
+                    const bool ok = r.DisplayTarget(fbp, fbw, psm, &image, &layout, &w, &h);
+                    (*then)(ok, image, layout, w, h);
+                    break;
+                }
                 case kUploadTexture: {
                     const auto key = Take<std::uint64_t>(at);
                     const auto w = Take<std::uint32_t>(at), h = Take<std::uint32_t>(at);
@@ -614,6 +695,9 @@ private:
         "TargetToMemory", "DepthToMemory", "ReadDepth", "ReadTexture", "DisplayTarget", "ReadTarget",
         "ReadTargetFull", "queue full"};
     mutable unsigned drains_[kWhys] = {};
+    mutable std::uint64_t waited_ns_[kWhys] = {};       // the caller's time in those waits
+    std::atomic<std::uint64_t> played_ns_{0};
+    std::atomic<std::uint64_t> display_ns_{0};          // of it in kDisplayThen (the picture handed to the window)           // the renderer's thread in Play
     unsigned kicks_ = 0;
     // The caller's side.
     mutable Bytes open_;

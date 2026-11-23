@@ -24,13 +24,25 @@
 #if defined(__SSE2__) || defined(_M_X64) || (defined(_M_IX86_FP) && _M_IX86_FP >= 2)
 #include <emmintrin.h>
 #define PS2RT_VU_SSE 1
+#define PS2RT_VU_SSE2NEON 0
+#elif (defined(__aarch64__) || defined(_M_ARM64)) && !defined(PS2RT_NO_SSE2NEON)
+/* AArch64 (Android, agent L 2026-11-21): the same four-lane paths, their SSE intrinsics as NEON by sse2neon (MIT,
+   v1.8.0, include/sse2neon - LICENSES/sse2neon-MIT.txt). The scalar forms were ~30 % of VU1's and the EE's time on
+   an Odin 2 (Snapdragon 8 Gen 2). The rounding: the callers set it by ps2rt/fp_mode.h (FPCR: toward zero, FZ - FZ
+   flushes operands and results, as DAZ + FTZ), not by sse2neon's _mm_setcsr (the rounding only). */
+#include "sse2neon/sse2neon.h"
+#define PS2RT_VU_SSE 1
+#define PS2RT_VU_SSE2NEON 1
 #else
 #define PS2RT_VU_SSE 0
+#define PS2RT_VU_SSE2NEON 0
 #endif
 /* SSE4.1 (pminud): every x86-64 processor a Vulkan port runs on has it; MSVC
    takes its intrinsics without /arch, and other compilers say so with
    __SSE4_1__. */
-#if PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
+#if PS2RT_VU_SSE2NEON
+#define PS2RT_VU_SSE41 1            /* (sse2neon has _mm_min_epu32 and the rest) */
+#elif PS2RT_VU_SSE && (defined(__SSE4_1__) || defined(_M_X64))
 #include <smmintrin.h>
 #define PS2RT_VU_SSE41 1
 #else
@@ -277,24 +289,29 @@ PS2RT_VU_INLINE double Ext(u32 bits) {
 }
 // A double as the unit's number: truncated (toward zero) or rounded to nearest (ties to even), whatever the
 // host's rounding mode; past exponent 255 saturated, below the smallest normal a zero of its sign.
+// (From the double's own bits since 2026-11-23: frexp, ldexp, floor and fmod were 2.2 % of VIF1's worker in ZOE's
+// boss fight, as efu::Exact + ldexp. The same numbers: the 24 bits kept are the leading 1 and the top 23 of the
+// double's 52, the 29 below them the rest - over half, or half with the kept bits odd, rounds up.)
 PS2RT_VU_INLINE u32 Narrow(double number, bool nearest) {
-    if (number != number) return 0x7FFFFFFFu;
-    const u32 sign = std::signbit(number) ? kSign : 0u;
-    const double magnitude = std::fabs(number);
-    if (magnitude < 1.1754943508222875e-38) return sign;
-    int e;
-    const double fraction = std::frexp(magnitude, &e);                 // magnitude = fraction * 2^e, [0.5, 1)
-    const double mantissa = std::ldexp(fraction, 24);                  // 2^23 .. 2^24
-    double whole = std::floor(mantissa);
+    std::uint64_t bits;
+    std::memcpy(&bits, &number, 8);
+    const int field = int((bits >> 52) & 0x7FFu);
+    const std::uint64_t mantissa = bits & 0xFFFFFFFFFFFFFull;
+    if (field == 0x7FF && mantissa) return 0x7FFFFFFFu;                // NaN
+    const u32 sign = (bits >> 63) ? kSign : 0u;
+    if (field == 0x7FF) return sign | 0x7FFFFFFFu;                      // infinity: saturated
+    int exponent = field - 1023;
+    if (field == 0 || exponent < -126) return sign;  // below the smallest normal (2^-126): a zero of its sign
+    u32 whole = 0x800000u | u32(mantissa >> 29);                        // 2^23 .. 2^24 - 1
     if (nearest) {
-        const double rest = mantissa - whole;
-        if (rest > 0.5 || (rest == 0.5 && std::fmod(whole, 2.0) != 0.0)) whole += 1.0;
-        if (whole >= 16777216.0) {
-            whole = 8388608.0;
-            ++e;
+        const std::uint64_t rest = mantissa & 0x1FFFFFFFull, half = 0x10000000ull;
+        if (rest > half || (rest == half && (whole & 1u))) ++whole;
+        if (whole == 0x1000000u) {
+            whole = 0x800000u;
+            ++exponent;
         }
     }
-    const int biased = e - 1 + 127;
+    const int biased = exponent + 127;
     if (biased > 255) return sign | 0x7FFFFFFFu;
     if (biased < 1) return sign;
     return sign | (u32(biased) << 23) | (u32(whole) & 0x7FFFFFu);

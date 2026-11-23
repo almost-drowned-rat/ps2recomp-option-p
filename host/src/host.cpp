@@ -34,6 +34,9 @@
 
 namespace ps2host {
 
+bool g_planned_stop = false;   // PlannedStop
+
+
 /* --gs-replay <file> <dir>: a GS stream (engine/tools/pcsx2dump.py's, from a
    PCSX2 GS dump) through the GS model alone: local memory and registers set,
    then GIF packets, privileged registers and vertical blanks in turn - each
@@ -174,6 +177,7 @@ int GsReplay(const std::string& file, const std::string& out) {
         }
         const char* scale = std::getenv("PS2HOST_REPLAY_SCALE");
         if (scale) GpuSetScale(std::max(1.0, std::atof(scale)));     // a factor on the lines: 1, 1.75, 2 ...
+        else if (std::getenv("PS2HOST_REPLAY_SCALE_XY")) GpuSetScale(1.0);    // (WantedScale reads the two factors)
         if (g.on_memory) g.on_memory(0, 16384, true);       // local memory as the dump has it, on the GPU too
     }
     std::FILE* trace = std::fopen((out + "/trace.txt").c_str(), "w");
@@ -523,6 +527,27 @@ void SetVuFastDefault(bool on) { g_vu_fast_default = on; }
 bool g_frame_pacing_default = true;
 void SetFramePacingDefault(bool on) { g_frame_pacing_default = on; }
 bool FramePacingDefault() { return g_frame_pacing_default; }
+
+std::string FramePacingSetting() {
+    const std::string v = Setting("frame_pacing", "auto");
+    if (v == "timer+paced" || v == "timer+immediate" || v == "display+paced" || v == "display+immediate") return v;
+    if (v == "on" || v == "timer") return "timer+paced";
+    if (v == "off") return "timer+immediate";
+    if (v == "display") return "display+paced";
+    return "auto";
+}
+
+bool FramePacingDisplaySource() {
+    // auto: the timer for now - the display's source showed pictures held 0.1-0.5 s on the Odin 2 while the game ran
+    // on (the maintainer saw it, 2026-11-22; under investigation). display+paced / display+immediate by hand only.
+    const std::string v = FramePacingSetting();
+    return v.rfind("display", 0) == 0;
+}
+
+bool FramePacingPaced() {
+    const std::string v = FramePacingSetting();
+    return v == "auto" ? g_frame_pacing_default : v.size() > 6 && v.compare(v.size() - 6, 6, "+paced") == 0;
+}
 
 Stats& RunStats() {
     static Stats stats;
@@ -953,6 +978,7 @@ int Run(const Options& options) {
             outcome = "stopped: the time limit, between threads (no thread was in a loop)";
         if (abort.reason == 2 && UntilFrameReached())
             outcome = "stopped: frame " + std::to_string(options.until_frame) + " reached (--until-frame)";
+        g_planned_stop = abort.reason == 2 && (watchdog.fired || UntilFrameReached());
     }
     // The GS takes what it was sent before the report reads it.
     try {
@@ -964,6 +990,8 @@ int Run(const Options& options) {
     Report(options, outcome);
     return code;
 }
+
+bool PlannedStop() { return g_planned_stop; }
 
 int Main(int argc, char** argv) {
     // PS2HOST_CORES=N: the process held to its first N logical cores from

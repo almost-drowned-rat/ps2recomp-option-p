@@ -358,8 +358,10 @@ static LRESULT CALLBACK window_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_CLOSE:
-        if (!ui->in_form &&
-            MessageBoxW(hwnd, L"The game is still being built. Stop and quit?", ui->title,
+        /* during the installation: asked first (the maintainer 2026-11-23) - No goes on, Yes stops it cleanly
+           (launcher.c stop_build_tools); RECOMP_NO_DIALOGS=1 (the tests): Yes */
+        if (!ui->in_form && !ui->closed && !xr_no_dialogs() &&
+            MessageBoxW(hwnd, L"The installation is not finished. Quit anyway?", ui->title,
                         MB_YESNO | MB_ICONQUESTION) != IDYES)
             return 0;
         ui->closed = 1;
@@ -627,8 +629,8 @@ int xr_no_dialogs(void)
 void xr_setup_ui_message(XrSetupUi *ui, int error, const char *msg)
 {
     wchar_t w[2048];
-    if (xr_no_dialogs())
-        return;
+    if (xr_no_dialogs() || (ui && ui->closed && !ui->in_form))
+        return;                         /* (the player quit during the installation: no "... failed" after it) */
     widen(msg, w, 2048);
     MessageBoxW(ui && ui->win ? ui->win : NULL, w, ui ? ui->title : L"Setup",
                 MB_OK | (error ? MB_ICONSTOP : MB_ICONWARNING));

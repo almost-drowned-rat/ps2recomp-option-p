@@ -121,6 +121,22 @@ public:
     }
     bool fps_toggle_ = false;
     double PresentsPerSecond() const override { return fps_.load(); }
+    std::uint64_t PresentCount() const override { return present_count_.load(std::memory_order_relaxed); }
+    double TakeLongestPresentGap() override { return longest_gap_.exchange(0.0); }
+    double TakeLongestFrame() override { return longest_frame_.exchange(0.0); }
+    int PresentsLastSecond() const override {
+        std::lock_guard<std::mutex> hold(pacing_lock_);
+        const auto now = std::chrono::steady_clock::now();
+        if (present_times_.empty() || now - first_present_ < std::chrono::seconds(1)) return -1;
+        int n = 0;
+        for (auto it = present_times_.rbegin(); it != present_times_.rend() && now - *it <= std::chrono::seconds(1); ++it) ++n;
+        return n;
+    }
+    std::deque<std::chrono::steady_clock::time_point> present_times_;     // the last second's (pacing_lock_)
+    std::chrono::steady_clock::time_point first_present_{};
+    std::atomic<double> longest_frame_{0.0};
+    std::atomic<std::uint64_t> present_count_{0};
+    std::atomic<double> longest_gap_{0.0};
     std::atomic<double> fps_{0.0};
     std::chrono::steady_clock::time_point fps_since_{};
     std::uint64_t fps_presents_ = 0;
@@ -323,6 +339,12 @@ private:
     void UpdateCursor();
     VkInstance instance_ = VK_NULL_HANDLE;
     VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+    /* Android: the app in the background (Home, Back, another app) - its window's surface taken away: the swapchain
+       and the Vulkan surface are let go and nothing is presented until it comes back (Pump; under present_lock_) */
+    bool background_ = false;
+    bool extent_from_window_ = false;          // the swapchain sized by SDL's window (a turned panel: CreateSwapchain)
+    std::atomic<bool> foreground_{false};     // back from the background: a new surface at the next present
+    static bool SDLCALL LifeCycle(void* self, SDL_Event* e);
     VkPhysicalDevice gpu_ = VK_NULL_HANDLE;
     VkDevice device_ = VK_NULL_HANDLE;
     std::uint32_t family_ = 0;
@@ -338,6 +360,8 @@ private:
     // (with one, every present waited for all the GPU had been given - the
     // GS thread, which presents, in step with the GPU once a vertical blank).
     static constexpr int kInFlight = 3;
+    int lag_index_ = -1;                        // PS2HOST_PRESENT_LAG: the picture submitted, shown at the next turn
+    VkFence lag_fence_ = VK_NULL_HANDLE;
     VkCommandBuffer cmds_[kInFlight] = {};
     VkSemaphore acquireds_[kInFlight] = {};
     VkFence fences_[kInFlight] = {};
@@ -358,7 +382,7 @@ private:
     double stamp_ns_ = 0;
     bool stamp_tried_ = false;
     bool present_stamped_[kInFlight] = {};
-    bool copy_stamped_[3] = {};
+    bool copy_stamped_[5] = {};
     void EnsureStamps();
     void TakeStamp(std::uint32_t first, std::atomic<std::uint64_t>& into);
     int slot_ = 0;
@@ -527,9 +551,13 @@ private:
     void RecordSmaa(VkImage source, std::uint32_t width, std::uint32_t height);
     void DestroySmaa();
     std::string describe_, error_;
-    // PresentImageAt's pictures: copies of the frames' targets, three, each
-    // its copy's command buffer and fence (the GS thread's own pool).
-    static constexpr int kPaced = 3;
+    // PresentImageAt's pictures: copies of the frames' targets, five, each
+    // its copy's command buffer and fence (the GS thread's own pool). Three
+    // were too few where the GPU is the limit (an Odin 2 in ZOE's boss
+    // fight): pictures came while all three waited or were shown, and the
+    // oldest lost its turn - 303 of 1,651 frames dropped, 160 with five
+    // (shown 45 -> 50 a second); agent L, 2026-11-22.
+    static constexpr int kPaced = 5;
     struct PacedPicture {
         VkImage image = VK_NULL_HANDLE;
         VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -550,7 +578,7 @@ private:
     std::thread present_thread_;
     std::mutex present_lock_;               // the swapchain and cmds_: the present thread, or Present
     // Present times (TakePacing): intervals since the last take.
-    std::mutex pacing_lock_;
+    mutable std::mutex pacing_lock_;
     std::chrono::steady_clock::time_point last_present_{};
     std::uint64_t presents_ = 0;
     double interval_sum_ = 0, interval_squares_ = 0, interval_longest_ = 0;
@@ -616,7 +644,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
         std::fprintf(stderr, "[window] %d controller(s) plugged in, %d of them with a known layout\n", joysticks,
                      gamepads);
     }
-    if (!Check(volkInitialize(), "volkInitialize (is there a Vulkan driver?)")) return false;
+    if (!Check(LoadVulkan(), "volkInitialize (is there a Vulkan driver?)")) return false;
     window_ = SDL_CreateWindow(title, width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
     if (!window_) {
         error_ = std::string("SDL_CreateWindow: ") + SDL_GetError();
@@ -635,6 +663,9 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     ici.ppEnabledExtensionNames = extensions;
     if (!Check(vkCreateInstance(&ici, nullptr, &instance_), "vkCreateInstance")) return false;
     volkLoadInstance(instance_);
+#ifdef __ANDROID__
+    SDL_AddEventWatch(LifeCycle, this);
+#endif
     if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
         error_ = std::string("SDL_Vulkan_CreateSurface: ") + SDL_GetError();
         return false;
@@ -683,7 +714,7 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     qci.queueFamilyIndex = family_;
     qci.queueCount = 1;
     qci.pQueuePriorities = &priority;
-    const char* device_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
+    std::vector<const char*> device_extensions = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     // What the GS renderer needs, for when it draws on this device
     // (SharedGpu): dynamic rendering, and dual-source blending if there is any.
     VkPhysicalDeviceFeatures supported;
@@ -697,14 +728,19 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
     features.features.dualSrcBlend = supported.dualSrcBlend;
     features.features.logicOp = supported.logicOp;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
+    features.features.samplerAnisotropy = supported.samplerAnisotropy;           // TEXTURE FILTERING FAST
     features.pNext = &v13;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT f3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    const bool dynamic_blend = OfferDynamicBlend(gpu_, &f3, &device_extensions);
+    if (dynamic_blend) v13.pNext = &f3;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = 1;
-    dci.ppEnabledExtensionNames = device_extensions;
+    dci.enabledExtensionCount = std::uint32_t(device_extensions.size());
+    dci.ppEnabledExtensionNames = device_extensions.data();
     if (!Check(vkCreateDevice(gpu_, &dci, nullptr, &device_), "vkCreateDevice")) return false;
+    g_dynamic_blend = dynamic_blend;
     // Device functions stay the loader's: see gpu.cpp.
     vkGetDeviceQueue(device_, family_, 0, &queue_);
 
@@ -733,12 +769,26 @@ bool VulkanDisplay::Init(const char* title, int width, int height) {
 }
 
 bool VulkanDisplay::CreateSwapchain() {
+    lag_index_ = -1;                            // (an image of the old swapchain: not shown)
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(gpu_, surface_, &caps);
     int w = 0, h = 0;
     SDL_GetWindowSizeInPixels(window_, &w, &h);
     extent_ = caps.currentExtent.width != 0xFFFFFFFFu ? caps.currentExtent
               : VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
+    // A display mounted turned (Android: the Odin 2 Portal's panel is portrait, the game always landscape): the
+    // surface reports a 90/270 degree transform. The picture is drawn upright at the window's own size (SDL's, in
+    // pixels - the surface's extent can be either way round) and the compositor turns it (preTransform identity):
+    // with the reported transform it came out turned, with a swapped extent squashed (Odin, 2026-11-21).
+    VkSurfaceTransformFlagBitsKHR transform = caps.currentTransform;
+    if (transform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR &&
+        (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR)) {
+        if (w > 0 && h > 0) extent_ = VkExtent2D{std::uint32_t(w), std::uint32_t(h)};
+        transform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+        extent_from_window_ = true;
+    } else {
+        extent_from_window_ = false;
+    }
     if (extent_.width == 0 || extent_.height == 0) return true;      // minimised: nothing to show
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         error_ = "the swapchain cannot be a transfer destination";
@@ -786,7 +836,7 @@ bool VulkanDisplay::CreateSwapchain() {
     sci.imageArrayLayers = 1;
     sci.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     sci.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    sci.preTransform = caps.currentTransform;
+    sci.preTransform = transform;
     sci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     sci.presentMode = mode_;
     sci.clipped = VK_TRUE;
@@ -900,11 +950,52 @@ void Barrier(VkCommandBuffer cmd, VkImage image, VkImageLayout from, VkImageLayo
     vkCmdPipelineBarrier(cmd, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
 }
 
+/* Android's life cycle (an event watch: SDL sends these from Android's own thread, at once - the event loop may be
+   blocked while paused): Home / Back / another app take the window's surface away, so the swapchain and the Vulkan
+   surface are let go first; back in the foreground the next present makes new ones (the picture stayed black). */
+bool SDLCALL VulkanDisplay::LifeCycle(void* self, SDL_Event* e) {
+    VulkanDisplay* d = static_cast<VulkanDisplay*>(self);
+    if (e->type == SDL_EVENT_WILL_ENTER_BACKGROUND || e->type == SDL_EVENT_DID_ENTER_BACKGROUND) {
+        std::lock_guard<std::mutex> hold(d->present_lock_);
+        if (!d->background_) {
+            d->background_ = true;
+            d->foreground_ = false;
+            d->DestroySwapchain();
+            if (d->surface_) vkDestroySurfaceKHR(d->instance_, d->surface_, nullptr);
+            d->surface_ = VK_NULL_HANDLE;
+            std::fprintf(stderr, "[display] in the background: the surface let go\n");
+        }
+    } else if (e->type == SDL_EVENT_DID_ENTER_FOREGROUND) {
+        d->foreground_ = true;
+    }
+    return true;
+}
+
 bool VulkanDisplay::BeginPresent(std::uint32_t* index, bool* ok) {
     *ok = true;
     if (closed_) {
         *ok = false;
         return false;
+    }
+    if (background_ && foreground_.exchange(false)) {  // (Android: back - the window's new surface)
+        if (SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
+            background_ = false;
+            stale_ = true;
+            std::fprintf(stderr, "[display] back in the foreground: a new surface\n");
+        } else {
+            surface_ = VK_NULL_HANDLE;
+            foreground_ = true;                     // (its window not there yet: again at the next present)
+        }
+    }
+    if (background_ || !surface_) return false;        // (Android, in the background: nothing to show on)
+    if (extent_from_window_ && swapchain_) {
+        // Sized by the window, not the surface: a new window size (Android at the start: 1920x914 with the bars, then
+        // 1920x1080 once they are hidden) need not give OUT_OF_DATE - a swapchain of the first size would stay.
+        // Checked each present (a cached value of SDL's), besides the resize event.
+        int w = 0, h = 0;
+        if (SDL_GetWindowSizeInPixels(window_, &w, &h) && w > 0 && h > 0 &&
+            (std::uint32_t(w) != extent_.width || std::uint32_t(h) != extent_.height))
+            stale_ = true;
     }
     if (stale_ && !CreateSwapchain()) {
         *ok = false;
@@ -999,6 +1090,17 @@ void VulkanDisplay::DrawOverlay(VkImage target) {
                     std::size_t(overlay_width_) * overlay_height_ * 4);
         overlay_slot_generation_[slot_] = overlay_generation_;
     }
+    // After the picture's blit into the same image: two transfer writes over the same pixels need a barrier to keep
+    // their order (Turnip ran them together and the blit covered the FPS counter; the Adreno driver kept the order)
+    VkImageMemoryBarrier after{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    after.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    after.oldLayout = after.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    after.srcQueueFamilyIndex = after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    after.image = target;
+    after.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                         nullptr, 1, &after);
     VkBufferImageCopy copy{};
     copy.bufferOffset = offset;
     copy.bufferRowLength = overlay_width_;
@@ -2137,6 +2239,17 @@ bool VulkanDisplay::FinishPresent(std::uint32_t index, VkImage source, std::uint
     const VkClearColorValue black{};
     const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     vkCmdClearColorImage(cmd_, target, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    {   // the clear before the picture's blit over it: ordered by a barrier (Turnip ran them together - black bands)
+        VkImageMemoryBarrier cleared{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+        cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        cleared.oldLayout = cleared.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        cleared.srcQueueFamilyIndex = cleared.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        cleared.image = target;
+        cleared.subresourceRange = all;
+        vkCmdPipelineBarrier(cmd_, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0,
+                             nullptr, 1, &cleared);
+    }
     // 4:3 as a television shows it, 16:9, or the window's own shape (SetAspect),
     // centred in the window.
     std::int32_t w = std::int32_t(extent_.width), h = std::int32_t(extent_.height);
@@ -2574,9 +2687,74 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
     present.pImageIndices = &index;
     VkResult r;
     {
+        // PS2HOST_HITCH: the queue held longer than 4 ms by this submit + present (the renderer waits for it - one
+        // queue on Turnip), and which of the two took it.
+        static const bool hitch = std::getenv("PS2HOST_HITCH") != nullptr;
+        // The picture's copy waited for here, outside the queue's lock, and handed to present with nothing to wait
+        // on: given the semaphore, Turnip's Android present waited on the CPU for all the GPU had queued - ~20 ms
+        // a picture with the one queue locked, the renderer unable to submit meanwhile (the boss fight's present
+        // held the queue 18-20 ms every frame, 2026-11-22). PS2HOST_PRESENT_SEMAPHORE=1: as before.
+        // (Tried 2026-11-22: the picture's turn then waited for all the GPU had queued before its copy - 27-33
+        // pictures a second on the Odin. Kept behind PS2HOST_PRESENT_FENCE=1 for experiments; the semaphore is
+        // the default.)
+        static const bool semaphore = std::getenv("PS2HOST_PRESENT_FENCE") == nullptr &&
+                                      std::getenv("PS2HOST_PRESENT_LAG") == nullptr;
+        // PS2HOST_PRESENT_LAG=1: a picture behind - this one's copy submitted (nothing to signal), the one before
+        // presented with nothing to wait on (its copy done by now: its fence waited outside the lock, at once as a
+        // rule). The queue held for the present call alone; a picture (16.7 ms) more latency.
+        static const bool lag = std::getenv("PS2HOST_PRESENT_LAG") != nullptr;
+        if (lag) {
+            submit.signalSemaphoreCount = 0;
+            {
+                std::lock_guard<std::mutex> hold(g_queue_lock);
+                if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+            }
+            r = VK_SUCCESS;
+            const int behind = lag_index_;
+            const VkFence behind_fence = lag_fence_;
+            lag_index_ = int(index);
+            lag_fence_ = fence_;
+            if (behind < 0) return true;                // the first: nothing to show yet
+            vkWaitForFences(device_, 1, &behind_fence, VK_TRUE, UINT64_MAX);
+            std::uint32_t shown = std::uint32_t(behind);
+            present.waitSemaphoreCount = 0;
+            present.pImageIndices = &shown;
+            const auto locking = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> hold(g_queue_lock);
+            const auto locked = std::chrono::steady_clock::now();
+            r = vkQueuePresentKHR(queue_, &present);
+            if (hitch) {
+                const double held = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - locked).count();
+                if (held > 4.0)
+                    std::fprintf(stderr, "[hitch] queue held %.1f ms by a present (lag; waited %.1f for it)\n", held,
+                                 std::chrono::duration<double, std::milli>(locked - locking).count());
+            }
+        } else if (!semaphore) {
+            submit.signalSemaphoreCount = 0;
+            present.waitSemaphoreCount = 0;
+            {
+                std::lock_guard<std::mutex> hold(g_queue_lock);
+                if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+            }
+            vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+        }
+        if (!lag) {
+        const auto locking = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> hold(g_queue_lock);
-        if (!Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+        const auto locked = std::chrono::steady_clock::now();
+        if (semaphore && !Check(vkQueueSubmit(queue_, 1, &submit, fence_), "vkQueueSubmit")) return false;
+        const auto submitted = std::chrono::steady_clock::now();
         r = vkQueuePresentKHR(queue_, &present);
+        if (hitch) {
+            const auto done = std::chrono::steady_clock::now();
+            const double held = std::chrono::duration<double, std::milli>(done - locked).count();
+            if (held > 4.0)
+                std::fprintf(stderr, "[hitch] queue held %.1f ms by a present (submit %.1f, present %.1f; waited %.1f for it)\n",
+                             held, std::chrono::duration<double, std::milli>(submitted - locked).count(),
+                             std::chrono::duration<double, std::milli>(done - submitted).count(),
+                             std::chrono::duration<double, std::milli>(locked - locking).count());
+        }
+        }
     }
     if (shot_buffer_) ShotWrite();
     {
@@ -2588,13 +2766,22 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             interval_sum_ += ms;
             interval_squares_ += ms * ms;
             interval_longest_ = std::max(interval_longest_, ms);
+            if (ms > longest_gap_.load(std::memory_order_relaxed)) longest_gap_.store(ms, std::memory_order_relaxed);
+            if (ms > longest_frame_.load(std::memory_order_relaxed)) longest_frame_.store(ms, std::memory_order_relaxed);
             static const bool hitch = std::getenv("PS2HOST_HITCH") != nullptr;
             if (hitch && ms > 25.0)
                 std::fprintf(stderr, "[hitch] present: %.1f ms since the last\n", ms);
         }
         last_present_ = now;
         // The FPS counter's: presents counted over half a second at a time.
-        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) ++fps_presents_;
+        if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
+            ++fps_presents_;
+            present_count_.fetch_add(1, std::memory_order_relaxed);
+            if (present_times_.empty() && first_present_ == std::chrono::steady_clock::time_point{}) first_present_ = now;
+            present_times_.push_back(now);
+            while (!present_times_.empty() && now - present_times_.front() > std::chrono::milliseconds(1100))
+                present_times_.pop_front();
+        }
         const double counted = std::chrono::duration<double>(now - fps_since_).count();
         if (counted >= 0.5) {
             fps_.store(fps_since_.time_since_epoch().count() ? fps_presents_ / counted : 0.0);
@@ -2602,8 +2789,12 @@ bool VulkanDisplay::Submit(std::uint32_t index) {
             fps_since_ = now;
         }
     }
-    if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) stale_ = true;
-    else if (!Check(r, "vkQueuePresentKHR")) return false;
+    // SUBOPTIMAL from a swapchain sized by the window (a turned panel, IDENTITY rather than the surface's own
+    // transform: CreateSwapchain) is what it is made as - it said so at every present, and a new swapchain each frame
+    // (a vkDeviceWaitIdle under the queue's lock each time) held the renderer's thread ~70 % of the time on an Odin 2
+    // (agent L, 2026-11-21). A new window size is seen by BeginPresent's check and the resize event.
+    if (r == VK_ERROR_OUT_OF_DATE_KHR || (r == VK_SUBOPTIMAL_KHR && !extent_from_window_)) stale_ = true;
+    else if (r != VK_SUBOPTIMAL_KHR && !Check(r, "vkQueuePresentKHR")) return false;
     return true;
 }
 
@@ -3094,6 +3285,9 @@ bool VulkanDisplay::KeyDown(int scancode) const {
 }
 
 VulkanDisplay::~VulkanDisplay() {
+#ifdef __ANDROID__
+    SDL_RemoveEventWatch(LifeCycle, this);
+#endif
     {
         std::lock_guard<std::mutex> hold(paced_lock_);
         stop_ = true;

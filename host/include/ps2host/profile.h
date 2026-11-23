@@ -15,14 +15,25 @@ namespace ps2host {
 
 enum class Section { GsDraw, GsUpload, Vu1, Vu0, GpuBridge, GpuRender, GpuSync, Dma, Iop, Spu2, GsWait, Count };
 
+/* Whether sections are timed: always on a PC; on Android only for a measured run (PS2HOST_PROFILE or
+   PS2HOST_TIMED set) - its thread-local bookkeeping and two clock reads a section were ~4.5 % of the GS thread on an
+   Odin 2, the thread that held the frame back there (agent L, 2026-11-21). */
+extern const bool g_timed;
+
 class Timed {
 public:
-    explicit Timed(Section section);
-    ~Timed();
+    explicit Timed(Section section) : section_(section) {
+        if (g_timed) Enter();
+    }
+    ~Timed() {
+        if (g_timed) Leave();
+    }
     Timed(const Timed&) = delete;
     Timed& operator=(const Timed&) = delete;
 
 private:
+    void Enter();
+    void Leave();
     Section section_;
 };
 

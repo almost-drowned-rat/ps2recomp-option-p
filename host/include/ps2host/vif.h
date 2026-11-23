@@ -60,8 +60,19 @@ public:
        VPS (waiting for data), CYCLE, MODE, NUM, MASK, CODE, ITOPS, BASE, OFST, TOPS, ITOP, TOP, R0-R3, C0-C3 - as
        the EE reads them (ps2autotests dma/vif). 0: none. */
     std::uint32_t register_base = 0;
-    /* After each DMA run and each FIFO quadword (Words does it itself). */
+    /* register_base's bytes in guest memory, translated once (Mirror: its Translate was 1.2 % of VIF1's worker). */
+    std::uint8_t* mirror_bytes_ = nullptr;
+    /* After each DMA run and each FIFO quadword (Words does it itself) - Words only marks it due (mirror_due_),
+       and a read of the registers mirrors first (MirrorIfDue, devices.cpp's read hooks): written after every run
+       it was 3.8 % of VIF1's worker in ZOE's boss fight, for registers the EE reads now and then. */
     void Mirror();
+    void MirrorIfDue() {
+        if (mirror_due_) {
+            mirror_due_ = false;
+            Mirror();
+        }
+    }
+    bool mirror_due_ = false;
     /* FBRST.RST: a command waiting for its data is dropped (STAT.VPS 0), a stall and what waits behind it too;
        the registers STCYCL, STMASK, STROW ... set stay. */
     void Reset();
@@ -87,6 +98,9 @@ private:
     std::uint32_t mpg_address_ = 0;
     std::uint32_t end_pc_ = 0;      /* where MSCNT continues */
     std::uint32_t code_ = 0;        /* the last VIFcode (VIFn_CODE) */
+    /* The VIFcodes before it and where in memory each came from (g_dma_source) - the stall's message. */
+    std::uint32_t recent_codes_[8] = {}, recent_from_[8] = {};
+    std::uint32_t recent_at_ = 0;
     struct Unpack {
         std::uint32_t address = 0, format = 0, num = 0, written = 0;
         bool masked = false, unsigned_ = false;

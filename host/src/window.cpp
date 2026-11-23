@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <deque>
 #include <thread>
 #include <cmath>
 #include <cstdio>
@@ -169,7 +170,11 @@ bool OpenWindow(const wchar_t* title, int width, int height) {
     if (g_display) {
         Note("window", "window: Vulkan on " + g_display->Describe());
         g_display->SetBorderless(Setting("fullscreen_mode", "fullscreen") == "borderless");
+#ifdef __ANDROID__
+        g_display->SetFullscreen(true);     // (Android: a window is the whole screen; windowed showed the system bars)
+#else
         if (SettingOn("fullscreen")) g_display->SetFullscreen(true);
+#endif
         ApplyCursorArt();
         g_display->SetPresentObserver([](std::uint64_t due_ns, std::uint64_t shown_ns, bool dropped) {
             // Shown on the display's own thread (its lane named so); dropped
@@ -456,11 +461,11 @@ bool PumpWindow() {
             g_display->SetPictureAspect(SettingAspect() > 4.0f / 3.0f + 0.01f && !g_shows_wide() ? 4.0f / 3.0f : 0.0f);
         UpdatePcMenu();                     // F9: the PC settings panel (pc_menu.cpp)
         UpdateSelectMenu();                 // Select: EXIT GAME / EXIT TO MENU (a port's EnableSelectMenu)
-        // F1: the FPS counter on or off; its figure redrawn twice a second.
+        // F1: the PERFORMANCE OVERLAY on or off; its figures redrawn twice a second.
         static std::chrono::steady_clock::time_point fps_drawn{};
         const auto now = std::chrono::steady_clock::now();
-        if (g_display->TakeFpsToggle()) {       // (off <-> the FPS figure; the panel has the other kinds)
-            SetSetting("fps_counter", Setting("fps_counter", "off") == "off" ? "on" : "off");
+        if (g_display->TakeFpsToggle()) {       // (off <-> FPS + SPEED; the panel has the other kinds)
+            SetSetting("performance_overlay", SettingPerformanceOverlay() == "off" ? "fps+speed" : "off");
             RefreshOverlay();
             fps_drawn = now;
         } else if (now - fps_drawn >= std::chrono::milliseconds(500)) {
@@ -555,20 +560,52 @@ void DrawOverlay(const std::vector<std::string>& lines) {
 #endif
 }
 
-// The FPS counter (F1, setting "fps_counter": off, on = the pictures shown a second, frametime = the time a
-// picture, both; off unless turned on): a line under whatever else the overlay says.
+// The PERFORMANCE OVERLAY (F1, setting "performance_overlay"; off unless turned on): FPS = the pictures shown a
+// second, FRAME TIME = the time a picture, SPEED = the game's own speed (GameSpeed: its blanks a real second, in
+// % of the console's) - any of them, on a line under whatever else the overlay says.
 void RefreshOverlay() {
     std::vector<std::string> lines = g_overlay_lines;
 #ifdef PS2HOST_VULKAN
-    const std::string mode = g_display ? Setting("fps_counter", "off") : std::string("off");
-    if (mode == "on" || mode == "frametime" || mode == "both") {
-        const double fps = g_display->PresentsPerSecond();
-        char text[48];
-        if (fps <= 0) std::snprintf(text, sizeof text, mode == "frametime" ? "-- ms" : "FPS --");
-        else if (mode == "frametime") std::snprintf(text, sizeof text, "%.1f ms", 1000.0 / fps);
-        else if (mode == "both") std::snprintf(text, sizeof text, "FPS %.1f  %.1f ms", fps, 1000.0 / fps);
-        else std::snprintf(text, sizeof text, "FPS %.1f", fps);
-        lines.push_back(text);
+    if (g_display) {
+        const bool fps_on = SettingOverlayShows("fps"), time_on = SettingOverlayShows("frametime");
+        const bool speed_on = SettingOverlayShows("speed");
+        std::string text;
+        const auto add = [&text](const char* part) {
+            if (!text.empty()) text += "  ";
+            text += part;
+        };
+        char part[48];
+        // All three from the game's own pictures (GamePictures: its flips, as ARMSX2's internal FPS) of the last
+        // whole second - what the player sees, nothing averaged (the maintainer 2026-11-22):
+        // FPS the pictures counted, SPEED them against the rate the game is made for (a game that moves a step a
+        // picture is that much slower), FRAME TIME the longest wait between two (a wait going on counts).
+        static int pictures = -1;
+        static double frame_ms = -1;
+        static auto measured = std::chrono::steady_clock::time_point{};
+        static auto started = std::chrono::steady_clock::now();
+        const auto now = std::chrono::steady_clock::now();
+        if (now - measured >= std::chrono::milliseconds(450)) {
+            measured = now;
+            const bool whole_second = now - started >= std::chrono::seconds(1) && GamePictures() > 0;
+            pictures = whole_second ? GamePicturesInLast(1'000'000'000ull) : -1;
+            frame_ms = GamePictures() > 1 ? TakeLongestGamePictureGap(0) : -1;
+        }
+        if (fps_on) {
+            if (pictures >= 0) std::snprintf(part, sizeof part, "FPS %d", pictures);
+            else std::snprintf(part, sizeof part, "FPS --");
+            add(part);
+        }
+        if (time_on) {
+            if (frame_ms >= 0) std::snprintf(part, sizeof part, "%.1f ms", frame_ms);
+            else std::snprintf(part, sizeof part, "-- ms");
+            add(part);
+        }
+        if (speed_on) {
+            if (pictures >= 0) std::snprintf(part, sizeof part, "SPEED %.0f %%", 100.0 * pictures / GamePictureRate());
+            else std::snprintf(part, sizeof part, "SPEED --");
+            add(part);
+        }
+        if (!text.empty()) lines.push_back(text);
     }
     // SHADER NOTICE (setting "shader_notice", on unless turned off): while draws wait for, are left out for or
     // stand in for shaders being made (SHADER COMPILE).
@@ -581,6 +618,42 @@ void RefreshOverlay() {
 }
 
 }  // namespace
+
+std::string SettingPerformanceOverlay() {
+    static const char* const kinds[] = {"off", "fps", "frametime", "speed", "fps+frametime", "fps+speed",
+                                        "frametime+speed", "all"};
+    const std::string v = Setting("performance_overlay", "");
+    for (const char* k : kinds)
+        if (v == k) return v;
+    // Unset (or unknown): the FPS COUNTER's it replaced (2026-11-22).
+    const std::string old = Setting("fps_counter", "off");
+    return old == "on" ? "fps" : old == "frametime" ? "frametime" : old == "both" ? "fps+frametime" : "off";
+}
+
+bool SettingOverlayShows(const char* part) {
+    const std::string v = SettingPerformanceOverlay();
+    if (v == "all") return true;
+    const std::string p = part;
+    std::size_t at = 0;
+    while (at <= v.size()) {
+        const std::size_t end = std::min(v.find('+', at), v.size());
+        if (v.compare(at, end - at, p) == 0) return true;
+        at = end + 1;
+    }
+    return false;
+}
+
+void SetOverlayPart(const char* part, bool on) {
+    std::string v;
+    for (const char* p : {"fps", "frametime", "speed"}) {
+        const bool shown = std::string(p) == part ? on : SettingOverlayShows(p);
+        if (!shown) continue;
+        if (!v.empty()) v += "+";
+        v += p;
+    }
+    SetSetting("performance_overlay", v.empty() ? "off" : v == "fps+frametime+speed" ? "all" : v);
+    RefreshOverlay();
+}
 
 void SetWindowOverlay(const std::vector<std::string>& lines) {
     g_overlay_lines = lines;

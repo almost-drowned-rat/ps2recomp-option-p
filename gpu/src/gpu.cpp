@@ -5,10 +5,12 @@
 
 #include "gpu_internal.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <cstring>
 #include <vector>
 
 namespace ps2gpu {
@@ -31,6 +33,32 @@ int DeviceScore(const VkPhysicalDeviceProperties& p) {
 }
 }  // namespace
 
+namespace {
+void LogDynamicState3(VkPhysicalDevice gpu, std::uint32_t family) {
+    // What the driver offers of VK_EXT_extended_dynamic_state3's colour blending (blending as dynamic state, not a
+    // pipeline each - a candidate for fewer pipeline binds, dear on Turnip), and the queue family's queues: logged.
+    std::uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> exts(count);
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, exts.data());
+    bool eds3 = false;
+    for (const auto& e : exts) eds3 = eds3 || std::strcmp(e.extensionName, VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME) == 0;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT f3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    if (eds3) f2.pNext = &f3;
+    vkGetPhysicalDeviceFeatures2(gpu, &f2);
+    std::uint32_t families = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &families, nullptr);
+    std::vector<VkQueueFamilyProperties> fp(families);
+    vkGetPhysicalDeviceQueueFamilyProperties(gpu, &families, fp.data());
+    std::fprintf(stderr, "[ps2gpu] extended dynamic state 3: %s (blend enable %d, blend equation %d, write mask %d, "
+                 "logic op enable %d); the graphics family's queues: %u\n", eds3 ? "yes" : "no",
+                 int(f3.extendedDynamicState3ColorBlendEnable), int(f3.extendedDynamicState3ColorBlendEquation),
+                 int(f3.extendedDynamicState3ColorWriteMask), int(f3.extendedDynamicState3LogicOpEnable),
+                 family < families ? fp[family].queueCount : 0u);
+}
+}  // namespace
+
 bool VulkanGpu::Init(std::string* error) {
     auto fail = [&](const char* what, VkResult r) {
         char text[160];
@@ -38,7 +66,7 @@ bool VulkanGpu::Init(std::string* error) {
         if (error) *error = text;
         return false;
     };
-    VkResult r = volkInitialize();
+    VkResult r = LoadVulkan();
     if (r != VK_SUCCESS) return fail("volkInitialize (is there a Vulkan driver?)", r);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "ps2gpu";
@@ -79,6 +107,7 @@ bool VulkanGpu::Init(std::string* error) {
     VkPhysicalDeviceProperties p;
     vkGetPhysicalDeviceProperties(gpu, &p);
     describe_ = p.deviceName;
+    LogDynamicState3(gpu, family);
 
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
@@ -104,12 +133,22 @@ bool VulkanGpu::Init(std::string* error) {
     logic_op = supported.logicOp == VK_TRUE;
     features.features.textureCompressionBC = supported.textureCompressionBC;     // texture packs' DDS
     bc = supported.textureCompressionBC == VK_TRUE;
+    // The sampler's own anisotropic filter (TEXTURE FILTERING FAST): where the device has it.
+    features.features.samplerAnisotropy = supported.samplerAnisotropy;
+    NoteAnisotropy(gpu, supported);
     features.pNext = &v13;
+    std::vector<const char*> extensions;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT f3{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    const bool dynamic_blend = OfferDynamicBlend(gpu, &f3, &extensions);
+    if (dynamic_blend) v13.pNext = &f3;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &features;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
+    dci.enabledExtensionCount = std::uint32_t(extensions.size());
+    dci.ppEnabledExtensionNames = extensions.data();
     if ((r = vkCreateDevice(gpu, &dci, nullptr, &device)) != VK_SUCCESS) return fail("vkCreateDevice", r);
+    g_dynamic_blend = dynamic_blend;
     // Device functions stay the loader's (volkLoadInstance): they dispatch by
     // handle, so the window's device and this one can live side by side. volk
     // keeps one global table; loading a device into it would point the other
@@ -134,6 +173,13 @@ bool VulkanGpu::Init(std::string* error) {
         if ((r = vkCreateFence(device, &fci, nullptr, &f)) != VK_SUCCESS) return fail("vkCreateFence", r);
     MakeTimestamps();
     return true;
+}
+
+void VulkanGpu::NoteAnisotropy(VkPhysicalDevice physical, const VkPhysicalDeviceFeatures& supported) {
+    sampler_anisotropy = supported.samplerAnisotropy == VK_TRUE;
+    VkPhysicalDeviceProperties properties;
+    vkGetPhysicalDeviceProperties(physical, &properties);
+    max_anisotropy = sampler_anisotropy ? std::max(1.0f, properties.limits.maxSamplerAnisotropy) : 1.0f;
 }
 
 void VulkanGpu::MakeTimestamps() {
@@ -174,7 +220,9 @@ bool VulkanGpu::InitShared(VkInstance shared_instance, VkPhysicalDevice shared_g
     vkGetPhysicalDeviceFeatures(shared_gpu, &supported);
     logic_op = supported.logicOp == VK_TRUE;
     bc = supported.textureCompressionBC == VK_TRUE;     // (the Display enables it too)
+    NoteAnisotropy(shared_gpu, supported);              // (and samplerAnisotropy)
     describe_ = describe;
+    LogDynamicState3(shared_gpu, shared_family);
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     pci.queueFamilyIndex = family;

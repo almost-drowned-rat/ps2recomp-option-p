@@ -959,8 +959,17 @@ void GpuScaledColourTransfersAsTheGs() {
                 }
             std::vector<u8> bytes(4u << 20);
             renderer->MemoryRead(0, 16384, bytes.data());
-            Check(std::memcmp(bytes.data(), reference.data(), bytes.size()) == 0,
-                  "scaled (whole, quarter-step and wide) color transfer matches scalar GS memory");
+            {
+                const bool same = std::memcmp(bytes.data(), reference.data(), bytes.size()) == 0;
+                if (!same) {
+                    std::size_t first = 0, count = 0;
+                    for (std::size_t i = 0; i < bytes.size(); ++i)
+                        if (bytes[i] != reference.data()[i]) { if (!count) first = i; ++count; }
+                    std::fprintf(stderr, "  scale %u x %u psm %02X: %zu bytes differ, first at %zX\n",
+                                 unsigned(scale.x), unsigned(scale.y), unsigned(psm), count, first);
+                }
+                Check(same, "scaled (whole, quarter-step and wide) color transfer matches scalar GS memory");
+            }
             const u32 begin = base * 32, end = begin + fbw * (sixteen ? 1 : 2) * 32;
             for (u32 i = begin * 256; i < end * 256; ++i) reference.data()[i] = u8(next() >> 24);
             renderer->MemoryWrite(begin, end, reference.data() + begin * 256);
@@ -1521,7 +1530,27 @@ void VuCompiledIsTheInterpreter() {
             const u64 a = interpreted->Run(program.entry, limit), b = ahead->Run(program.entry, limit);
             ++runs;
             if (ahead->compiled_pairs()) ++entered;
-            if (a != b || !interpreted->SameState(*ahead)) ++wrong;
+            if (a != b || !interpreted->SameState(*ahead)) {
+                if (wrong < 12) {       // (the first few: where)
+                    std::fprintf(stderr, "  program %zu trial %d: cycles %llu / %llu", i, trial,
+                                 (unsigned long long)a, (unsigned long long)b);
+                    for (int r = 0; r < 32; ++r)
+                        for (int l = 0; l < 4; ++l)
+                            if (interpreted->regs.vf[r][l] != ahead->regs.vf[r][l])
+                                std::fprintf(stderr, " vf%d.%d %08X/%08X", r, l, unsigned(interpreted->regs.vf[r][l]),
+                                             unsigned(ahead->regs.vf[r][l]));
+                    for (int l = 0; l < 4; ++l)
+                        if (interpreted->regs.vacc[l] != ahead->regs.vacc[l])
+                            std::fprintf(stderr, " acc.%d %08X/%08X", l, unsigned(interpreted->regs.vacc[l]),
+                                         unsigned(ahead->regs.vacc[l]));
+                    for (int r = 0; r < 32; ++r)
+                        if (interpreted->regs.vc[r] != ahead->regs.vc[r])
+                            std::fprintf(stderr, " vc%d %08X/%08X", r, unsigned(interpreted->regs.vc[r]),
+                                         unsigned(ahead->regs.vc[r]));
+                    std::fprintf(stderr, "\n");
+                }
+                ++wrong;
+            }
         }
     }
     char what[128];

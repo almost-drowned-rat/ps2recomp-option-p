@@ -31,7 +31,11 @@
 #include <timeapi.h>
 #elif defined(__linux__)
 #include <dlfcn.h>
+#ifdef __ANDROID__
+#include <unwind.h>                 // (bionic has backtrace() only from API 33: the unwinder directly)
+#else
 #include <execinfo.h>
+#endif
 #include <signal.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -50,6 +54,14 @@ using Clock = std::chrono::steady_clock;
 std::uint64_t Ticks() {
 #if defined(_MSC_VER)
     return __rdtsc();
+#elif defined(__aarch64__)
+    // ARM's generic timer, read from user space in one instruction (the vDSO's clock_gettime around it was ~12 %
+    // of the EE, VIF1 and GS threads on the Odin 2: two reads a section, millions of sections)
+    std::uint64_t ticks;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+#elif defined(__x86_64__) || defined(__i386__)
+    return __builtin_ia32_rdtsc();
 #else
     return std::uint64_t(Clock::now().time_since_epoch().count());
 #endif
@@ -101,7 +113,13 @@ const char* const kSectionNames[] = {"GS drawing", "GS image transfers", "VU1", 
                                      "GPU bookkeeping", "GPU drawing", "GPU and memory in step",
                                      "DMA and VIF", "IOP", "SPU2", "waiting for the GS thread"};
 
-Timed::Timed(Section section) : section_(section) {
+// The sections' times (the run's "time:" line) only when measured - PS2HOST_TIMED=1 or PS2HOST_PROFILE - on every
+// platform since 2026-11-23 (Android's way): kept always, their clock reads were 2.9 % of VIF1's worker in ZOE's
+// boss fight (--sample-vif1), and nothing but the line reads them.
+extern const bool g_timed = std::getenv("PS2HOST_PROFILE") != nullptr || std::getenv("PS2HOST_TIMED") != nullptr;
+
+void Timed::Enter() {
+    const Section section = section_;
     ThreadTicks& t = t_ticks;
     const std::uint64_t now = Ticks();
     if (t.depth > 0) t.ticks[int(t.stack[t.depth - 1])] += now - t.since;
@@ -111,7 +129,7 @@ Timed::Timed(Section section) : section_(section) {
     t.since = now;
 }
 
-Timed::~Timed() {
+void Timed::Leave() {
     ThreadTicks& t = t_ticks;
     const std::uint64_t now = Ticks();
     t.ticks[int(section_)] += now - t.since;
@@ -642,6 +660,23 @@ void SetCrashHelper(const std::vector<std::string>&) {}
 // the signal end the process. The sampler (--sample) is the Windows build's (on Linux: perf).
 
 namespace {
+
+#ifdef __ANDROID__
+struct Frames { void** out; int max, n; };
+_Unwind_Reason_Code Frame(_Unwind_Context* context, void* arg) {
+    Frames* f = static_cast<Frames*>(arg);
+    if (const std::uintptr_t pc = _Unwind_GetIP(context)) {
+        if (f->n >= f->max) return _URC_END_OF_STACK;
+        f->out[f->n++] = reinterpret_cast<void*>(pc);
+    }
+    return _URC_NO_REASON;
+}
+int backtrace(void** out, int max) {          // (bionic's own backtrace() needs API 33)
+    Frames f{out, max, 0};
+    _Unwind_Backtrace(Frame, &f);
+    return f.n;
+}
+#endif
 
 char g_crash_exe[4096] = "";                 // (made before: nothing allocated in a crash) - SetCrashHelper
 char g_crash_args[8][4096] = {};

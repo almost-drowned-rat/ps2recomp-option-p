@@ -51,15 +51,18 @@ struct Choice {
     int page = 0;                           // kMain, or the page it is on (kPost, kRate)
 };
 
-// The panel's pages (porting guide 4b, Orta's RECOMP OPTIONS): the list, POST PROCESSING's and FRAME RATE's.
-enum Page { kMain, kPost, kRate };
+// The panel's pages (porting guide 4b, Orta's RECOMP OPTIONS): the list, POST PROCESSING's and PERFORMANCE's
+// (FRAME RATE's until 2026-11-22).
+// RENDERING's (the maintainer 2026-11-23: TEXTURE FILTERING, SHADER COMPILE, SHADER NOTICE - POST PROCESSING less full).
+enum Page { kMain, kPost, kRate, kRender };
 int g_page = kMain;
 
 std::string OnOff(bool on) { return on ? "on" : "off"; }
 
 const std::vector<Choice>& Choices() {
     // In the ports' RECOMP OPTIONS order (porting guide 4b): POST PROCESSING (its page: antialiasing, upscaling),
-    // display mode, resolution, aspect, FRAME RATE (its page: V-sync, frame pacing, FPS counter), textures,
+    // display mode, resolution, aspect, PERFORMANCE (its page: V-sync, FPS, frame time,
+    // game speed), textures,
     // language (no boot animation line for the PS2 ports: boot_video.h, hidden). Rows() puts the pages' rows in.
     static const std::vector<Choice> choices = {
         {"Display mode", {"windowed", "fullscreen", "borderless"}, {"Windowed", "Fullscreen", "Borderless"},
@@ -107,6 +110,20 @@ const std::vector<Choice>& Choices() {
          },
          "ANISOTROPIC FILTER", {"OFF", "2X", "4X", "8X", "16X"},
          "Textures seen at a flat angle stay sharp.", kPost},
+        // TEXTURE FILTERING (the maintainer 2026-11-23: on RENDERING, beside the shader lines): ACCURATE the
+        // GS's own filter in the shader, bit for bit; FAST the GPU's sampler where it gives the GS's result (less
+        // GPU time, not bit-exact); AUTO FAST on Android, ACCURATE elsewhere. At once (ApplyTextureFilteringSetting).
+        {"Texture filtering", {"accurate", "fast", "auto"}, {"Accurate", "Fast", "Auto"},
+         [] {
+             const std::string v = Setting("texture_filtering", "auto");
+             return v == "accurate" || v == "fast" ? v : std::string("auto");
+         },
+         [](const std::string& v) {
+             SetSetting("texture_filtering", v);
+             ApplyTextureFilteringSetting();
+         },
+         "TEXTURE FILTERING", {"ACCURATE", "FAST", "AUTO"},
+         "ACCURATE filters textures exactly as the PS2, FAST by the graphics card (quicker), AUTO picks.", kRender},
         // BLOOM + BLOOM STRENGTH (4b; a PC enhancement, off by default, its own pass after the frame): the
         // game's own glow stays as the original draws it (no line for that).
         {"Bloom", {"off", "on"}, {"Off", "On"},
@@ -148,18 +165,22 @@ const std::vector<Choice>& Choices() {
          [] { return OnOff(WindowVsync()); },
          [](const std::string& v) { SetWindowVsync(v == "on"); },
          "V-SYNC", {"OFF", "ON"}, "Wait for the screen's refresh: no tearing.", kRate},
-        // Frame pacing (Orta's two): TIMER = pictures at a steady 60 Hz timer (the "frame_pacing" setting on),
-        // DISPLAY = each shown as it is done, in step with the monitor (off).
-        {"Frame pacing", {"on", "off"}, {"Timer", "Display"},
-         [] { return OnOff(SettingOn("frame_pacing", FramePacingDefault())); },
-         [](const std::string& v) { SetSettingOn("frame_pacing", v == "on"); },
-         "PACING", {"TIMER", "DISPLAY"},
-         "TIMER: pictures at a steady 60 Hz. DISPLAY: in step with the monitor.", kRate},
-        {"FPS counter", {"off", "on", "frametime", "both"}, {"Off", "FPS", "Frame time", "Both"},
-         [] { return Setting("fps_counter", "off"); },
-         [](const std::string& v) { SetSetting("fps_counter", v); },
-         "FPS COUNTER", {"OFF", "FPS", "FRAME TIME", "BOTH"},
-         "The game's pictures a second, the time a picture, or both, in a corner (F1).", kRate},
+        // (FRAME PACING left the menus, the maintainer 2026-11-22: "frame_pacing" in the settings file only.)
+        // PERFORMANCE OVERLAY (was FPS COUNTER; the maintainer 2026-11-22): a switch for each figure, in a corner
+        // together ("performance_overlay": fps, frametime, speed joined by +, all, off; unset, "fps_counter"'s).
+        {"FPS", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("fps")); },
+         [](const std::string& v) { SetOverlayPart("fps", v == "on"); },
+         "FPS", {"OFF", "ON"}, "The pictures shown a second, in a corner (F1: the overlay on or off).", kRate},
+        {"Frame time", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("frametime")); },
+         [](const std::string& v) { SetOverlayPart("frametime", v == "on"); },
+         "FRAME TIME", {"OFF", "ON"}, "The time a picture takes, in milliseconds, in a corner.", kRate},
+        {"Game speed", {"off", "on"}, {"Off", "On"},
+         [] { return OnOff(SettingOverlayShows("speed")); },
+         [](const std::string& v) { SetOverlayPart("speed", v == "on"); },
+         "GAME SPEED", {"OFF", "ON"}, "The game's own speed in a corner: 100 % as on the console, below it slowed.",
+         kRate},
         // SHADER COMPILE (4b, option-c's four): while a kind of draw's pipeline is made - OFF the frame waits for
         // it, SKIP the draw is left out, WAIT the frame waits up to 2.5 ms then leaves it out, HYBRID the whole
         // shader draws it meanwhile (the same picture). At once; SHADER NOTICE says so on the screen.
@@ -170,11 +191,11 @@ const std::vector<Choice>& Choices() {
              ApplyShaderCompileSetting();
          },
          "SHADER COMPILE", {"OFF", "SKIP", "WAIT", "HYBRID"},
-         "New shaders: OFF waits, SKIP leaves the draw out, WAIT a little then out, HYBRID draws it at once."},
+         "New shaders: OFF waits, SKIP leaves the draw out, WAIT a little then out, HYBRID draws it at once.", kRender},
         {"Shader notice", {"on", "off"}, {"On", "Off"},
          [] { return OnOff(SettingOn("shader_notice", true)); },
          [](const std::string& v) { SetSettingOn("shader_notice", v == "on"); },
-         "SHADER NOTICE", {"ON", "OFF"}, "BUILDING SHADERS in a corner while new shaders are made."},
+         "SHADER NOTICE", {"ON", "OFF"}, "BUILDING SHADERS in a corner while new shaders are made.", kRender},
         // The player's packs (a folder each in "textures" beside the game): Off or one of them, stepped through by
         // Step (the list is the folder's, read at the start).
         {"Texture pack", {"off"}, {"Off"},
@@ -220,13 +241,14 @@ std::string DefaultValue(const std::string& label) {
     if (label == "Aspect ratio") return "4:3";
     if (label == "Field of view") return "0";
     if (label == "Antialiasing" || label == "Anisotropic" || label == "Bloom" || label == "V-sync" ||
-        label == "FPS counter" || label == "Texture pack")
+        label == "FPS" || label == "Frame time" ||
+        label == "Game speed" || label == "Texture pack")
         return "off";
     if (label == "Bloom strength") return "5";
     if (label == "Upscaling") return "linear";
-    if (label == "Frame pacing") return OnOff(FramePacingDefault());
     if (label == "Shader compile") return "hybrid";
     if (label == "Shader notice") return "on";
+    if (label == "Texture filtering") return "auto";
     if (label == "Language" || label == "Dub") return "en";
     return "";
 }
@@ -274,6 +296,10 @@ void Step(const Choice& c, int step) {
 bool Shown(const Choice& c) {
     const std::string label = c.label;
     if (label == "Texture pack" && TexturePacks().empty()) return false;
+#ifdef __ANDROID__
+    // Android: always the whole screen - no window, fullscreen or borderless to choose (the maintainer 2026-11-22).
+    if (label == "Display mode") return false;
+#endif
     if (label == "Language" && Languages().size() < 2) return false;
     if (label == "Dub" && (Dubs().size() < 2 || !g_dubs_available || !g_dubs_available())) return false;
     if ((label == "Aspect ratio" || label == "Field of view" || label == "Stretch cutscenes") && !WidescreenSupported())
@@ -284,9 +310,13 @@ bool Shown(const Choice& c) {
     return true;
 }
 
-// The rows of a page: the list's - POST PROCESSING >, its own lines (FRAME RATE > after the aspect ratio's),
+// The rows of a page: the list's - POST PROCESSING >, its own lines (PERFORMANCE > after the aspect ratio's),
 // CONTROLS >, Close; a page's - its lines, then Back.
-constexpr int kCloseRow = -1, kControlsRow = -2, kPostRow = -3, kRateRow = -4, kBackRow = -5;
+constexpr int kCloseRow = -1, kControlsRow = -2, kPostRow = -3, kRateRow = -4, kBackRow = -5, kRenderRow = -6;
+// A page's row on the list and back.
+int PageRow(int page) { return page == kPost ? kPostRow : page == kRate ? kRateRow : kRenderRow; }
+int RowPage(int row) { return row == kPostRow ? kPost : row == kRateRow ? kRate : kRender; }
+bool IsPageRow(int row) { return row == kPostRow || row == kRateRow || row == kRenderRow; }
 // A port's own debug lines (AddDebugLine: ZOE's subtitle timing of the scene playing), rows kPortBase - n.
 constexpr int kPortBase = -100;
 struct DebugLine {
@@ -302,14 +332,17 @@ std::vector<int> Rows(int page = g_page) {
     std::vector<int> rows;
     if (page == kMain) rows.push_back(kPostRow);
     const auto& c = Choices();
-    std::size_t rate_at = rows.size();      // FRAME RATE > after render resolution, aspect ratio, field of view
+    std::size_t rate_at = rows.size();      // PERFORMANCE > after render resolution, aspect ratio, field of view
     for (int i = 0; i < int(c.size()); ++i) {
         if (c[i].page != page || !Shown(c[i])) continue;
         rows.push_back(i);
         const std::string label = c[i].label;
         if (label == "Render resolution" || label == "Aspect ratio" || label == "Field of view") rate_at = rows.size();
     }
-    if (page == kMain) rows.insert(rows.begin() + std::ptrdiff_t(rate_at), kRateRow);
+    if (page == kMain) {
+        rows.insert(rows.begin() + std::ptrdiff_t(rate_at), kRenderRow);    // RENDERING > after PERFORMANCE >
+        rows.insert(rows.begin() + std::ptrdiff_t(rate_at), kRateRow);
+    }
     if (page == kMain) {
         for (int n = 0; n < int(DebugLines().size()); ++n) rows.push_back(kPortBase - n);
         rows.push_back(kControlsRow);
@@ -324,8 +357,8 @@ std::vector<int> Rows(int page = g_page) {
 std::vector<int> AllChoices() {
     std::vector<int> all;
     for (int r : Rows(kMain)) {
-        if (r == kPostRow || r == kRateRow)
-            for (int s : Rows(r == kPostRow ? kPost : kRate))
+        if (IsPageRow(r))
+            for (int s : Rows(RowPage(r)))
                 if (s >= 0) all.push_back(s);
         if (r >= 0) all.push_back(r);
     }
@@ -334,7 +367,8 @@ std::vector<int> AllChoices() {
 
 void Draw(bool force = false) {
     std::vector<std::string> lines = {g_page == kPost   ? "RECOMP OPTIONS > POST PROCESSING   (Esc back)"
-                                      : g_page == kRate ? "RECOMP OPTIONS > FRAME RATE   (Esc back)"
+                                      : g_page == kRate ? "RECOMP OPTIONS > PERFORMANCE   (Esc back)"
+                                      : g_page == kRender ? "RECOMP OPTIONS > RENDERING   (Esc back)"
                                                         : "RECOMP OPTIONS   (F9 closes)"};
     const std::vector<int> rows = Rows();
     for (int r = 0; r < int(rows.size()); ++r) {
@@ -344,7 +378,9 @@ void Draw(bool force = false) {
         } else if (rows[r] == kPostRow) {
             text = "Post processing >";
         } else if (rows[r] == kRateRow) {
-            text = "Frame rate >";
+            text = "Performance >";
+        } else if (rows[r] == kRenderRow) {
+            text = "Rendering >";
         } else if (rows[r] == kBackRow) {
             text = "Back";
         } else if (rows[r] <= kPortBase) {
@@ -432,7 +468,7 @@ void OpenPage(int page) {
     if (page == kMain) {
         const std::vector<int> rows = Rows();
         for (int r = 0; r < int(rows.size()); ++r)
-            if (rows[r] == (from == kPost ? kPostRow : kRateRow)) g_row = r;
+            if (from != kMain && rows[r] == PageRow(from)) g_row = r;
     }
     Draw(true);
 }
@@ -444,8 +480,8 @@ void Change(int step) {
         if (step > 0) OpenControls();
         return;
     }
-    if (which == kPostRow || which == kRateRow) {
-        if (step > 0) OpenPage(which == kPostRow ? kPost : kRate);
+    if (IsPageRow(which)) {
+        if (step > 0) OpenPage(RowPage(which));
         return;
     }
     if (which == kBackRow) {
@@ -743,7 +779,10 @@ std::vector<PcSetting> PcSettings() {
         for (std::size_t v = 0; v < c.values.size(); ++v)
             if (c.values[v] == now) value = c.game_values[v];
         settings.push_back({c.game_label, value, c.help,
-                            c.page == kPost ? "POST PROCESSING" : c.page == kRate ? "FRAME RATE" : "",
+                            c.page == kPost   ? "POST PROCESSING"
+                            : c.page == kRate ? "PERFORMANCE"
+                            : c.page == kRender ? "RENDERING"
+                                                : "",
                             NeedsRestart(c), {}});
         for (std::size_t v = 0; v < c.values.size() && v < c.game_values.size(); ++v)
             if (Allowed(c, c.values[v])) settings.back().values.push_back(c.game_values[v]);

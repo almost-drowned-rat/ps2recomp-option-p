@@ -44,6 +44,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <mutex>
+#include <utility>
 #include <bitset>
 #include <cmath>
 #include <cstdarg>
@@ -354,6 +356,13 @@ Bridge* g_bridge = nullptr;
 // primitive with the registers of the one before draws as that one did
 // (OnDraw's fast path).
 u64 g_mutations = 0;
+std::atomic<u64> g_game_pictures{0};      // GamePictures
+// The game's pictures' times (steady ns), the last 256, and the longest wait between two per reader (0 the overlay,
+// 1 the log) - GamePicturesInLast / TakeLongestGamePictureGap.
+std::mutex g_picture_times_lock;
+u64 g_picture_times[256] = {};
+u64 g_picture_longest[2] = {};
+double g_game_picture_rate = 1e9 / 16683333.0;   // SetGamePictureRate (59.94)
 // Of those, the CLUT loads' (LoadClut); and why primitives missed the fast path (the summary's "fast path" line):
 // 0 none to repeat, 1 only CLUT loads since and the same registers, 2 only CLUT loads and TEX0 differing only in
 // its CLUT fields (CBP, CPSM, CSM, CSA, CLD), 3 other mutations, 4 other registers, 5 the rest.
@@ -597,7 +606,10 @@ void WriteBack(Bridge& b, Owned& o) {
 void ApplyPatch(Bridge& b);
 
 void Sync(Bridge& b, u32 begin, u32 end, bool write, const Owned* except = nullptr) {
-    Mutate(kMutSync);
+    // A mutation only where something changes: a write, a patch applied, blocks brought back from the GPU
+    // (WriteBack counts its own). A read that finds nothing to do - a CLUT load's, most of them - leaves the
+    // fast path standing (ZOE's boss fight, 2026-11-22: ~5 M of 7 M fast-path misses came right after one).
+    if (write || !b.patch.blocks.empty()) Mutate(kMutSync);
     {
         const auto& t = gs::TheGs().last_transfer;
         TraceBlocks(b, begin, end, "CPU %s %X-%X (last transfer: bp %X bw %u psm %02X at %u,%u %ux%u)",
@@ -611,6 +623,7 @@ void Sync(Bridge& b, u32 begin, u32 end, bool write, const Owned* except = nullp
     // two clock reads were ~1 % of the GS thread in the hangar).
     if (const u32 e = std::min(end, 16384u);
         begin < e && std::memchr(b.blocks.data() + begin, Bridge::kGpuNewer, e - begin)) {
+        if (!write) Mutate(kMutSync);
         Timed timed(Section::GpuSync);
         const TimelineStep step("sync: memory for the CPU");
         Coherent(b, begin, end, false);
@@ -726,12 +739,19 @@ Owned& Use(Bridge& b, u32 fbp, u32 fbw, u32 psm, bool depth, u32 width, u32 heig
     // before: that one, without the map (its elements stay put).
     static Owned* last = nullptr;
     static std::tuple<u32, u32, u32, bool> last_key;
-    const auto key = std::make_tuple(fbp, fbw, psm, depth);
+    // A depth buffer's Z32 and Z24 over the same pages are one (agent L, 2026-11-21): the same 32-bit layout, the
+    // renderer's one depth image for both (depths_ by ZBP and size). Kept apart, each switch of the format wrote one
+    // back and reloaded the other - ZOE's hangar takes turns between the two ~7 times a frame (11 write-backs and 19
+    // render passes a frame: on a tiling GPU, the Odin 2's Adreno, a third of its frame). Written back in the format
+    // last drawn with (Z24's leaves the top byte as it is).
+    const bool z_alias = depth && (psm == gs::PSMZ24 || psm == gs::PSMZ32);
+    const auto key = std::make_tuple(fbp, fbw, z_alias ? u32(gs::PSMZ32) : psm, depth);
     if (!last || key != last_key) {
         last = &b.owned[key];
         last_key = key;
     }
     Owned& o = *last;
+    if (z_alias && o.width) o.psm = psm;
     if (!o.width) {
         o.fbp = fbp;
         o.fbw = fbw;
@@ -1350,7 +1370,11 @@ u64 CachedTexture(Bridge& b, const gs::Context& c, u64 texa, u32 tw, u32 th,
     // looked up in the draw (GsDrawState::palette) - a new CLUT (ZOE's explosions animate theirs, ~800 a
     // picture) is no new decode. Keyed without the CLUT, and without CSA (the indices are the same).
     // PS2HOST_GPU_BAKED_CLUT=1: the CLUT decoded into the texels, as tier E does.
-    static const bool baked = TierESwitch("PS2HOST_GPU_BAKED_CLUT");
+    // (Honoured in every build since 2026-11-22: the CLUT baked into RGBA texels, sampled without a CLUT lookup a
+    // texel - the Odin 2's pixel cost.)
+    // TEXTURE FILTERING FAST bakes it too: its texels then RGBA, which the GPU's sampler can filter (gs_renderer.cpp).
+    static const bool baked_env = std::getenv("PS2HOST_GPU_BAKED_CLUT") != nullptr;
+    const bool baked = baked_env || ps2gpu::TextureFilteringFast();
     // PS2HOST_GPU_PALETTE_RANGE=<first>-<last>: the palette path only for primitives in that range (bisecting).
     static const std::pair<u64, u64> palette_range = [] {
         unsigned long long lo = 0, hi = ~0ull;
@@ -2555,6 +2579,32 @@ void OnDraw(const gs::Gs::DrawCall& call) {
                     state.csa = Bits(c.tex0, 56, 5);
                     state.clut_version = sent_version;
                 }
+                // The texels' alpha range: the rows it reads, where the GS model holds them (not the GPU only) - for
+                // the palette's indices and as well for a palette baked into the texels (TEXTURE FILTERING FAST,
+                // PS2HOST_GPU_BAKED_CLUT): the same CLUT's alphas either way.
+                if (const u32 tpsm = Bits(c.tex0, 20, 6); ClutRowsOf(tpsm, Bits(c.tex0, 56, 5))) {
+                    const u32 rows = ClutRowsOf(tpsm, Bits(c.tex0, 56, 5));
+                    if (rows && !(rows & ~s.clut_cpu)) {
+                        static u64 ranged = ~0ull;
+                        static int row_lo[16], row_hi[16];
+                        if (gs::TheGs().clut_changes() != ranged) {
+                            ranged = gs::TheGs().clut_changes();
+                            const auto& entries = gs::TheGs().Clut();
+                            for (u32 r = 0; r < 16; ++r) {
+                                row_lo[r] = 255, row_hi[r] = 0;
+                                for (u32 i = 0; i < 16; ++i) {
+                                    const int a = int(entries[r * 16 + i] >> 24);
+                                    row_lo[r] = std::min(row_lo[r], a), row_hi[r] = std::max(row_hi[r], a);
+                                }
+                            }
+                        }
+                        int lo = 255, hi = 0;
+                        for (u32 r = 0; r < 16; ++r)
+                            if (rows >> r & 1) lo = std::min(lo, row_lo[r]), hi = std::max(hi, row_hi[r]);
+                        state.tex_alpha_lo = lo;
+                        state.tex_alpha_hi = hi;
+                    }
+                }
             } else {
                 // Decoded again when the texture's registers change, local memory
                 // is uploaded into, or a draw since went into the texture's blocks.
@@ -2914,6 +2964,11 @@ RenderSize FsrPresetSize() {
 }
 
 ps2gpu::GsScale WantedScale() {
+    // PS2HOST_REPLAY_SCALE_XY=<x>,<y> (diagnosis, a replay): the two factors as given - a wide picture's unequal ones
+    static const char* const xy = std::getenv("PS2HOST_REPLAY_SCALE_XY");
+    double sx = 0, sy = 0;
+    if (xy && std::sscanf(xy, "%lf,%lf", &sx, &sy) == 2 && sx >= 1.0 && sy >= 1.0)
+        return ps2gpu::GsScale{u32(sx * ps2gpu::kScaleOne + 0.5), u32(sy * ps2gpu::kScaleOne + 0.5)};
     if (const u32 q = g_replay_scale.load()) return ScaleFor(q);
     const RenderSize preset = FsrPresetSize();
     if (preset.w) return ScaleOfSize(preset, 1);
@@ -2968,10 +3023,36 @@ void Rescale(Bridge& b, ps2gpu::GsScale scale) {
     std::fprintf(stderr, "[gpu] internal resolution: %.3fx %.3fx\n", scale.x / double(kOne), scale.y / double(kOne));
 }
 
+/* The picture handed over without waiting for the renderer's queue (DisplayTargetThen): the target's image
+   presented from the renderer's thread when the queue gets there, the GS thread on to the next frame meanwhile. If
+   the renderer had no such target after all (none drawn there yet: not owned by the GPU, it is seen here first), the
+   next picture goes the waiting way, with the software picture where there is none - each frame after it handed
+   over again. PS2HOST_PRESENT_WAIT: always the waiting way (agent L, 2026-11-21). */
+static std::atomic<bool> g_present_missed{false};
+
 void PresentGpuPicture(ps2gpu::Display& display, u64 due_ns) {
     u32 fbp = 0, fbw = 0, psm = 0;
+    static const bool wait = std::getenv("PS2HOST_PRESENT_WAIT") != nullptr;
     if (g_bridge && gs::TheGs().Displayed(&fbp, &fbw, &psm)) {
         auto found = g_bridge->owned.find(std::make_tuple(fbp, fbw, psm, false));
+        if (!wait && found != g_bridge->owned.end() && !found->second.stale && !g_present_missed.exchange(false)) {
+            // What the picture's size takes of the GS's state, now; the rest on the renderer's thread.
+            const ps2gpu::GsScale k = g_bridge->renderer->Scale();
+            const u32 lines = std::min(gs::TheGs().ShownLines(), 448u);
+            g_bridge->renderer->DisplayTargetThen(
+                fbp, fbw, psm, [&display, k, lines, due_ns](bool ok, std::uint64_t image, int layout, u32 w, u32 h) {
+                    if (!ok) {
+                        g_present_missed = true;
+                        return;
+                    }
+                    const u32 sw = std::min(w, ps2gpu::ScaleSize(640u, k.x)), sh = std::min(h, ps2gpu::ScaleSize(lines, k.y));
+                    display.SetPictureCrop(k.x > kOne ? (k.x + 2 * kOne - 1) / (2 * kOne) : 0u,
+                                           k.y > kOne ? (k.y + 2 * kOne - 1) / (2 * kOne) : 0u);
+                    if (due_ns) display.PresentImageAt(image, layout, sw, sh, due_ns);
+                    else display.PresentImage(image, layout, sw, sh);
+                });
+            return;
+        }
         std::uint64_t image = 0;
         int layout = 0;
         u32 w = 0, h = 0;
@@ -3084,10 +3165,14 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
     // The pipeline cache beside the PC settings - a player's only: a scripted
     // run's settings are beside its memory card, in %TEMP% (what every
     // game's runs there would share), and it makes every pipeline at once.
-    if (!SettingsPath().empty() && !VirtualClock())
+    // (PS2HOST_PLAYER_PIPELINES=1: a scripted run with the player's cache too - a benchmark measuring what a
+    // player meets, not every pipeline made cold in the middle of a fight; 2026-11-22.)
+    static const bool player_pipelines = std::getenv("PS2HOST_PLAYER_PIPELINES") != nullptr;
+    if (!SettingsPath().empty() && (!VirtualClock() || player_pipelines))
         ps2gpu::SetPipelineCacheDir(std::filesystem::path(SettingsPath()).parent_path().u8string());
     ApplyShaderCompileSetting();        // SHADER COMPILE (RECOMP OPTIONS; a scripted run makes all at once anyway)
     ApplyAnisotropySetting();           // ANISOTROPIC FILTER (off unless chosen)
+    ApplyTextureFilteringSetting();     // TEXTURE FILTERING (auto: FAST on Android)
     bridge.renderer = ps2gpu::CreateGsRenderer(*device, error);
     if (!bridge.renderer) return false;
     // Vulkan's recording on a thread of its own, beside the GS thread's
@@ -3180,6 +3265,26 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
                 g_good = g_bridge->renderer->Scale();
             }
             if (scale != g_bridge->renderer->Scale()) Rescale(*g_bridge, scale);
+            // The game's own pictures: a frame whose shown buffer differs from the last frame's is a new one (a
+            // double-buffered game's flip) - GamePictures, what the game's speed is when it moves a step a picture
+            // (the maintainer 2026-11-22: ZOE slows with its pictures while its blanks go on).
+            {
+                u32 shown_fbp = 0, shown_fbw = 0, shown_psm = 0;
+                static u32 last_shown = ~0u;
+                if (gs::TheGs().Displayed(&shown_fbp, &shown_fbw, &shown_psm) && shown_fbp != last_shown) {
+                    last_shown = shown_fbp;
+                    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                            std::chrono::steady_clock::now().time_since_epoch()).count());
+                    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+                    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+                    if (n) {
+                        const u64 gap = now - g_picture_times[(n - 1) & 255];
+                        for (u64& longest : g_picture_longest) longest = std::max(longest, gap);
+                    }
+                    g_picture_times[n & 255] = now;
+                    g_game_pictures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             g_present_frame = frame;
             g_present_waits = true;
             if (!g_present_at_blank_end || VirtualClock()) PresentWaiting();
@@ -3189,6 +3294,31 @@ bool StartGpuRenderer(std::string* error, GpuMode mode, bool show) {
                  bridge.primary ? "instead of the software GS" : "beside the software GS");
     return true;
 }
+
+u64 GamePictures() { return g_game_pictures.load(std::memory_order_relaxed); }
+
+int GamePicturesInLast(u64 window_ns) {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+    int count = 0;
+    for (u64 i = n; i > 0 && n - i < 256 && now - g_picture_times[(i - 1) & 255] <= window_ns; --i) ++count;
+    return count;
+}
+
+double TakeLongestGamePictureGap(int reader) {
+    const u64 now = u64(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch()).count());
+    std::lock_guard<std::mutex> hold(g_picture_times_lock);
+    const u64 n = g_game_pictures.load(std::memory_order_relaxed);
+    u64 longest = std::exchange(g_picture_longest[reader & 1], 0);
+    if (n) longest = std::max(longest, now - g_picture_times[(n - 1) & 255]);    // a wait going on now counts
+    return double(longest) / 1e6;
+}
+
+void SetGamePictureRate(double per_second) { g_game_picture_rate = per_second; }
+double GamePictureRate() { return g_game_picture_rate; }
 
 bool GpuPrimary() { return g_bridge && g_bridge->primary; }
 
@@ -3214,11 +3344,26 @@ void ApplyAnisotropySetting() {
     ps2gpu::SetAnisotropy(v == "off" ? 0 : std::atoi(v.c_str()));
 }
 
+void ApplyTextureFilteringSetting() {
+#ifdef __ANDROID__
+    const char* automatic = "fast";         // a phone's GPU: the GS's filter in the shader is its per-pixel cost
+#else
+    const char* automatic = "accurate";
+#endif
+    std::string v = Setting("texture_filtering", "auto");
+    if (v != "accurate" && v != "fast") v = automatic;
+    // PS2HOST_TEXTURE_FILTERING=accurate|fast (a measured run, the settings file aside).
+    if (const char* e = std::getenv("PS2HOST_TEXTURE_FILTERING"); e && (std::string(e) == "accurate" || std::string(e) == "fast"))
+        v = e;
+    ps2gpu::SetTextureFiltering(v == "fast" ? 1 : 0);
+    std::fprintf(stderr, "[gpu] texture filtering %s\n", v.c_str());
+}
+
 void PresentWaiting() {
     if (!g_present_waits) return;
     g_present_waits = false;
     if (ps2gpu::Display* display = WindowDisplay()) {
-        const bool pace = !VirtualClock() && SettingOn("frame_pacing", FramePacingDefault());    // (PC SETTINGS)
+        const bool pace = !VirtualClock() && FramePacingPaced();    // (FRAME PACING: PACED or IMMEDIATE)
         PresentGpuPicture(*display, pace ? FrameDue(g_present_frame) : 0);
     }
 }

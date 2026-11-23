@@ -23,6 +23,7 @@
 #define PS2GPU_GS_RENDERER_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -152,6 +153,10 @@ struct GsDrawState {
     std::uint32_t csa = 0;
     bool palette_eight = true;                           /* 8-bit indices, else 4-bit at CSA */
     std::uint64_t clut_version = 0;
+    /* The texels' alpha, where the bridge knows it (a palette's CLUT rows as the GS model holds them): every
+       texel's within [tex_alpha_lo, tex_alpha_hi]; lo > hi unknown. Lets an alpha test the range decides be
+       folded away (DrawTriangles); not part of the batch's state. */
+    std::int32_t tex_alpha_lo = 1, tex_alpha_hi = 0;
 
     /* The alpha test (TEST.ATE, ATST, AREF, AFAIL). What a failing pixel
        writes: AFAIL 0 KEEP nothing, 1 FB_ONLY its colour (not depth), 2
@@ -396,6 +401,18 @@ public:
         (void)fbp, (void)fbw, (void)psm, (void)image, (void)layout, (void)width, (void)height;
         return false;
     }
+    /* DisplayTarget's answer handed to `then` (ok, image, layout, width, height), in turn after everything asked
+       before: here at once; a renderer on a thread of its own (ThreadedGsRenderer) calls it on that thread when it
+       gets there, the caller not held up until the queue is drawn (agent L, 2026-11-21: on an Odin 2 the GS thread
+       waited 12-15 ms a frame there, the renderer's thread and it in turn instead of side by side). */
+    virtual void DisplayTargetThen(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
+                                   std::function<void(bool, std::uint64_t, int, std::uint32_t, std::uint32_t)> then) {
+        std::uint64_t image = 0;
+        int layout = 0;
+        std::uint32_t width = 0, height = 0;
+        const bool ok = DisplayTarget(fbp, fbw, psm, &image, &layout, &width, &height);
+        then(ok, image, layout, width, height);
+    }
     /* A target's pixels, RGBA in memory, rows top-down; false if there is none. */
     virtual bool ReadTarget(std::uint32_t fbp, std::uint32_t fbw, std::uint32_t psm,
                             std::vector<std::uint32_t>* pixels, std::uint32_t* width,
@@ -412,6 +429,10 @@ std::unique_ptr<GsRenderer> CreateGsRenderer(Gpu& gpu, std::string* error);
    pipelines the game has drawn with (gpu_pipelines.txt) - made again at the
    start, from the cache, so none is built in the middle of a race. Set
    before CreateGsRenderer; "" (a scripted run) keeps nothing. */
+/* The renderer's waits for the GPU queue's lock so far (ns): the present may hold it (the GPU thread log's). */
+std::uint64_t QueueWaitNanoseconds();
+std::uint64_t GpuWaitNanoseconds();
+std::uint64_t ShaderStandIns();         /* batches drawn by a stand-in or kept waiting for their pipeline so far */     /* its waits for the GPU (fences) so far */
 void SetPipelineCacheDir(const std::string& dir);
 /* Pipelines a game is known to draw with (keys as gpu_pipelines.txt has
    them), made by the renderer's worker from the start as the last runs'
@@ -427,6 +448,13 @@ enum ShaderCompile { kShaderOff = 0, kShaderSkip = 1, kShaderWait = 2, kShaderHy
 /* ANISOTROPIC FILTER (porting guide 4b, a PC enhancement, off by default): the most bilinear taps a texture
    sample takes along its footprint's long axis - 0 or 1 off, 2, 4, 8, 16. Any thread; the next batches take it. */
 void SetAnisotropy(int taps);
+/* TEXTURE FILTERING: 0 ACCURATE - the GS's own bilinear filter in gs.frag, bit for bit (and ANISOTROPIC FILTER's
+   taps of it); 1 FAST - a texture the GPU's sampler can filter as the GS does (a texture from memory, its texels
+   RGBA - palettes baked in -, REPEAT or CLAMP, no mipmaps) is filtered by the sampler, ANISOTROPIC FILTER by the
+   sampler's own; not bit-exact (the GPU's sub-texel precision, not the GS's 1/16 steps). Any thread; the next
+   batches take it; the bridge bakes palettes for FAST (TextureFilteringFast). */
+void SetTextureFiltering(int mode);
+bool TextureFilteringFast();
 void SetShaderCompileMode(int mode);
 int ShaderCompileMode();
 /* SHADER NOTICE: true while draws are waiting for, skipped for or standing in for pipelines being made (and

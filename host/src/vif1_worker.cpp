@@ -186,7 +186,12 @@ void Vif1RunFrame(std::function<void()> command) {
     // The worker at most kFramesBehind frames behind the EE: what is shown
     // lags what the game has done by no more (input to picture), and the EE
     // waits for the worker, not the other way round.
-    constexpr int kFramesBehind = 2;
+    // PS2HOST_VIF1_FRAMES_BEHIND=n: another depth (a frame more absorbs a stage's late frame, a frame more lag).
+    static const int kFramesBehind = [] {
+        const char* e = std::getenv("PS2HOST_VIF1_FRAMES_BEHIND");
+        const int n = e ? std::atoi(e) : 0;
+        return n >= 1 && n <= 8 ? n : 2;
+    }();
     if (w.frames.load() >= kFramesBehind) {
         Timed timed(Section::GsWait);
         Waited waited{g_frame_wait_us};

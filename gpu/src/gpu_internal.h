@@ -5,6 +5,26 @@
 
 #include <volk.h>
 
+#include <cstdlib>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
+/* volkInitialize, or - SDL_VULKAN_LIBRARY set (Android: the app's driver shim, which picks the system driver or the
+   player's Turnip) - that library's vkGetInstanceProcAddr, so the game and SDL's surface use the same Vulkan. */
+inline VkResult LoadVulkan() {
+#ifndef _WIN32
+    if (const char* lib = std::getenv("SDL_VULKAN_LIBRARY"); lib && *lib) {
+        if (void* h = dlopen(lib, RTLD_NOW | RTLD_LOCAL)) {
+            if (auto gipa = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(h, "vkGetInstanceProcAddr"))) {
+                volkInitializeCustom(gipa);
+                return VK_SUCCESS;
+            }
+        }
+    }
+#endif
+    return volkInitialize();
+}
+
 #include <atomic>
 #include <chrono>
 #include <functional>
@@ -25,6 +45,42 @@ inline std::uint64_t g_submits = 0;
    submissions, presents and the device's wait-idle from one thread at a
    time, and the display presents from a thread of its own. */
 inline std::mutex g_queue_lock;
+/* The renderer's waits for g_queue_lock (its submits; the present thread may hold it), summed - the GPU thread log's. */
+inline std::atomic<std::uint64_t> g_queue_wait_ns{0};
+/* ...and its waits for the GPU (a recording slot's fence: the ring full, or a sync), summed. */
+inline std::atomic<std::uint64_t> g_gpu_wait_ns{0};
+/* VK_EXT_extended_dynamic_state3's colour blending - enable, equation, write mask - as dynamic state: the GS
+   renderer's pipelines then differ by shader only, not by each draw's blending (agent L, 2026-11-22: ZOE's boss
+   fight bound a pipeline every third draw, the alpha-blended and opaque passes taking turns; a bind on Turnip
+   copies its program state, ~20 % of the renderer's thread). Taken where the device offers all three, unless
+   PS2HOST_GPU_DYNAMIC_BLEND=0; set by whoever makes the device (the window's, or VulkanGpu's own). */
+inline std::atomic<bool> g_dynamic_blend{false};
+/* The device's offer: true with `f3` filled in (all three on) and the extension's name added to `extensions` - the
+   caller chains `f3` into its features and enables them, then sets g_dynamic_blend. */
+inline bool OfferDynamicBlend(VkPhysicalDevice gpu, VkPhysicalDeviceExtendedDynamicState3FeaturesEXT* f3,
+                              std::vector<const char*>* extensions) {
+    if (const char* e = std::getenv("PS2HOST_GPU_DYNAMIC_BLEND"); e && e[0] == '0') return false;
+    std::uint32_t count = 0;
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, nullptr);
+    std::vector<VkExtensionProperties> offered(count);
+    vkEnumerateDeviceExtensionProperties(gpu, nullptr, &count, offered.data());
+    bool has = false;
+    for (const auto& e : offered) has = has || std::string(e.extensionName) == VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME;
+    if (!has) return false;
+    VkPhysicalDeviceExtendedDynamicState3FeaturesEXT query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    f2.pNext = &query;
+    vkGetPhysicalDeviceFeatures2(gpu, &f2);
+    if (!query.extendedDynamicState3ColorBlendEnable || !query.extendedDynamicState3ColorBlendEquation ||
+        !query.extendedDynamicState3ColorWriteMask)
+        return false;
+    *f3 = VkPhysicalDeviceExtendedDynamicState3FeaturesEXT{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_3_FEATURES_EXT};
+    f3->extendedDynamicState3ColorBlendEnable = VK_TRUE;
+    f3->extendedDynamicState3ColorBlendEquation = VK_TRUE;
+    f3->extendedDynamicState3ColorWriteMask = VK_TRUE;
+    extensions->push_back(VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+    return true;
+}
 inline double g_wait_seconds = 0;
 inline GpuWaitObserver g_wait_observer = nullptr;      // SetGpuWaitObserver
 /* The GPU's time on the command buffers handed over, in all (timestamps at
@@ -64,6 +120,8 @@ public:
     bool InitShared(VkInstance instance, VkPhysicalDevice gpu, VkDevice device, std::uint32_t family, VkQueue queue,
                     bool dual_source, const std::string& describe, std::string* error);
     std::string Describe() const override { return describe_; }
+    /* samplerAnisotropy (enabled where supported) and the device's limit into sampler_anisotropy, max_anisotropy. */
+    void NoteAnisotropy(VkPhysicalDevice physical, const VkPhysicalDeviceFeatures& supported);
 
     std::uint32_t FindMemory(std::uint32_t bits, VkMemoryPropertyFlags wanted) const;
     /* Records into the open command buffer (opening one if none is), to run
@@ -105,6 +163,11 @@ public:
     }
     /* Counts command buffers begun: what was set in one is not in the next. */
     std::uint64_t recording_id() const { return recordings_; }
+    /* The recording the next recorded work goes into: the open one, or the one the next Record begins - for what
+       is placed for it ahead (the GS renderer's CLUT ring, filled as primitives arrive): recording_id() is the
+       next one's only once it has begun (agent L, 2026-11-22: what was placed before a frame's first recording
+       began was counted for the recording before, and the new one's own entries wrote over it). */
+    std::uint64_t filling_id() const { return open_ ? recordings_ : recordings_ + 1; }
     static constexpr int kSlots = 3;
     /* The command buffer recording goes into (or will). */
     int slot() const { return current_; }
@@ -127,6 +190,9 @@ public:
     bool dual_source = false;       /* dualSrcBlend: the GS's blending */
     bool logic_op = false;          /* logicOp: FBMSK's partly masked channels */
     bool bc = false;                /* textureCompressionBC: texture packs' DDS uploaded as they are */
+    /* samplerAnisotropy and its limit: TEXTURE FILTERING FAST's anisotropic filter in the GPU's sampler */
+    bool sampler_anisotropy = false;
+    float max_anisotropy = 1.0f;
     bool owns_device = true;
 
 private:
@@ -190,7 +256,10 @@ void VulkanGpu::Record(F&& record, int line) {
 inline bool VulkanGpu::Retire(int slot, const char* why) {
     if (!in_flight_[slot]) return true;
     const auto start = std::chrono::steady_clock::now();
+    const auto fence_waiting = std::chrono::steady_clock::now();
     const bool ok = vkWaitForFences(device, 1, &fences[slot], VK_TRUE, UINT64_MAX) == VK_SUCCESS;
+    g_gpu_wait_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - fence_waiting).count()), std::memory_order_relaxed);
     const auto end = std::chrono::steady_clock::now();
     const double waited = std::chrono::duration<double>(end - start).count();
     g_wait_seconds += waited;
@@ -245,7 +314,10 @@ inline bool VulkanGpu::Flush() {
     vkResetFences(device, 1, &fences[current_]);
     bool ok;
     {
+        const auto waiting = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> hold(g_queue_lock);
+        g_queue_wait_ns.fetch_add(std::uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - waiting).count()), std::memory_order_relaxed);
         ok = vkQueueSubmit(queue, 1, &submit, fences[current_]) == VK_SUCCESS;
     }
     ++g_submits;

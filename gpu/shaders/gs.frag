@@ -19,6 +19,7 @@ layout(location = 0) in vec4 shade;
 layout(location = 1) noperspective in vec3 coordinate;
 layout(location = 2) noperspective in float fog;
 layout(location = 3) flat in vec4 range;   // a sprite's S, T at its first and last pixels (gs.vert)
+layout(location = 4) flat in uint draw_clut;    // the primitive's CLUT in the ring (gs.vert; was p.clut)
 
 layout(set = 0, binding = 0) uniform sampler2D texture_image;
 // The same image's texels as 32-bit words (R in bits 0-7, A in 24-31): the
@@ -113,8 +114,8 @@ vec4 Expand(vec4 t) {
     }
     if (p.tex_format == 5u) {                       // indices: the draw's CLUT, a 4-bit one at CSA's row
         const uint i = uint(t.a) & 255u;
-        const uint at = ((p.clut >> 27) & 1u) != 0u ? i : (((p.clut >> 22) & 31u) * 16u + (i & 15u)) & 255u;
-        const uint c = ring[(p.clut & 0x3FFFFFu) + at];
+        const uint at = ((draw_clut >> 27) & 1u) != 0u ? i : (((draw_clut >> 22) & 31u) * 16u + (i & 15u)) & 255u;
+        const uint c = ring[(draw_clut & 0x3FFFFFu) + at];
         return vec4(float(c & 255u), float((c >> 8) & 255u), float((c >> 16) & 255u), float(c >> 24));
     }
     bool black = t.r + t.g + t.b == 0.0;
@@ -284,6 +285,14 @@ vec4 ReplacedSample(vec2 r, float footprint) {
 // along the long way, evenly over it, averaged - a floor far off sharp, not a smear.
 vec2 g_major = vec2(0.0);       // the footprint's long axis (main), in level 0's texels
 int g_taps = 1;
+// TEXTURE FILTERING FAST (blend_ops bit 17, gs_renderer.cpp): the GPU's sampler filters - bilinear, and its own
+// anisotropic filter if the set's sampler has one - in one fetch. The pixel's footprint from main (before a
+// sprite's clamp), in the image's normalized coordinates.
+vec2 g_hw_dx = vec2(0.0), g_hw_dy = vec2(0.0);
+bool HardwareFiltered() { return ((p.blend_ops >> 17) & 1u) != 0u; }
+vec4 HardwareSample(vec2 uv) {
+    return floor(textureGrad(texture_image, uv / vec2(ImageSize()), g_hw_dx, g_hw_dy) * 255.0 + 0.5);
+}
 vec4 AnisoSample(vec2 uv, int n, bool linear) {
     if (!linear || g_taps <= 1) return Sample(uv, n, linear);
     vec4 sum = vec4(0.0);
@@ -300,6 +309,7 @@ vec4 AnisoSample(vec2 uv, int n, bool linear) {
 // (the software GS's ChooseLevel).
 vec4 Sample(vec2 uv) {
     const uint m = p.bilinear;
+    if (Has(kLinear) && HardwareFiltered()) return HardwareSample(uv);
     if (!Has(kMip) || (m & 2u) == 0u) return AnisoSample(uv, 0, Has(kLinear) && (m & 1u) != 0u);
     const int mxl = int((m >> 2) & 7u);
     const uint mmin = (m >> 5) & 7u;
@@ -330,6 +340,11 @@ void main() {
     vec4 c = v;
     if (Has(kTextured) && p.textured != 0u) {
         vec2 uv = coordinate.xy / coordinate.z * vec2(TextureSize());
+        // TEXTURE FILTERING FAST's footprint (HardwareSample), from the coordinates before any clamp below.
+        if (Has(kLinear) && HardwareFiltered()) {
+            g_hw_dx = dFdx(uv) / vec2(ImageSize());
+            g_hw_dy = dFdy(uv) / vec2(ImageSize());
+        }
         // ANISOTROPIC FILTER's footprint (AnisoSample), from the coordinates before any clamp below.
         if (Has(kLinear) && (p.bilinear >> 28) != 0u) {
             const vec2 dx = dFdx(uv), dy = dFdy(uv);

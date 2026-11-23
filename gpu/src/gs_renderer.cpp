@@ -61,8 +61,13 @@ struct PackedVertex {
     std::uint32_t z;
     std::uint8_t fog, pad[3];
     float range[4];             // a sprite's S, T at its first and last pixels (gs.vert)
-    float pad2[4];
+    std::uint32_t clut;         // a palettized texture's CLUT in the ring, CSA, 8-bit (gs.vert's; DrawTriangles)
+    float pad2[3];
 };
+/* Each primitive carries its CLUT (PackedVertex::clut), so a new CLUT - or CSA - ends no batch (agent L, 2026-11-22:
+   ~70 % of ZOE's batches in a fight ended on a new CLUT, the Odin 2's GPU busy with ~4,500 draws a frame).
+   PS2HOST_GPU_CLUT_FLUSH=1: a batch per CLUT, as before (to compare). */
+const bool g_clut_per_primitive = std::getenv("PS2HOST_GPU_CLUT_FLUSH") == nullptr;
 // The vertex ring hands out 256-byte aligned runs, a batch's first vertex
 // found by its offset: whole vertices to 256 bytes.
 static_assert(256 % sizeof(PackedVertex) == 0, "a vertex must divide the ring's alignment");
@@ -171,7 +176,7 @@ constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT_S8_UINT;
 
 struct Texture {
     Image image;
-    VkDescriptorSet sets[8] = {};       /* by sampler */
+    VkDescriptorSet sets[28] = {};      /* by sampler: samplers_' 8, then FAST's 20 (kHwSampler) */
     /* A texture drawn as a texture pack's replacement (UseReplacement): its
        id, 0 for none. A replacement itself (replacements_): gs.frag's
        tex_format for it - bit 8, levels - 1 in bits 9-11 - when it was last
@@ -206,15 +211,25 @@ std::uint64_t g_clut_flushes = 0;       /* batches ended by a new CLUT (ClutVers
 std::atomic<int> g_shader_mode{kShaderHybrid};  // SetShaderCompileMode's wish (the renderer takes it a picture)
 std::uint64_t g_shader_skips = 0;               // draws SKIP / WAIT left out (their pipeline not made yet)
 std::atomic<int> g_anisotropy{0};               // SetAnisotropy: 0 off, 1 2x .. 4 16x (log2 of the taps)
+std::atomic<int> g_texture_filtering{0};        // SetTextureFiltering: 0 ACCURATE, 1 FAST
+std::uint64_t g_hw_filtered = 0;                // batches the sampler filtered (FAST; PS2HOST_GPU_COUNT)
+/* TEXTURE FILTERING FAST's samplers, after samplers_' 8 in Texture::sets: linear, the anisotropy (1, 2, 4, 8, 16:
+   the level) and CLAMP's two modes (REPEAT / CLAMP each way) - kHwSampler + level * 4 + (clamp_s << 1 | clamp_t). */
+constexpr int kHwSampler = 8, kHwLevels = 5;
 std::atomic<long long> g_building_at{0};        // when a draw last waited / skipped / stood in (steady ms)
 long long SteadyMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
-void MarkBuilding() { g_building_at.store(SteadyMs(), std::memory_order_relaxed); }
+std::atomic<std::uint64_t> g_marked_building{0};   // MarkBuilding's calls (the GPU thread log's: stand-ins and waits)
+void MarkBuilding() {
+    g_marked_building.fetch_add(1, std::memory_order_relaxed);
+    g_building_at.store(SteadyMs(), std::memory_order_relaxed);
+}
 std::uint64_t g_batches = 0;            /* batches recorded (Flush with something pending) */
 /* The two-pass breaks by AFAIL (0 KEEP .. 3 RGB_ONLY) and ZTST (0 NEVER or no depth, 1 ALWAYS, 2 GEQUAL, 3 GREATER). */
 std::uint64_t g_two_pass_breaks[4][4] = {};
+std::map<std::string, std::uint64_t> g_two_pass_kinds;   /* PS2HOST_GPU_COUNT: what the two-pass breakers are */
 std::uint64_t g_two_pass_kept = 0;      /* two-pass primitives kept in the batch: boxes touched, triangles not */
 /* Target breaks by what changed: 0 FBP, 1 FBW/PSM only, 2 FBMSK only; 3: FBP back to the one before the last
    (A, B, A). Texture breaks: 0 only the texture differs (the rest of the state equal), 1 sampling a target is
@@ -469,13 +484,20 @@ VkPipelineColorBlendAttachmentState Blending(std::uint32_t key, bool dual_source
 }
 
 bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
-    // Most primitives come with the very state of the one before (the
-    // bridge's fast path): the same bytes are the same fields, at once.
-    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     // PS2HOST_GPU_WHATIF_MERGE=1 (diagnosis only - WRONG pictures): texture, CLUT and FBMSK changes do not end a
     // batch, as state carried per primitive would let them; the GPU time and batch count it gives are what that
     // work could win at most.
     static const bool what_if = std::getenv("PS2HOST_GPU_WHATIF_MERGE") != nullptr;
+    // A few fields any batch must share, first: most asks are about another batch's state (ChooseBatch asks each
+    // open one), which these tell at once - the whole-state memcmp below ran to the end for each (the CLUT, last,
+    // differs a primitive): ~10 % of the renderer's thread (ZOE's boss fight, 2026-11-22). The same answer.
+    if (!what_if && (x.fbp != y.fbp || x.textured != y.textured || (x.textured && x.texture != y.texture) ||
+                     x.blend != y.blend || x.alpha_test != y.alpha_test || x.depth != y.depth || x.sprite != y.sprite ||
+                     x.fbmsk != y.fbmsk))
+        return false;
+    // Most primitives come with the very state of the one before (the
+    // bridge's fast path): the same bytes are the same fields, at once.
+    if (std::memcmp(&x, &y, sizeof x) == 0) return true;
     if (what_if) {
         GsDrawState a = x, b = y;
         b.fbmsk = a.fbmsk;
@@ -508,7 +530,8 @@ bool SameBatch(const GsDrawState& x, const GsDrawState& y) {
            x.texture_target == y.texture_target && x.tex_fbp == y.tex_fbp && x.tex_fbw == y.tex_fbw &&
            x.tex_target_psm == y.tex_target_psm && x.tex_format == y.tex_format && x.ta0 == y.ta0 &&
            x.ta1 == y.ta1 && x.aem == y.aem && x.palette == y.palette &&
-           (!x.palette || (x.csa == y.csa && x.palette_eight == y.palette_eight && x.clut_version == y.clut_version)))) &&
+           (!x.palette || g_clut_per_primitive ||
+            (x.csa == y.csa && x.palette_eight == y.palette_eight && x.clut_version == y.clut_version)))) &&
            x.alpha_test == y.alpha_test && (!x.alpha_test || (x.atst == y.atst && x.aref == y.aref && x.afail == y.afail)) &&
            // PipelineKey's inputs compared rather than two keys built a
            // primitive: the format, mask, width and sprite kind are compared
@@ -562,7 +585,8 @@ public:
         return targets_.count(Key{fbp, fbw, psm}) != 0;
     }
     void DrawTriangles(const GsDrawState& state, const GsVertex* vertices, std::size_t count) override;
-    void Flush() override;
+    void Flush() override;          // every open batch, oldest first
+    void FlushOne();                // the batch being filled (DrawTriangles)
     void Kick() override {
         Flush();
         g_.Flush();
@@ -646,6 +670,14 @@ private:
     std::vector<VkDeviceMemory> image_blocks_;
     void Fill(Texture& texture, const std::uint32_t* pixels);
     VkPipeline PipelineFor(std::uint32_t key);
+    /* g_dynamic_blend: blending and the write mask (a key's bits 0-12) set per draw, not made into the pipeline -
+       a key's pipeline without them (Pipeline); the functions from the device. */
+    static constexpr std::uint32_t kDynamicBlendBits = (1u << 13) - 1;
+    bool dynamic_blend_ = false;
+    PFN_vkCmdSetColorBlendEnableEXT set_blend_enable_ = nullptr;
+    PFN_vkCmdSetColorBlendEquationEXT set_blend_equation_ = nullptr;
+    PFN_vkCmdSetColorWriteMaskEXT set_write_mask_ = nullptr;
+    std::uint32_t Pipeline(std::uint32_t key) const { return dynamic_blend_ ? key & ~kDynamicBlendBits : key; }
     /* The pipeline cache (SetPipelineCacheDir): every pipeline is made
        through it; the keys PipelineFor has made, kept to make again at the
        next start (WarmPipelines); written back now and then as they grow
@@ -809,6 +841,7 @@ private:
     VkDescriptorPool pool_ = VK_NULL_HANDLE;
     bool keep_colour_ = false;      /* ReloadKeepsColour */
     VkSampler samplers_[8] = {};    /* bilinear << 2 | clamp_s << 1 | clamp_t */
+    VkSampler hw_samplers_[kHwLevels * 4] = {};     /* TEXTURE FILTERING FAST's (kHwSampler): level * 4 + clamps */
     VkPipelineLayout layout_ = VK_NULL_HANDLE;
     std::map<std::uint32_t, VkPipeline> pipelines_;
     std::uint32_t last_pipeline_key_ = ~0u;
@@ -859,6 +892,69 @@ private:
     Texture blank_;                 /* bound when nothing is textured */
     GsDrawState state_;
     PendingVertices pending_;
+    /* Batches open beside the one being filled (agent L, 2026-11-22): a primitive goes to the newest open batch of
+       its state that nothing opened after it covers - draws of two kinds taking turns (ZOE: an object's body and its
+       glow, A B A B) become A A ... B B: fewer draws, and on a tile GPU (Turnip: each draw's state change is what
+       costs) ~28 % fewer batches in ZOE's boss fight. Its order kept: a batch is recorded only after every batch
+       opened before it, and a primitive joins an older batch only where it overlaps nothing in the newer ones (their
+       boxes). A batch reading its target (a copy, blending in the shader), sampling a target or with DATE: the one
+       batch open, as before. PS2HOST_GPU_OPEN_BATCHES=N (1: one batch, as before). */
+    struct OpenBatch {
+        GsDrawState state;
+        PendingVertices pending;
+        bool drawn_any = false;
+        int drawn_x0 = 0, drawn_y0 = 0, drawn_x1 = 0, drawn_y1 = 0;
+        std::vector<BatchTri> tris;
+        std::vector<SpriteSpan> sprites;
+        FlatTriangle last_flat{};
+        bool last_flat_valid = false;
+        std::vector<FlatQuad> quads;
+        bool read_any = false, read_all = false;
+        int read_x0 = 0, read_y0 = 0, read_x1 = 0, read_y1 = 0;
+        std::uint64_t clut_recording = ~0ull;
+        float box[4] = {1e30f, 1e30f, -1e30f, -1e30f};     // what its primitives cover (GS pixels: x0, y0, x1, y1)
+        std::uint64_t order = 0;                            // when it was opened
+    };
+    std::vector<OpenBatch> parked_;                         // the open batches but the one being filled
+    // Batches closed, kept with their buffers (vertices, triangles, sprites, quads) for the next to open: an erase
+    // freed them and the next batch grew them again - ~9 % of the renderer's thread (ZOE's boss fight, 2026-11-22).
+    std::vector<OpenBatch> spare_batches_;
+    void DropParked(std::size_t i) {
+        OpenBatch& b = parked_[i];
+        // Its buffers kept (emptied), everything else as a new OpenBatch has it.
+        PendingVertices pending = std::move(b.pending);
+        std::vector<BatchTri> tris = std::move(b.tris);
+        std::vector<SpriteSpan> sprites = std::move(b.sprites);
+        std::vector<FlatQuad> quads = std::move(b.quads);
+        b = OpenBatch{};
+        pending.clear();
+        tris.clear();
+        sprites.clear();
+        quads.clear();
+        b.pending = std::move(pending);
+        b.tris = std::move(tris);
+        b.sprites = std::move(sprites);
+        b.quads = std::move(quads);
+        if (i + 1 != parked_.size()) std::swap(b, parked_.back());   // (the order is by `order`, not place)
+        spare_batches_.push_back(std::move(parked_.back()));
+        parked_.pop_back();
+    }
+    void ParkNew() {
+        if (spare_batches_.empty()) {
+            parked_.emplace_back();
+            return;
+        }
+        parked_.push_back(std::move(spare_batches_.back()));
+        spare_batches_.pop_back();
+    }
+    float box_[4] = {1e30f, 1e30f, -1e30f, -1e30f};         // the batch being filled's (OpenBatch::box)
+    std::uint64_t order_ = 0, next_order_ = 1;
+    const int open_batches_ = [] {
+        const char* n = std::getenv("PS2HOST_GPU_OPEN_BATCHES");
+        return n ? std::clamp(std::atoi(n), 1, 16) : 4;      // (ChooseBatch looks at 16 at most)
+    }();
+    void SwapBatch(OpenBatch& b);
+    void ChooseBatch(const GsDrawState& state, const float* box);
     /* Vertex data for what is recorded: appended to chunks of host-visible
        memory, all reusable once the submission that reads them has run. */
     struct VertexChunk {
@@ -926,8 +1022,21 @@ private:
     VkDeviceMemory clut_ring_memory_ = VK_NULL_HANDLE;
     std::uint32_t* clut_ring_mapped_ = nullptr;
     std::uint64_t clut_ring_recording_ = ~0ull;  // the recording the part in use is filled for
+    std::uint64_t pending_clut_recording_ = ~0ull;  // the recording the pending batch's CLUTs were placed for
     std::uint32_t clut_ring_used_ = 0;
-    std::unordered_map<std::uint64_t, std::uint32_t> clut_ring_placed_;     // version -> its first entry
+    // Version -> its first entry, this recording's: an open-addressed table whose slots count as empty unless
+    // stamped with the recording's generation (a new recording clears nothing), and the last one looked up.
+    // (An unordered_map before: a node allocated per CLUT, freed per recording - ~8 % of the renderer thread
+    // in ZOE's boss fight, 2026-11-22.)
+    struct ClutPlaced {
+        std::uint64_t version = 0;
+        std::uint32_t entry = 0, generation = 0;
+    };
+    static constexpr std::uint32_t kClutPlacedSlots = kClutRingVersions * 2;    // a power of two
+    std::vector<ClutPlaced> clut_ring_placed_ = std::vector<ClutPlaced>(kClutPlacedSlots);
+    std::uint32_t clut_ring_generation_ = 1;
+    std::uint64_t clut_last_version_ = 0;
+    std::uint32_t clut_last_entry_ = 0, clut_last_generation_ = 0;
     std::uint64_t clut_version_ = 0;            // ClutVersion's latest, and its entries
     std::uint32_t clut_version_entries_[256] = {};
     bool CanPaletteInShader() const override { return clut_ring_mapped_ != nullptr; }
@@ -945,6 +1054,7 @@ private:
         VkRect2D scissor{};
         float size[2] = {-1, -1};
         VkBuffer vertices = VK_NULL_HANDLE;
+        std::uint32_t blend_key = ~0u;      // dynamic blending: the key bits 0-12 (+ 13-15) last set
     } drawn_;
     // The CLUT for the draws (gs.frag's set 1): a target read as PSMT8H.
     VkDescriptorSetLayout clut_set_layout_ = VK_NULL_HANDLE;
@@ -1228,6 +1338,17 @@ void VulkanGsRenderer::FreeImageMemory(VkDeviceMemory memory, VkDeviceSize offse
 }
 
 bool VulkanGsRenderer::Init(std::string* error) {
+    if (g_dynamic_blend.load()) {
+        set_blend_enable_ = reinterpret_cast<PFN_vkCmdSetColorBlendEnableEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorBlendEnableEXT"));
+        set_blend_equation_ = reinterpret_cast<PFN_vkCmdSetColorBlendEquationEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorBlendEquationEXT"));
+        set_write_mask_ = reinterpret_cast<PFN_vkCmdSetColorWriteMaskEXT>(
+            vkGetDeviceProcAddr(g_.device, "vkCmdSetColorWriteMaskEXT"));
+        dynamic_blend_ = set_blend_enable_ && set_blend_equation_ && set_write_mask_;
+    }
+    std::fprintf(stderr, "[gpu] blending: %s\n", dynamic_blend_ ? "dynamic state (VK_EXT_extended_dynamic_state3)"
+                                                               : "in each pipeline");
     OpenPipelineCache();
     {
         VkPhysicalDeviceProperties properties;
@@ -1267,11 +1388,13 @@ bool VulkanGsRenderer::Init(std::string* error) {
     cli.bindingCount = 2;
     cli.pBindings = clut_bindings;
     vkCreateDescriptorSetLayout(g_.device, &cli, nullptr, &clut_set_layout_);
-    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 8192},
+    // (Twice the sets since TEXTURE FILTERING FAST: a texture may have its sampled set for the shader's own
+    // filter and one for the sampler's.)
+    VkDescriptorPoolSize sizes[2] = {{VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 2 * 16384},
                                      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8}};
     VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpi.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpi.maxSets = 8192 + 4;
+    dpi.maxSets = 16384 + 4;
     dpi.poolSizeCount = 2;
     dpi.pPoolSizes = sizes;
     vkCreateDescriptorPool(g_.device, &dpi, nullptr, &pool_);
@@ -1285,6 +1408,23 @@ bool VulkanGsRenderer::Init(std::string* error) {
         sci.maxLod = 0.0f;
         vkCreateSampler(g_.device, &sci, nullptr, &samplers_[i]);
     }
+    // TEXTURE FILTERING FAST: the GPU's bilinear filter (one level: the GS's mipmapping stays the shader's), the
+    // anisotropic filter where the device has it, 1x to 16x (capped at its limit).
+    for (int level = 0; level < kHwLevels; ++level)
+        for (int clamps = 0; clamps < 4; ++clamps) {
+            VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+            sci.magFilter = sci.minFilter = VK_FILTER_LINEAR;
+            sci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+            sci.addressModeU = (clamps & 2) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sci.addressModeV = (clamps & 1) ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_REPEAT;
+            sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+            sci.maxLod = 0.0f;
+            if (level > 0 && g_.sampler_anisotropy) {
+                sci.anisotropyEnable = VK_TRUE;
+                sci.maxAnisotropy = std::min(float(1 << level), g_.max_anisotropy);
+            }
+            vkCreateSampler(g_.device, &sci, nullptr, &hw_samplers_[level * 4 + clamps]);
+        }
     VkPushConstantRange push[2] = {{VK_SHADER_STAGE_VERTEX_BIT, 0, 8},
                                    {VK_SHADER_STAGE_FRAGMENT_BIT, kFragmentOffset, sizeof(FragmentParams)}};
     VkPipelineLayoutCreateInfo lci{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -2105,15 +2245,17 @@ void VulkanGsRenderer::WarmPipelines() {
     std::string word;
     std::vector<std::uint32_t> keys;
     while (in && in >> word) {
-        const std::uint32_t key = std::uint32_t(std::strtoul(word.c_str(), nullptr, 16));
+        const std::uint32_t key = Pipeline(std::uint32_t(std::strtoul(word.c_str(), nullptr, 16)));
         if (pipelines_.count(key) || !pipelines_asked_.insert(key).second) continue;
         known_keys_.insert(key);
         keys.push_back(key);
     }
     // The game's own list after (SetPipelineHints): kept in the file only
     // once drawn with.
-    for (std::uint32_t key : g_pipeline_hints)
+    for (std::uint32_t hint : g_pipeline_hints) {
+        const std::uint32_t key = Pipeline(hint);
         if (!pipelines_.count(key) && pipelines_asked_.insert(key).second) keys.push_back(key);
+    }
     if (keys.empty()) return;
     // The whole shader's (a blend's, no features) first: every draw of a
     // kind not made yet stands in with one of them, and the GS thread makes
@@ -2232,6 +2374,7 @@ void VulkanGsRenderer::SavePipelineCache() {
 }
 
 VkPipeline VulkanGsRenderer::PipelineFor(std::uint32_t key) {
+    key = Pipeline(key);
     // Batch after batch asks for the same one.
     if (key == last_pipeline_key_ && last_pipeline_) return last_pipeline_;
     // SHADER COMPILE's wish (SetShaderCompileMode) taken.
@@ -2357,17 +2500,18 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     VkSpecializationInfo specialisation{1, &feature_entry, sizeof features, &features};
     stages[1].pSpecializationInfo = &specialisation;
     VkVertexInputBindingDescription binding{0, sizeof(PackedVertex), VK_VERTEX_INPUT_RATE_VERTEX};
-    VkVertexInputAttributeDescription attributes[6] = {
+    VkVertexInputAttributeDescription attributes[7] = {
         {0, 0, VK_FORMAT_R32G32_SFLOAT, offsetof(PackedVertex, x)},
         {1, 0, VK_FORMAT_R8G8B8A8_UNORM, offsetof(PackedVertex, r)},
         {2, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(PackedVertex, s)},
         {3, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, z)},
         {4, 0, VK_FORMAT_R8_UNORM, offsetof(PackedVertex, fog)},
-        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)}};
+        {5, 0, VK_FORMAT_R32G32B32A32_SFLOAT, offsetof(PackedVertex, range)},
+        {6, 0, VK_FORMAT_R32_UINT, offsetof(PackedVertex, clut)}};
     VkPipelineVertexInputStateCreateInfo input{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
     input.vertexBindingDescriptionCount = 1;
     input.pVertexBindingDescriptions = &binding;
-    input.vertexAttributeDescriptionCount = 6;
+    input.vertexAttributeDescriptionCount = 7;
     input.pVertexAttributeDescriptions = attributes;
     VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
     assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
@@ -2395,9 +2539,11 @@ VkPipeline VulkanGsRenderer::MakePipeline(std::uint32_t key) {
     depth.back = depth.front;
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR,
                                        VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
-                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE};
+                                       VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
+                                       VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT, VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                                       VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
-    dynamic.dynamicStateCount = 6;
+    dynamic.dynamicStateCount = dynamic_blend_ ? 9 : 6;
     dynamic.pDynamicStates = dynamic_states;
     const VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;
     VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
@@ -2558,7 +2704,7 @@ VkDescriptorSet VulkanGsRenderer::SetFor(Texture& texture, int sampler) {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &set_layout_;
     if (vkAllocateDescriptorSets(g_.device, &ai, &set) != VK_SUCCESS) return VK_NULL_HANDLE;
-    WriteTextureSet(set, samplers_[sampler], texture.image);
+    WriteTextureSet(set, sampler >= kHwSampler ? hw_samplers_[sampler - kHwSampler] : samplers_[sampler], texture.image);
     return set;
 }
 
@@ -2917,8 +3063,10 @@ void VulkanGsRenderer::ClutRows(const std::uint32_t* clut, std::uint32_t rows) {
 void VulkanGsRenderer::ClutVersion(std::uint64_t version, const std::uint32_t* entries) {
     if (version == clut_version_) return;
     static const bool what_if = std::getenv("PS2HOST_GPU_WHATIF_MERGE") != nullptr;    // (SameBatch's)
-    if (!pending_.empty() && !what_if) ++g_clut_flushes;
-    if (!what_if) Flush();          // what is pending draws with the CLUT before
+    if (!g_clut_per_primitive) {    // (each primitive's own otherwise: PackedVertex::clut)
+        if (!pending_.empty() && !what_if) ++g_clut_flushes;
+        if (!what_if) Flush();      // what is pending draws with the CLUT before
+    }
     clut_version_ = version;
     std::memcpy(clut_version_entries_, entries, sizeof clut_version_entries_);
 }
@@ -2926,14 +3074,26 @@ void VulkanGsRenderer::ClutVersion(std::uint64_t version, const std::uint32_t* e
 /* The current CLUT (ClutVersion) in the ring's part for the recording under way, placed there if it is
    not yet: its first entry. Called while recording (the recording's id is the one its draws go into). */
 std::uint32_t VulkanGsRenderer::ClutRingEntry() {
-    if (g_.recording_id() != clut_ring_recording_) {
-        clut_ring_recording_ = g_.recording_id();
+    if (g_.filling_id() != clut_ring_recording_) {
+        clut_ring_recording_ = g_.filling_id();
         clut_ring_used_ = 0;
-        clut_ring_placed_.clear();
+        if (++clut_ring_generation_ == 0) {         // (wrapped: every slot's stamp cleared once)
+            for (ClutPlaced& p : clut_ring_placed_) p.generation = 0;
+            clut_ring_generation_ = 1;
+        }
     }
+    if (clut_last_generation_ == clut_ring_generation_ && clut_last_version_ == clut_version_) return clut_last_entry_;
     const std::uint32_t part = std::uint32_t(g_.slot()) * kClutRingVersions * 256;
-    auto found = clut_ring_placed_.find(clut_version_);
-    if (found != clut_ring_placed_.end()) return found->second;
+    std::uint32_t slot = std::uint32_t((clut_version_ * 0x9E3779B97F4A7C15ull) >> 40) & (kClutPlacedSlots - 1);
+    while (clut_ring_placed_[slot].generation == clut_ring_generation_) {
+        if (clut_ring_placed_[slot].version == clut_version_) {
+            clut_last_version_ = clut_version_;
+            clut_last_entry_ = clut_ring_placed_[slot].entry;
+            clut_last_generation_ = clut_ring_generation_;
+            return clut_last_entry_;
+        }
+        slot = (slot + 1) & (kClutPlacedSlots - 1);
+    }
     if (clut_ring_used_ == kClutRingVersions) {
         // The part full within one recording (thousands of CLUTs): its first CLUTs written over - the draws
         // that read them recorded already, and this recording's CLUTs placed again from the start would
@@ -2944,7 +3104,10 @@ std::uint32_t VulkanGsRenderer::ClutRingEntry() {
     }
     const std::uint32_t entry = part + clut_ring_used_++ * 256;
     std::memcpy(clut_ring_mapped_ + entry, clut_version_entries_, 1024);
-    clut_ring_placed_[clut_version_] = entry;
+    clut_ring_placed_[slot] = ClutPlaced{clut_version_, entry, clut_ring_generation_};
+    clut_last_version_ = clut_version_;
+    clut_last_entry_ = entry;
+    clut_last_generation_ = clut_ring_generation_;
     return entry;
 }
 
@@ -3111,7 +3274,69 @@ void VulkanGsRenderer::UploadDepth(std::uint32_t zbp, std::uint32_t width, std::
 }
 
 void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v, std::size_t count) {
+    // An alpha test the vertices decide (no texel alpha: untextured, or TCC 0 - the alpha is the vertex's, the
+    // pixels' between theirs): all pass - no test (one pass, no two-pass batch break); all fail with AFAIL
+    // FB_ONLY - the colour without the test, depth not written. The same pixels (ZOE's boss fight, 2026-11-22:
+    // ~58 % of its ~720 two-pass breaks a frame were TCC 0 at vertex alpha 0x80 against GEQUAL 0x40).
+    // (PS2HOST_GPU_NO_TEXEL_ALPHA_FOLD=1: only the vertices' - no texel alpha.)
+    // With texel alpha whose range the bridge knows (a palette's CLUT rows): the pixel's alpha's range from the
+    // texels' and the vertices' by TFX - MODULATE At * Af / 128, DECAL and HIGHLIGHT2 At, HIGHLIGHT At + Af -
+    // widened by one each way (the shader's rounding).
+    const bool texel_alpha = state.textured && state.tcc;
+    static const bool no_texel_fold = std::getenv("PS2HOST_GPU_NO_TEXEL_ALPHA_FOLD") != nullptr;
+    if (state.alpha_test && state.atst != 1 && count >= 3 &&
+        (!texel_alpha || (!no_texel_fold && state.tex_alpha_lo <= state.tex_alpha_hi))) {
+        int amin = 255, amax = 0;
+        for (std::size_t i = 0; i < count; ++i) amin = std::min<int>(amin, v[i].a), amax = std::max<int>(amax, v[i].a);
+        if (texel_alpha) {
+            const int tlo = state.tex_alpha_lo, thi = state.tex_alpha_hi;
+            switch (state.tfx) {
+                case TextureFunction::Modulate: amin = tlo * amin / 128, amax = thi * amax / 128; break;
+                case TextureFunction::Highlight: amin = tlo + amin, amax = thi + amax; break;
+                default: amin = tlo, amax = thi; break;
+            }
+            amin = std::clamp(amin - 1, 0, 255);
+            amax = std::clamp(amax + 1, 0, 255);
+        }
+        const auto passes = [&](int a) {
+            const int ref = int(state.aref & 0xFF);
+            switch (state.atst) {
+                case 0: return false;
+                case 2: return a < ref;
+                case 3: return a <= ref;
+                case 4: return a == ref;
+                case 5: return a >= ref;
+                case 6: return a > ref;
+                case 7: return a != ref;
+                default: return true;
+            }
+        };
+        bool all_pass = true, all_fail = true;
+        for (int a = amin; a <= amax; ++a) {
+            const bool p = passes(a);
+            all_pass = all_pass && p;
+            all_fail = all_fail && !p;
+        }
+        static const bool off = std::getenv("PS2HOST_GPU_NO_ATEST_FOLD") != nullptr;
+        if (!off && (all_pass || (all_fail && state.afail == 1))) {
+            GsDrawState folded = state;
+            folded.alpha_test = false;
+            folded.atst = 1;
+            folded.aref = 0;
+            folded.afail = 0;
+            if (!all_pass) folded.depth_write = false;
+            DrawTriangles(folded, v, count);
+            return;
+        }
+    }
     RecordShuffle();
+    // What it covers, and the open batch it goes to (ChooseBatch: the one being filled after it).
+    float box[4] = {1e30f, 1e30f, -1e30f, -1e30f};
+    for (std::size_t i = 0; i < count; ++i) {
+        box[0] = std::min(box[0], v[i].x), box[1] = std::min(box[1], v[i].y);
+        box[2] = std::max(box[2], v[i].x), box[3] = std::max(box[3], v[i].y);
+    }
+    if (open_batches_ > 1 && count >= 3) ChooseBatch(state, box);
     if (!SameBatch(state, state_)) {
         if (!pending_.empty()) {
             const BatchBreak why = BreakWhy(state, state_);
@@ -3154,7 +3379,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
                 if (state.texture != state_.texture) tex_before = state_.texture;
             }
         }
-        Flush();
+        FlushOne();     // (ChooseBatch parked the others; with one batch open, the same as Flush)
     }
     // A primitive sampling the target it draws into, where the batch has
     // drawn already: the batch so far first (the next takes a new copy).
@@ -3211,8 +3436,28 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
         if (reads_drawn || (shader_blend && overlaps(x0, y0, x1, y1)) || two_pass_real) {
             if (!pending_.empty()) {
                 ++g_batch_breaks[reads_drawn ? kBreakOverlapFeedback : shader_blend ? kBreakOverlap : kBreakOverlapTwoPass];
-                if (!reads_drawn && !shader_blend)
+                if (!reads_drawn && !shader_blend) {
                     ++g_two_pass_breaks[state.afail & 3u][state.depth ? (state.ztst & 3u) : 0u];
+                    static const bool count_kinds = std::getenv("PS2HOST_GPU_COUNT") != nullptr;
+                    if (count_kinds) {
+                        int amin = 255, amax = 0;
+                        std::uint32_t zmin = ~0u, zmax = 0;
+                        for (std::size_t i = 0; i < count; ++i) {
+                            amin = std::min<int>(amin, v[i].a), amax = std::max<int>(amax, v[i].a);
+                            zmin = std::min(zmin, v[i].z), zmax = std::max(zmax, v[i].z);
+                        }
+                        char k[200];
+                        std::snprintf(k, sizeof k, "%s%s tfx%u tcc%d atst%u aref%02X va%02X-%02X blend%d %s %s tris%zu",
+                                      !state.textured ? "untex" : state.texture_target ? "target" : state.palette
+                                          ? (state.palette_eight ? "pal8" : "pal4") : "fmt",
+                                      state.textured && !state.palette && !state.texture_target
+                                          ? std::to_string(state.tex_format).c_str() : "",
+                                      unsigned(state.tfx), int(state.tcc), state.atst, state.aref, amin, amax,
+                                      int(state.blend), zmin == zmax ? "zconst" : "zvar",
+                                      state.sprite_prim ? "sprite" : "tri", count / 3);
+                        ++g_two_pass_kinds[k];
+                    }
+                }
             }
             Flush();
         }
@@ -3359,6 +3604,13 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             last_flat_valid_ = true;
         }
     }
+    // The primitive's CLUT in the ring, placed for this recording now (Flush checks the batch is recorded in it).
+    std::uint32_t clut = 0;
+    if (state.textured && state.palette && clut_ring_mapped_) {
+        clut = ClutRingEntry() | (state.csa & 31u) << 22 | (state.palette_eight ? 1u : 0u) << 27;
+        pending_clut_recording_ = g_.filling_id();
+    }
+    for (int i = 0; i < 2; ++i) box_[i] = std::min(box_[i], box[i]), box_[i + 2] = std::max(box_[i + 2], box[i + 2]);
     PackedVertex* out = pending_.Grow(count / 3 * 3);
     for (std::size_t i = 0; i + 2 < count; i += 3) {
         for (int k = 0; k < 3; ++k, ++out) {
@@ -3377,6 +3629,7 @@ void VulkanGsRenderer::DrawTriangles(const GsDrawState& state, const GsVertex* v
             out->z = p.z;
             out->fog = p.fog;
             for (int n = 0; n < 4; ++n) out->range[n] = range[n];
+            out->clut = clut;
         }
     }
 }
@@ -3437,8 +3690,96 @@ void VulkanGsRenderer::FlatQuadRange(FlatQuad& q, const GsDrawState& state) {
     }
 }
 
+void VulkanGsRenderer::SwapBatch(OpenBatch& b) {
+    std::swap(state_, b.state);
+    std::swap(pending_, b.pending);
+    std::swap(drawn_any_, b.drawn_any);
+    std::swap(drawn_x0_, b.drawn_x0), std::swap(drawn_y0_, b.drawn_y0);
+    std::swap(drawn_x1_, b.drawn_x1), std::swap(drawn_y1_, b.drawn_y1);
+    std::swap(batch_tris_, b.tris);
+    std::swap(sprites_, b.sprites);
+    std::swap(last_flat_, b.last_flat);
+    std::swap(last_flat_valid_, b.last_flat_valid);
+    std::swap(quads_, b.quads);
+    std::swap(read_any_, b.read_any), std::swap(read_all_, b.read_all);
+    std::swap(read_x0_, b.read_x0), std::swap(read_y0_, b.read_y0);
+    std::swap(read_x1_, b.read_x1), std::swap(read_y1_, b.read_y1);
+    std::swap(pending_clut_recording_, b.clut_recording);
+    for (int i = 0; i < 4; ++i) std::swap(box_[i], b.box[i]);
+    std::swap(order_, b.order);
+}
+
 void VulkanGsRenderer::Flush() {
+    // The parked batches and the one being filled, oldest first.
+    while (!parked_.empty()) {
+        auto oldest = std::min_element(parked_.begin(), parked_.end(),
+                                       [](const OpenBatch& a, const OpenBatch& b) { return a.order < b.order; });
+        if (!pending_.empty() && order_ < oldest->order) FlushOne();
+        SwapBatch(*oldest);
+        FlushOne();
+        SwapBatch(*oldest);
+        DropParked(std::size_t(oldest - parked_.begin()));
+    }
+    FlushOne();
+}
+
+/* Where a primitive of `state` covering `box` goes (DrawTriangles, before its own checks): the newest open batch of its
+   state that no batch opened after it covers, made the one being filled - or a new batch, the newest; past
+   open_batches_, the oldest recorded. */
+void VulkanGsRenderer::ChooseBatch(const GsDrawState& state, const float* box) {
+    auto unsafe = [&](const GsDrawState& st) { return ShaderBlend(st) || (st.textured && st.texture_target) || st.date; };
+    if (unsafe(state) || (!pending_.empty() && unsafe(state_))) {
+        if (!parked_.empty()) Flush();          // one batch for it, as before - the others recorded first
+        return;
+    }
+    auto covers = [&](const float* o) { return box[0] < o[2] && o[0] < box[2] && box[1] < o[3] && o[1] < box[3]; };
+    // The open batches, newest first (-1: the one being filled): the first of its state is the one; the first that
+    // the primitive overlaps ends the search (it cannot be drawn before that one).
+    int open[16], n = 0;
+    if (!pending_.empty()) open[n++] = -1;
+    for (int i = 0; i < int(parked_.size()) && n < 16; ++i) open[n++] = i;
+    auto order = [&](int i) { return i < 0 ? order_ : parked_[std::size_t(i)].order; };
+    std::sort(open, open + n, [&](int a, int b) { return order(a) > order(b); });
+    for (int k = 0; k < n; ++k) {
+        const int i = open[k];
+        const GsDrawState& st = i < 0 ? state_ : parked_[std::size_t(i)].state;
+        if (SameBatch(state, st)) {
+            if (i < 0) return;                  // the one being filled
+            // It becomes the one being filled, that one parked in its place (an empty one dropped).
+            SwapBatch(parked_[std::size_t(i)]);
+            if (parked_[std::size_t(i)].pending.empty()) DropParked(std::size_t(i));
+            return;
+        }
+        if (covers(i < 0 ? box_ : parked_[std::size_t(i)].box)) break;
+    }
+    // A new batch, the newest; past open_batches_ open, the oldest recorded.
+    if (!pending_.empty()) {
+        ParkNew();
+        SwapBatch(parked_.back());
+        if (int(parked_.size()) >= open_batches_) {
+            auto oldest = std::min_element(parked_.begin(), parked_.end(),
+                                           [](const OpenBatch& a, const OpenBatch& b) { return a.order < b.order; });
+            SwapBatch(*oldest);
+            FlushOne();
+            SwapBatch(*oldest);
+            DropParked(std::size_t(oldest - parked_.begin()));
+        }
+    }
+    order_ = next_order_++;
+}
+
+void VulkanGsRenderer::FlushOne() {
     RecordShuffle();
+    for (int i = 0; i < 2; ++i) box_[i] = 1e30f, box_[i + 2] = -1e30f;
+    if (pending_clut_recording_ != ~0ull) {
+        // The batch's CLUTs were placed in the ring part of the recording they were drawn in: recorded in another,
+        // a later recording could write over them while it reads them. Never seen (a submit flushes first); said.
+        if (!pending_.empty() && pending_clut_recording_ != g_.filling_id()) {
+            static int told = 0;
+            if (told++ < 5) std::fprintf(stderr, "[ps2gpu] a batch's CLUTs were placed for an earlier recording\n");
+        }
+        pending_clut_recording_ = ~0ull;
+    }
     drawn_any_ = false;
     batch_tris_.clear();
     sprites_.clear();
@@ -3616,6 +3957,22 @@ void VulkanGsRenderer::Flush() {
                        std::uint32_t(state_.d) << 6;
     if (state_.textured && t->scale.Upscaled()) params.blend_ops |= 2u << 8;
     if (Is16Bit(state_.psm)) params.blend_ops |= 1u << 16;    // gs.frag: colour cut to five bits a channel
+    // TEXTURE FILTERING FAST: what the GPU's sampler can filter as the GS does - a texture from memory, its texels
+    // RGBA as decoded (no palette indices, no pack replacement), bilinear at one level (no mipmapping: the GS's LOD
+    // is its own), REPEAT or CLAMP (no region), the image TW x TH (its edges the texture's) - by the sampler, and
+    // ANISOTROPIC FILTER by the sampler's own (gs.frag's HardwareSample, blend_ops bit 17). The rest as before.
+    if (g_texture_filtering.load(std::memory_order_relaxed) == 1 && params.textured && !source &&
+        params.tex_format == 0 && (params.bilinear & 3u) == 1u && state_.wms < 2 && state_.wmt < 2 &&
+        bound->pw() == state_.tw && bound->ph() == state_.th) {
+        const int level = g_anisotropy.load(std::memory_order_relaxed);        // 0 off, 1 2x .. 4 16x
+        if (VkDescriptorSet hw = SetFor(*texture, kHwSampler + std::clamp(level, 0, kHwLevels - 1) * 4 +
+                                                      (state_.wms == 1 ? 2 : 0) + (state_.wmt == 1 ? 1 : 0))) {
+            set = hw;
+            params.blend_ops |= 1u << 17;
+            params.bilinear &= 0x0FFFFFFFu;     // no taps of the shader's own anisotropic filter
+            ++g_hw_filtered;
+        }
+    }
     const std::uint32_t count = std::uint32_t(pending_.size());
     static int complaints = 0;
     if (!set && complaints < 5) {
@@ -3784,6 +4141,24 @@ void VulkanGsRenderer::Flush() {
                         if (d.pipeline != chosen) {
                             d.pipeline = chosen;
                             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, chosen);
+                        }
+                        if (dynamic_blend_ && d.blend_key != (full_key & 0xFFFFu)) {
+                            // The blending this key's pipeline would have had, set: what changed of it.
+                            const VkPipelineColorBlendAttachmentState was =
+                                Blending(d.blend_key == ~0u ? ~0u : d.blend_key, g_.dual_source);
+                            const VkPipelineColorBlendAttachmentState b = Blending(full_key, g_.dual_source);
+                            const bool fresh = d.blend_key == ~0u;
+                            if (fresh || was.blendEnable != b.blendEnable) set_blend_enable_(cmd, 0, 1, &b.blendEnable);
+                            const VkColorBlendEquationEXT eq{b.srcColorBlendFactor, b.dstColorBlendFactor, b.colorBlendOp,
+                                                             b.srcAlphaBlendFactor, b.dstAlphaBlendFactor, b.alphaBlendOp};
+                            const VkColorBlendEquationEXT eq_was{was.srcColorBlendFactor, was.dstColorBlendFactor,
+                                                                 was.colorBlendOp, was.srcAlphaBlendFactor,
+                                                                 was.dstAlphaBlendFactor, was.alphaBlendOp};
+                            if (fresh || (b.blendEnable && std::memcmp(&eq, &eq_was, sizeof eq) != 0))
+                                set_blend_equation_(cmd, 0, 1, &eq);
+                            if (fresh || was.colorWriteMask != b.colorWriteMask)
+                                set_write_mask_(cmd, 0, 1, &b.colorWriteMask);
+                            d.blend_key = full_key & 0xFFFFu;
                         }
                         const int depth_write = pass.depth_write && op != 1 ? 1 : 0;
                         if (d.depth_write != depth_write)
@@ -3988,6 +4363,8 @@ VulkanGsRenderer::~VulkanGsRenderer() {
     if (date_pipeline_) vkDestroyPipeline(g_.device, date_pipeline_, nullptr);
     for (VkSampler s : samplers_)
         if (s) vkDestroySampler(g_.device, s, nullptr);
+    for (VkSampler s : hw_samplers_)
+        if (s) vkDestroySampler(g_.device, s, nullptr);
     if (pool_) vkDestroyDescriptorPool(g_.device, pool_, nullptr);
     if (set_layout_) vkDestroyDescriptorSetLayout(g_.device, set_layout_, nullptr);
     if (clut_set_layout_) vkDestroyDescriptorSetLayout(g_.device, clut_set_layout_, nullptr);
@@ -4131,12 +4508,14 @@ std::string RendererCounters() {
     static std::uint64_t last_breaks[kBreakWhys] = {};
     std::uint64_t b[kBreakWhys];
     for (int i = 0; i < kBreakWhys; ++i) b[i] = g_batch_breaks[i] - last_breaks[i], last_breaks[i] = g_batch_breaks[i];
-    static std::uint64_t last_clut = 0, last_batches = 0;
-    char batches[96];
-    std::snprintf(batches, sizeof batches, "; %llu batches, %llu ended by a new CLUT",
-                  (unsigned long long)(g_batches - last_batches), (unsigned long long)(g_clut_flushes - last_clut));
+    static std::uint64_t last_clut = 0, last_batches = 0, last_hw = 0;
+    char batches[144];
+    std::snprintf(batches, sizeof batches, "; %llu batches, %llu ended by a new CLUT, %llu filtered by the sampler",
+                  (unsigned long long)(g_batches - last_batches), (unsigned long long)(g_clut_flushes - last_clut),
+                  (unsigned long long)(g_hw_filtered - last_hw));
     last_clut = g_clut_flushes;
     last_batches = g_batches;
+    last_hw = g_hw_filtered;
     char breaks[448];
     std::snprintf(breaks, sizeof breaks, "; batches ended by: target %llu, scissor %llu, texture %llu, texture mode %llu, "
                   "alpha test %llu, blend %llu, depth %llu, fog %llu, DATE %llu, sprite kind %llu, overlap: shader blend "
@@ -4154,6 +4533,15 @@ std::string RendererCounters() {
             last_two[a][z] = g_two_pass_breaks[a][z];
             if (n) out += " " + std::to_string(a) + "/" + std::to_string(z) + "=" + std::to_string(n);
         }
+    {
+        std::vector<std::pair<std::uint64_t, std::string>> kinds;
+        for (const auto& [k, n] : g_two_pass_kinds) kinds.emplace_back(n, k);
+        std::sort(kinds.rbegin(), kinds.rend());
+        out += "; two-pass breakers:";
+        for (std::size_t i = 0; i < kinds.size() && i < 10; ++i)
+            out += " [" + kinds[i].second + "]=" + std::to_string(kinds[i].first);
+        g_two_pass_kinds.clear();
+    }
     static std::uint64_t last_kept = 0;
     out += "; two-pass kept in their batch (boxes only touched): " + std::to_string(g_two_pass_kept - last_kept);
     last_kept = g_two_pass_kept;
@@ -4217,6 +4605,9 @@ std::string SubmitStats() {
 }
 
 void SetPipelineCacheDir(const std::string& dir) { g_pipeline_cache_dir = dir; }
+std::uint64_t QueueWaitNanoseconds() { return g_queue_wait_ns.load(std::memory_order_relaxed); }
+std::uint64_t GpuWaitNanoseconds() { return g_gpu_wait_ns.load(std::memory_order_relaxed); }
+std::uint64_t ShaderStandIns() { return g_marked_building.load(std::memory_order_relaxed); }
 void SetPipelineHints(const std::uint32_t* keys, std::size_t count) { g_pipeline_hints.assign(keys, keys + count); }
 void SetShaderCompileMode(int mode) {
     g_shader_mode.store(std::clamp(mode, int(kShaderOff), int(kShaderHybrid)), std::memory_order_relaxed);
@@ -4227,6 +4618,8 @@ void SetAnisotropy(int taps) {
     while (log2 < 4 && (2 << log2) <= taps) ++log2;
     g_anisotropy.store(taps >= 2 ? log2 : 0, std::memory_order_relaxed);
 }
+void SetTextureFiltering(int mode) { g_texture_filtering.store(mode == 1 ? 1 : 0, std::memory_order_relaxed); }
+bool TextureFilteringFast() { return g_texture_filtering.load(std::memory_order_relaxed) == 1; }
 bool BuildingShaders() {
     const long long at = g_building_at.load(std::memory_order_relaxed);
     return at != 0 && SteadyMs() - at < 500;
