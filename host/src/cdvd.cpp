@@ -116,6 +116,20 @@ std::vector<u8> SCommand(u32 procedure, const std::vector<u8>& /*data*/) {
             // SDK 2.3's library reads one word, the error (Mister Mosquito,
             // 0x0010D9E0); every read here succeeds.
             return Word(0);
+        case 0x27: {                                    // sceCdReadDvdDualInfo: result, on_dual, layer1_start
+            // God of War II (0x002B6520, from its start-up 0x001884A8) asks until it succeeds - a zero result
+            // spun it for ever. Disc::Layer1Start (God of War II EU: layer 0 volume 2,080,912 sectors, layer 1
+            // from 2,080,896, its volume 2,012,592 - together the image's 4,093,488). The game reads layer 1 at
+            // layer1_start + its sectors, which an image holds in a line.
+            const u32 layer1_start = GuestDisc().Layer1Start(), on_dual = layer1_start ? 1 : 0;
+            std::vector<u8> reply = Word(1);
+            const std::vector<u8> dual = Word(on_dual), start = Word(layer1_start);
+            reply.insert(reply.end(), dual.begin(), dual.end());
+            reply.insert(reply.end(), start.begin(), start.end());
+            Note("cd dual info", "CD: sceCdReadDvdDualInfo: on_dual " + std::to_string(on_dual) +
+                 ", layer 1 from sector " + std::to_string(layer1_start));
+            return reply;
+        }
         default:
             Note("cd scmd " + std::to_string(procedure),
                  "CD: S-command " + std::to_string(procedure) + " (answered with zeros)");

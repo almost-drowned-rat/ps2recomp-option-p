@@ -498,6 +498,22 @@ void GsTakesRegisterPacketsInBlocks() {
     }
 }
 
+// SIGNAL, FINISH and LABEL reach on_event in the order the GS takes them (CSR's events, the GS interrupt -
+// God of War II waits on FINISH); other registers do not.
+void GsReportsItsEvents() {
+    using namespace ps2host::gs;
+    Gs gs;
+    std::vector<std::pair<u32, u64>> events;
+    gs.on_event = [&](u32 address, u64 value) { events.push_back({address, value}); };
+    gs.WriteRegister(0x00, 6);                                 // PRIM
+    gs.WriteRegister(0x61, 0);                                 // FINISH
+    gs.WriteRegister(0x60, (u64(0xFF) << 32) | 0x12);          // SIGNAL id 0x12, mask 0xFF
+    gs.WriteRegister(0x62, (u64(0xF) << 32) | 0x3);            // LABEL
+    Check(events.size() == 3 && events[0].first == 0x61 && events[1].first == 0x60 &&
+              events[1].second == ((u64(0xFF) << 32) | 0x12) && events[2].first == 0x62,
+          "the GS reports FINISH, SIGNAL and LABEL in order");
+}
+
 void GsDrawsASprite() {
     using namespace ps2host::gs;
     Gs gs;
@@ -1302,6 +1318,12 @@ void MemoryCardKeepsSaves() {
         c.r[5] = kName;
     };
     auto call = [&](void (*handler)(lifted::Context&)) { handler(c); return u32(c.r[2]); };
+    // Slot 2 (socket 1) has no card: libmc2's ENODEV, the info zeroed.
+    c.r[4] = 1;
+    c.r[5] = kBuffer;
+    generated::Write32(kBuffer, 7);
+    Check(call(mc2::GetInfo) == 0x81010013 && ps2host::GuestMemory().Read(kBuffer, 4) == 0,
+          "memory card: none in slot 2");
     c.r[4] = 0;
     name("SAVE");
     c.r[6] = 0x8427;
@@ -1344,6 +1366,108 @@ void MemoryCardKeepsSaves() {
           "memory card: a formatted PS2 card, its free space less the save");
     mc2::SetCardDirectory("");
     fs::remove_all(card, error);
+}
+
+// dbcman (dbc.cpp) answers libdbc's version check with the version of the DBCMAN the game loads (loadfile.cpp, its
+// .iopmod): God of War II's 3.10 - its libdbc 3.10 refuses 3.0 and finds no controller; 3.0 without one.
+void DbcmanAnswersTheDiscsVersion() {
+    ps2host::InstallIopServers();
+    const ps2host::RpcServer dbc = ps2host::FindRpcServer(0x80001300u), loadfile = ps2host::FindRpcServer(0x80000006u);
+    Check(bool(dbc) && bool(loadfile) && bool(ps2host::FindRpcServer(0x8000131Eu)) &&
+              bool(ps2host::FindRpcServer(0x8000131Fu)),
+          "dbcman: its servers registered, 3.1's 0x8000131E/F too");
+    if (!dbc || !loadfile) return;
+    auto version = [&] {
+        const std::vector<u8> answer = dbc(0x80001363u, std::vector<u8>(0x30, 0));
+        u32 v = 0;
+        if (answer.size() >= 4) std::memcpy(&v, answer.data(), 4);
+        return v;
+    };
+    // A module in IOP memory (sceSifLoadModuleBuffer, loadfile procedure 6): an ELF header, one .iopmod section.
+    std::vector<u8> elf(0xB0, 0);
+    auto put = [&](std::size_t o, u32 v, std::size_t n) { std::memcpy(&elf[o], &v, n); };
+    put(0, 0x464C457Fu, 4);
+    put(0x20, 0x40, 4);                                  // shoff
+    put(0x2E, 0x28, 2);                                  // shentsize
+    put(0x30, 1, 2);                                     // shnum
+    put(0x40 + 4, 0x70000080u, 4);                       // .iopmod
+    put(0x40 + 16, 0x80, 4);
+    put(0x40 + 20, 0x30, 4);
+    put(0x80 + 0x18, 0x0310, 2);                         // version 3.10
+    std::memcpy(&elf[0x80 + 0x1A], "Dbc_Manager", 11);
+    const u32 address = 0x1F0000;
+    ps2host::Memory& m = ps2host::GuestMemory();
+    for (std::size_t i = 0; i < elf.size(); ++i) m.Write(ps2host::kIopRamBase + address + u32(i), elf[i], 1);
+    std::vector<u8> request(0x104, 0);
+    std::memcpy(&request[0], &address, 4);
+    loadfile(6, request);
+    Check(version() == 0x0310, "dbcman: answers 3.10 after the game's DBCMAN 3.10 is loaded");
+    ps2host::SetDbcmanVersion(0x0300);
+    Check(version() == 0x0300, "dbcman: answers 3.0 as set");
+}
+
+// sceCdReadDvdDualInfo (S-command 0x27, cdvd.cpp): a dual-layer image - layer 1's own primary volume descriptor at
+// the sector layer 0's volume size names - answers on_dual 1 and layer 1 from 16 sectors before that descriptor
+// (God of War II asks at start-up until it succeeds); a single-layer image answers 0, 0 - both with result 1.
+void CdReadsDvdDualInfo() {
+    using ps2host::kSectorSize;
+    ps2host::InstallIopServers();
+    const ps2host::RpcServer scmd = ps2host::FindRpcServer(0x80000593u);
+    Check(bool(scmd), "dual info: the S-command server registered");
+    if (!scmd) return;
+    auto words = [&](std::vector<u8> image) {
+        ps2host::GuestDisc().Use(std::move(image));
+        const std::vector<u8> answer = scmd(0x27, {});
+        u32 w[3] = {9, 9, 9};
+        if (answer.size() >= 12) std::memcpy(w, answer.data(), 12);
+        return std::vector<u32>(w, w + 3);
+    };
+    std::vector<u8> image(40 * kSectorSize, 0);
+    auto pvd = [&](u32 sector, u32 volume) {
+        u8* p = &image[sector * kSectorSize];
+        p[0] = 1;
+        std::memcpy(p + 1, "CD001", 5);
+        std::memcpy(p + 80, &volume, 4);
+    };
+    pvd(16, 24);                                        // layer 0: 24 sectors
+    Check(words(image) == std::vector<u32>{1, 0, 0}, "dual info: a single-layer image");
+    pvd(24, 16);                                        // layer 1 from sector 8: its descriptor at 8 + 16
+    Check(words(image) == std::vector<u32>{1, 1, 8}, "dual info: a dual-layer image, layer 1 from sector 8");
+    ps2host::GuestDisc().Use({});
+}
+
+// A file in a dual-layer disc's layer 1 (God of War II EU's PART2.PAK): Disc::Find looks there after layer 0,
+// the file's sectors counted from the disc's start.
+void DiscFindsLayer1Files() {
+    using ps2host::kSectorSize;
+    std::vector<u8> image(40 * kSectorSize, 0);
+    auto put = [&](u32 at, u32 value) { std::memcpy(&image[at], &value, 4); };
+    auto pvd = [&](u32 sector, u32 volume, u32 root) {
+        u8* p = &image[sector * kSectorSize];
+        p[0] = 1;
+        std::memcpy(p + 1, "CD001", 5);
+        put(sector * kSectorSize + 80, volume);
+        put(sector * kSectorSize + 156 + 2, root);
+        put(sector * kSectorSize + 156 + 10, kSectorSize);
+    };
+    pvd(16, 24, 17);                                    // layer 0: 24 sectors, an empty root at 17
+    pvd(24, 16, 10);                                    // layer 1 from 8: its root at 8 + 10
+    u8* record = &image[18 * kSectorSize];
+    record[0] = 40;
+    put(18 * kSectorSize + 2, 12);                      // the file at layer 1's sector 12: the disc's 20
+    put(18 * kSectorSize + 10, 100);
+    record[32] = 7;
+    std::memcpy(record + 33, "B.BIN;1", 7);
+    ps2host::GuestDisc().Use(std::move(image));
+    ps2host::Disc::File file;
+    Check(ps2host::GuestDisc().Layer1Start() == 8, "layer 1: starts at sector 8");
+    Check(ps2host::GuestDisc().Find("\\B.BIN;1", &file) && file.lsn == 20 && file.size == 100,
+          "layer 1: its file found, from the disc's start");
+    Check(!ps2host::GuestDisc().Find("\\C.BIN;1", &file), "layer 1: a missing file is not found");
+    const auto files = ps2host::GuestDisc().Files();    // what an unpacked disc is made of
+    Check(files.size() == 1 && files[0].path == "B.BIN" && files[0].lsn == 20 && files[0].size == 100,
+          "layer 1: its file listed for unpacking, by name");
+    ps2host::GuestDisc().Use({});
 }
 
 // libmc's server (mcserv.cpp, RPC 0x80000400) as a libmc game saves: the card
@@ -2568,6 +2692,10 @@ int main() {
     VifRunsMicroprogramsOnAVu();
     MemoryCardKeepsSaves();
     McservKeepsSaves();
+    CdReadsDvdDualInfo();
+    DiscFindsLayer1Files();
+    GsReportsItsEvents();
+    DbcmanAnswersTheDiscsVersion();
     VuLanesAreTheModel();
     VuAdderDropsAFarSmallerOperand();
     VuCompiledIsTheInterpreter();

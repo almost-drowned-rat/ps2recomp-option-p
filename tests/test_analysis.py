@@ -119,6 +119,69 @@ class TestSwitches(unittest.TestCase):
         self.assertEqual(sorted(a.functions), [BASE])
 
 
+class TestSwitchBaseInSavedRegister(unittest.TestCase):
+    """The table's `lui` in a saved register far above, a call between (God of
+    War II's 0x002B85F0, P1 2026-11-24)."""
+
+    CODE = [
+        0x3C140010,     # 00 lui $s4, 0x0010
+        JAL,            # 04 jal
+        NOP,            # 08
+        0x2C810002,     # 0C sltiu $at, $a0, 2
+        0x1020000A,     # 10 beq $at, $zero, ...
+        0x00042080,     # 14 sll $a0, $a0, 2
+        0x26830100,     # 18 addiu $v1, $s4, 0x0100
+        0x00832021,     # 1C addu $a0, $a0, $v1
+        0x8C820000,     # 20 lw $v0, 0($a0)
+        0x00400008,     # 24 jr $v0
+        NOP,            # 28
+        0x24420001, JR_RA, NOP,     # 2C case 0
+        0x24420002, JR_RA, NOP,     # 38 case 1
+    ]
+
+    def analyzer(self, code):
+        words = code + [NOP] * (0x40 - len(code)) + [BASE + 0x2C, BASE + 0x38] + [NOP] * 32
+        return ImageAnalyzer(struct.pack("<%dI" % len(words), *words), BASE, BASE)
+
+    def test_the_lui_is_found_past_the_call(self):
+        self.assertEqual(self.analyzer(list(self.CODE)).jump_table(BASE + 0x24, 2), [BASE + 0x2C, BASE + 0x38])
+
+    def test_no_table_when_the_register_is_set_otherwise_between(self):
+        code = list(self.CODE)
+        code[2] = 0x24140001        # addiu $s4, $zero, 1 in the call's delay slot
+        self.assertIsNone(self.analyzer(code).jump_table(BASE + 0x24, 2))
+
+
+class TestBuiltPointerAboveFrame(unittest.TestCase):
+    """A callback whose address the code builds (`lui; addiu`), its entry an
+    instruction above its frame setup and after no terminator (God of War II's
+    0x00285408, 0x001C6918, P1 2026-11-24)."""
+
+    def words(self, before):
+        return [
+            0x3C040010,     # 00 lui $a0, 0x0010
+            0x24840018,     # 04 addiu $a0, $a0, 0x18: the callback's address
+            JR_RA, NOP,     # 08
+            0x30420020,     # 10 andi $v0, $v0, 0x20
+            before,         # 14
+            0x00C0182D,     # 18 the entry: daddu $v1, $a2, $zero
+            0x27BDFFF0,     # 1C addiu $sp, $sp, -0x10
+            JR_RA,          # 20
+            0x27BD0010,     # 24 addiu $sp, $sp, 0x10
+        ]
+
+    def test_the_entry_is_the_built_address(self):
+        a = analyzer(self.words(0x30420002))       # andi $v0, $v0, 2
+        a.run()
+        self.assertIn(BASE + 0x18, a.functions)
+        self.assertNotIn(BASE + 0x1C, a.functions)
+
+    def test_not_when_it_reads_what_the_instruction_before_set(self):
+        a = analyzer(self.words(0x3C060001))       # lui $a2, 1: the "entry" is mid-sequence
+        a.run()
+        self.assertNotIn(BASE + 0x18, a.functions)
+
+
 class TestPointerTablesInData(unittest.TestCase):
     """A function only a data section's word names (a callback table in .data)."""
 

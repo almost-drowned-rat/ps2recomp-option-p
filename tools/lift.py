@@ -255,6 +255,13 @@ def equivalent_to_plain(addresses, structured, plain, abi, cache, work) -> list:
     return [a for a in addresses if results[a] == "equivalent"]
 
 
+def holds_immediate(func) -> bool:
+    """Whether a function holds one of the game's run-time immediates (lift.use_immediates): it keeps the plain
+    form, which reads them through lifted::Immediate - the structured forms fold constants."""
+    ranges = [(func["addr"], func["end"])] + [tuple(chunk) for chunk in func.get("chunks", ())]
+    return any(low <= address < high for address in lift.immediates() for low, high in ranges)
+
+
 def structure_verified(chosen, functions, image, base, game, seeds, jobs, strings=None,
                        cache=None, machine=None) -> dict:
     """Swap in the structured form of every function whose structured form verifies too.
@@ -268,7 +275,7 @@ def structure_verified(chosen, functions, image, base, game, seeds, jobs, string
 
     stage = time.time()
     result = dict(chosen)
-    remaining = list(chosen)
+    remaining = [a for a in chosen if not holds_immediate(functions[a])]
     # Most readable first - temporaries folded, checked at the calling-convention
     # level - then structured with the callee-saved saves elided, then with them
     # kept; what no form passes keeps the lifted form.
@@ -315,7 +322,7 @@ def structure_unverified(plain, functions, image, base, game, strings, cache) ->
 
     stage = time.time()
     result = dict(plain)
-    remaining = list(plain)
+    remaining = [a for a in plain if not holds_immediate(functions[a])]
     forms = (("folded", dict(elide=True, readable=True), True),
              ("with saves elided", dict(elide=True), False),
              ("with saves kept", dict(elide=False), False))
@@ -499,6 +506,10 @@ def main(argv=None) -> int:
     image = elf.section_data(section)
     lift.use_sections(_other_sections(elf, section))
     lift.use_function_starts(f["addr"] for f in database["functions"])
+    lift.use_immediates(game.immediates)
+    if game.immediates:
+        print("immediates: %d instructions a port sets at run time (their functions stay plain)"
+              % len(game.immediates))
     machine = Machine.from_elf(elf)
     # Every function, including those with no return of their own - thunks that
     # end in a jump: a port reaches them like any other, and the original runs to

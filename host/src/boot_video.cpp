@@ -25,8 +25,9 @@ namespace ps2host {
 
 namespace {
 
-// The game's own folder (the executable's): boot.mpg is looked for there (PS2 ports, 2026-11-17: no media folder).
-std::filesystem::path RootDir() { return ps2platform::ExeDir(); }
+// The game's own folder (the root, the exe's or data\'s parent): boot.mpg is looked for there (PS2 ports,
+// 2026-11-17: no media folder).
+std::filesystem::path RootDir() { return ps2platform::RootDir(); }
 
 #ifdef PS2HOST_VULKAN
 constexpr std::size_t kChunk = 64 * 1024;

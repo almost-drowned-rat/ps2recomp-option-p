@@ -281,12 +281,82 @@ struct ThreadHandle {
     pid_t tid;
     clockid_t clock;
 };
+
+#ifdef __ANDROID__
+/* Android: the runtime's busy threads that others wait on get a fast core of their own (the maintainer's rule
+   2026-11-24 for every Android port, from option-c's thread_name.h, agent L). At low load the phone schedulers
+   (EAS / WALT) pack threads that work together onto one core; one waiting for the other then runs only after the
+   time slice, up to ~25 ms (Orta Android: 33 ms frames). ZOE on the Odin 2 showed the pattern in light scenes (GS
+   waited 4.5 s of 30 s, speed still 100 %), not in the boss fight (real load). The cores: those above the slowest
+   cluster by cpuinfo_max_freq, without the single fastest one when five or more are left (EE, the game's own thread,
+   likes it best); one each for GS, VIF1 worker, the vertical blank timer and present when four are there, else GS
+   and VIF1 worker on two, else nothing. PS2HOST_ANDROID_PIN=0 (or option-c's RECOMP_ANDROID_PIN=0) turns it off.
+   Desktop Linux spreads such threads over idle cores by itself: unchanged. */
+void PinBusyThread(const char* name) {
+    static const char* const kRoles[] = {"GS", "VIF1 worker", "vertical blank timer", "present"};
+    static int cores[4] = {-1, -1, -1, -1};
+    static std::once_flag read;
+    int role = -1;
+    for (int i = 0; i < 4; ++i)
+        if (std::strcmp(name, kRoles[i]) == 0) role = i;
+    if (role < 0) return;
+    std::call_once(read, [] {
+        for (const char* key : {"PS2HOST_ANDROID_PIN", "RECOMP_ANDROID_PIN"}) {
+            const char* e = std::getenv(key);
+            if (e && *e == '0') {
+                std::fprintf(stderr, "[threads] Android: core assignment off (%s=0)\n", key);
+                return;
+            }
+        }
+        long freq[64] = {}, lo = 0, hi = 0;
+        int n = 0, top = -1;
+        for (int c = 0; c < 64; ++c) {
+            char path[80];
+            std::snprintf(path, sizeof path, "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", c);
+            std::FILE* f = std::fopen(path, "r");
+            if (!f) break;
+            if (std::fscanf(f, "%ld", &freq[c]) != 1) freq[c] = 0;
+            std::fclose(f);
+            if (!lo || freq[c] < lo) lo = freq[c];
+            if (freq[c] > hi) hi = freq[c], top = c;
+            n = c + 1;
+        }
+        int cand[64], k = 0;
+        for (int c = 0; c < n; ++c)
+            if (freq[c] > lo) cand[k++] = c;
+        if (k >= 5) {                               // the single fastest core left to EE
+            int j = 0;
+            for (int c = 0; c < k; ++c)
+                if (cand[c] != top) cand[j++] = cand[c];
+            k = j;
+        }
+        if (k >= 4) {
+            for (int c = 0; c < 4; ++c) cores[c] = cand[c];
+        } else if (k >= 2) {
+            cores[0] = cand[0];
+            cores[1] = cand[1];
+        }
+        std::fprintf(stderr, "[threads] Android: %d cores (slowest cluster %ld kHz); GS %d, VIF1 worker %d, vertical "
+                     "blank timer %d, present %d (-1 = left to the system; PS2HOST_ANDROID_PIN=0 turns it off)\n",
+                     n, lo, cores[0], cores[1], cores[2], cores[3]);
+    });
+    if (cores[role] < 0) return;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cores[role], &set);
+    if (sched_setaffinity(0, sizeof set, &set) != 0)
+        std::fprintf(stderr, "[threads] Android: %s not held to core %d (errno %d)\n", name, cores[role], errno);
+}
+#endif
 }  // namespace
 
 void* NameThread(const char* name) {
     char short_name[16] = {};
     std::strncpy(short_name, name, 15);         // the kernel's limit: 15 characters
     pthread_setname_np(pthread_self(), short_name);
+#ifdef __ANDROID__
+    PinBusyThread(name);
+#endif
     auto* handle = new ThreadHandle{pid_t(syscall(SYS_gettid)), CLOCK_THREAD_CPUTIME_ID};
     if (pthread_getcpuclockid(pthread_self(), &handle->clock) != 0) handle->clock = CLOCK_THREAD_CPUTIME_ID;
     return handle;

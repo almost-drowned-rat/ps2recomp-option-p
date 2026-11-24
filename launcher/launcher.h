@@ -32,7 +32,8 @@ typedef struct {
     const char *game;                   /* "Zone of the Enders": the name in the messages */
     const char *disc;                   /* "Zone of the Enders (USA, SLUS-201.48)": what the player provides */
     const char *window_title;           /* "Zone of the Enders - PC port" */
-    const char *game_exe;               /* "ZOE.exe": built next to the launcher */
+    const char *game_exe;               /* "zoe.exe": built in data\ - the top folder holds only the launcher
+                                         * (<game>_launcher, the maintainer's rule 2026-11-21, all ports) */
     const void *icon_bmp;               /* the progress window's icon (a BMP), or NULL */
     size_t      icon_bmp_size;
     /* An optional second disc on the setup page (a multi-version port's other version - ZOE: "Japanese disc
@@ -47,6 +48,10 @@ typedef struct {
     const char *extra_file_filter_name;
     const char *extra_file_filter;
     const char *extra_file_name;
+    /* An older release's executables in the top folder ("ZOE.exe,zoe_us.exe"; ',' between them), or NULL: removed
+     * there (with their -sse4 builds and .pdb) once the game is built in data\ - one exe on top again. Never the
+     * launcher running, never anything else of the player's (saves, settings, disc images stay). */
+    const char *old_exes;
 } PsLauncherConfig;
 
 /* The whole launcher; returns the process exit code. */

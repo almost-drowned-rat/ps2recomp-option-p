@@ -260,6 +260,7 @@ class ImageAnalyzer:
     # How far back from a `jr` its table and bound are looked for.
     JUMP_TABLE_WINDOW = 32
     MAX_CASES = 1024
+    SAVED_REGISTERS = frozenset(range(16, 24)) | {30}    # $s0-$s7, $fp: kept across a call
 
     def jump_table(self, jr_addr: int, register: int):
         """The targets of the switch that ends in `jr register`, or None.
@@ -274,7 +275,16 @@ class ImageAnalyzer:
         Walking back from the `jr` finds the load, the sum, the table's two
         halves and the bound; the table's N words are the cases. Without the
         bound the table's length is unknown, and nothing is claimed.
+
+        The table's `lui` may be far above its `addiu`, in a saved register
+        set at the function's start and kept across calls: God of War II's
+        0x002B85F0 (`lui $s4, 0x30` 17 instructions above `addiu $v1, $s4,
+        -0x6530`, a `jal` and the bound's `sltiu` between - P1 2026-11-24).
+        So the bound counts where it is met, and the walk goes on past a call
+        while it looks for a saved register's `lui`; anything else writing that
+        register first, and there is no table.
         """
+        from .structs import _written_register        # structs imports what imports this module
         load = index = low = table = bound = None
         register_of_sum = register
         addr = jr_addr - 4
@@ -282,7 +292,12 @@ class ImageAnalyzer:
             if not self.contains(addr):
                 break
             ins = DISASM.decode(self.word_at(addr), addr)
-            if not ins.is_valid or ins.is_call:
+            if not ins.is_valid:
+                break
+            if ins.is_call:
+                if table is None and low and low[0] in self.SAVED_REGISTERS:
+                    addr -= 4
+                    continue                    # a saved register outlives the call
                 break
             m = ins.mnemonic
             if load is None:
@@ -301,6 +316,12 @@ class ImageAnalyzer:
                     # The table's low half is in the addiu, or else in the load's
                     # own offset: `lui $t, hi; addu $t, $t, $i; lw $r, lo($t)`.
                     table = ((ins.imm << 16) + (low[1] if low else 0) + load.imm) & 0xFFFFFFFF
+                    if bound is not None:
+                        break
+                elif low and m == "sltiu" and bound is None:
+                    bound = ins.imm             # the bound between the table's two halves
+                elif low and _written_register(ins) == low[0]:
+                    return None                 # the addiu's source set by something else
             elif m == "sltiu":
                 bound = ins.imm
                 break
@@ -419,17 +440,88 @@ class ImageAnalyzer:
             if not self.contains(word) or word % 4:
                 continue
             candidates.add(word)
+        built = self.built_addresses() - candidates
 
         accepted = []
-        for addr in sorted(candidates):
+        for addr in sorted(candidates | built):
             if addr in self.functions:
                 continue
-            if not (self._is_prologue(addr) or self._follows_terminator(addr)):
+            if not (self._is_prologue(addr) or self._follows_terminator(addr) or self._frame_ahead(addr)):
                 continue
             if not self._looks_like_code(addr):
                 continue
             accepted.append(addr)
         return accepted
+
+    # How far after a `lui` its `addiu` / `ori` is looked for.
+    BUILT_WINDOW = 16
+
+    def built_addresses(self) -> set:
+        """Code addresses the code builds itself: `lui $r, hi` and an `addiu` /
+        `ori` of $r's low half after it, before $r is set otherwise or the block
+        ends.
+
+        A callback handed to a function (a thread's entry, an interrupt handler,
+        a task) is no word of any table: God of War II's 0x001C8B70, 0x001C6918,
+        0x002044D0 and 0x00285408 are reached by such pointers only (P1's
+        pointer scan, 2026-11-24), each a few instructions above its frame
+        setup - which, taken for the entry, left those instructions to no
+        function, and a call to the real entry fell outside every one.
+        """
+        from .structs import _written_register        # structs imports what imports this module
+        found = set()
+        for i, word in enumerate(self.words):
+            if (word >> 26) != 0x0F:                    # lui
+                continue
+            register, high = (word >> 16) & 31, (word & 0xFFFF) << 16
+            if not register or not (high - 0x8000 < self.end and high + 0x10000 > self.base):
+                continue                                # no low half makes it a code address
+            addr = self.base + 4 * (i + 1)
+            for _ in range(self.BUILT_WINDOW):
+                if not self.contains(addr):
+                    break
+                ins = DISASM.decode(self.word_at(addr), addr)
+                if not ins.is_valid:
+                    break
+                if ins.mnemonic in ("addiu", "ori") and ins.rs == register:
+                    low = ins.imm & 0xFFFF if ins.mnemonic == "ori" else ins.imm
+                    target = (high + low) & 0xFFFFFFFF
+                    if self.contains(target) and not target % 4:
+                        found.add(target)
+                if _written_register(ins) == register or ins.ends_block:
+                    break
+                addr += 4
+        return found
+
+    def _frame_ahead(self, addr: int) -> bool:
+        """True when a frame is set up within the first instructions from `addr`,
+        none of those leaving the code (God of War II's 0x001C6918: `lui; lw;
+        slti; beq` and the `addiu $sp` in its delay slot; 0x00285408, from a
+        .rodata table: `por` and the `addiu $sp`) - an entry the compiler
+        scheduled work above.
+
+        Not a delay slot, and nothing read there that the instruction before
+        sets: a word that only happens to point a few instructions above a
+        frame setup lands in the middle of other code (GoW II's 0x001084B8,
+        an `ori` of the `lui $at` before it; 0x0010803C, a `jr $ra`'s slot).
+        """
+        from .structs import _read_registers, _written_register
+        before = DISASM.decode(self.word_at(addr - 4), addr - 4)
+        if not self.contains(addr - 4) or not before.is_valid or before.has_delay_slot:
+            return False
+        handed = _written_register(before)
+        written = set()
+        for k in range(1, 5):
+            at = addr + 4 * (k - 1)
+            ins = DISASM.decode(self.word_at(at), at)
+            if not ins.is_valid or ins.is_return or ins.mnemonic in ("j", "jr", "eret", "syscall"):
+                return False
+            if handed and handed in _read_registers(ins) - written:
+                return False
+            written.add(_written_register(ins))
+            if self._is_prologue(addr + 4 * k):
+                return True
+        return False
 
     # Alignment padding between functions is a short run of `nop`; bridging that
     # much keeps a function whole without letting a real gap merge two of them.

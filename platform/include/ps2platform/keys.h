@@ -24,7 +24,7 @@ inline constexpr int kLeft = 0x25, kUp = 0x26, kRight = 0x27, kDown = 0x28;
 inline constexpr int kInsert = 0x2D, kDelete = 0x2E, kCapital = 0x14;
 inline constexpr int kNumpad0 = 0x60, kNumpad1 = 0x61, kNumpad9 = 0x69;
 inline constexpr int kMultiply = 0x6A, kAdd = 0x6B, kSubtract = 0x6D, kDecimal = 0x6E, kDivide = 0x6F;
-inline constexpr int kF1 = 0x70, kF9 = 0x78, kF12 = 0x7B;
+inline constexpr int kF1 = 0x70, kF8 = 0x77, kF9 = 0x78, kF12 = 0x7B;
 inline constexpr int kLShift = 0xA0, kRShift = 0xA1, kLControl = 0xA2, kRControl = 0xA3, kLMenu = 0xA4, kRMenu = 0xA5;
 inline constexpr int kOem1 = 0xBA, kOemPlus = 0xBB, kOemComma = 0xBC, kOemMinus = 0xBD, kOemPeriod = 0xBE;
 inline constexpr int kOem2 = 0xBF, kOem3 = 0xC0, kOem4 = 0xDB, kOem5 = 0xDC, kOem6 = 0xDD, kOem7 = 0xDE;

@@ -77,6 +77,20 @@ void Syscall(Context& c);
 /* A word result, sign-extended into its 64-bit register as the EE does. */
 inline u64 Sx32(u64 value) { return (u64)(s64)(s32)(u32)value; }
 
+/* A game's "immediates" (game.json, ps2decomp/lift.py use_immediates): instructions whose constant a port changes
+   at run time - God of War II's 50 Hz constants, 60 with the player's setting. The lifted code reads number k's
+   operand here; unset, it is the original's, so the translation verifies as it is. The value is the operand as
+   the instruction uses it: lui's the register's (imm << 16, sign-extended), addiu's the sign-extended 32-bit
+   immediate, ori's the zero-extended 16 bits. */
+inline u64 g_immediate_value[64] = {};
+inline u64 g_immediate_set = 0;
+inline u64 Immediate(int k, u64 original) { return (g_immediate_set >> k) & 1 ? g_immediate_value[k] : original; }
+inline void SetImmediate(int k, u64 value) {
+    g_immediate_value[k] = value;
+    g_immediate_set |= 1ull << k;
+}
+inline void ResetImmediate(int k) { g_immediate_set &= ~(1ull << k); }
+
 inline u64 Read64(u32 address) { return generated::ReadU64(address); }
 
 /* A loop head reached with the budget spent. Without a hook the run is

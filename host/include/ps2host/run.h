@@ -137,6 +137,8 @@ const char* IopRelease();
    the releases of its modules - loadfile's answers its version check. */
 void UseIopImage(const std::string& path);
 void InstallDbc();
+/* The version dbcman answers (major << 8 | minor): the disc's DBCMAN.IRX's, from its .iopmod (loadfile.cpp). */
+void SetDbcmanVersion(u32 version);
 void InstallIopHeap();
 /* libmc's memory card server (mcserv.cpp) over --memcard's directory. */
 void InstallMcserv();
@@ -162,6 +164,10 @@ void ApplySdkOverrides(const FunctionEntry* table, std::size_t count);
 /* The EE kernel: lifted::Syscall's implementation (kernel.cpp). */
 void KernelSyscall(lifted::Context& c);
 const char* SyscallName(s32 service);
+/* A vertical blank's start, for the kernel: SetVSyncFlag's flag and CSR written, once (threads.cpp DeliverFrame). */
+void KernelVblank(u64 frame);
+/* GsPutIMR's mask, from any thread: bit 8 SIGNAL, 9 FINISH, ... masked when set (0xFF00 until put). */
+u32 KernelGsImr();
 
 /* Device registers with hardware meaning (devices.cpp). */
 void InstallDevices();
@@ -553,6 +559,9 @@ ps2gpu::Display* WindowDisplay();
 void SetPictureSource(std::function<bool(std::vector<u32>*, u32*, u32*)> source);
 /* Whether the window has the keyboard (input is read only then). */
 bool WindowFocused();
+/* A developer's build (the F9 debug panel built in): a port's debugging keys only there, never in a player's
+   release (PS2HOST_DEBUG_PANEL OFF - the maintainer 2026-11-24). */
+bool DeveloperBuild();
 /* Whether a key (a Win32 virtual key) is down, on the window's keyboard. */
 bool HostKeyDown(int key);
 /* The window's game controller, as a DualShock 2 reads (window.cpp): false

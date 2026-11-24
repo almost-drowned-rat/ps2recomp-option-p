@@ -1,15 +1,19 @@
 # The release launcher (launcher.h): one small exe, SDL3 only, built with llvm-mingw (static: it runs before
 # anything of the port is there). A port's release script builds it with its names:
 #   cmake -S engine/launcher -B <dir> -G Ninja -DCMAKE_C_COMPILER=x86_64-w64-mingw32-clang
-#         -DPS2_LAUNCHER_GAME="Zone of the Enders" -DPS2_LAUNCHER_DISC="..." -DPS2_LAUNCHER_GAME_EXE=ZOE.exe
+#         -DPS2_LAUNCHER_GAME="Zone of the Enders" -DPS2_LAUNCHER_DISC="..." -DPS2_LAUNCHER_GAME_EXE=zoe.exe
+#         -DPS2_LAUNCHER_OUTPUT=zoe_launcher [-DPS2_LAUNCHER_OLD_EXES="ZOE.exe,zoe_us.exe"]
 #         [-DPS2_LAUNCHER_SDL3=<an SDL3 source folder>]
+# The release's layout (the maintainer's rule 2026-11-21, all ports and platforms): the top folder holds only
+# <game>_launcher; the game <game> is built into data\ (its settings, saves and game\ stay in the top folder).
 cmake_minimum_required(VERSION 3.20)
 project(ps2_launcher LANGUAGES C)
 
 set(PS2_LAUNCHER_GAME "the game" CACHE STRING "the game's name in the messages")
 set(PS2_LAUNCHER_DISC "" CACHE STRING "the disc the player provides")
 set(PS2_LAUNCHER_TITLE "" CACHE STRING "the window title")
-set(PS2_LAUNCHER_GAME_EXE "game.exe" CACHE STRING "the game's exe, built beside the launcher")
+set(PS2_LAUNCHER_GAME_EXE "game.exe" CACHE STRING "the game's exe, built into data/")
+set(PS2_LAUNCHER_OLD_EXES "" CACHE STRING "an older release's exes in the top folder, removed after a build (',' between)")
 set(PS2_LAUNCHER_OUTPUT "launcher" CACHE STRING "the launcher's exe name (without .exe)")
 set(PS2_LAUNCHER_SDL3 "" CACHE PATH "an SDL3 source folder (empty: fetched as the engine's gpu/ does)")
 set(PS2_LAUNCHER_EXTRA_DISC "" CACHE STRING "an optional second disc's line label on the setup page")
@@ -109,6 +113,9 @@ if(PS2_LAUNCHER_FILE_LABEL AND PS2_LAUNCHER_FILE_NAME)
     list(APPEND defs PS2_LAUNCHER_FILE_LABEL="${PS2_LAUNCHER_FILE_LABEL}"
          PS2_LAUNCHER_FILE_FILTER_NAME="${PS2_LAUNCHER_FILE_FILTER_NAME}" PS2_LAUNCHER_FILE_FILTER="${PS2_LAUNCHER_FILE_FILTER}"
          PS2_LAUNCHER_FILE_NAME="${PS2_LAUNCHER_FILE_NAME}")
+endif()
+if(PS2_LAUNCHER_OLD_EXES)
+    list(APPEND defs PS2_LAUNCHER_OLD_EXES="${PS2_LAUNCHER_OLD_EXES}")
 endif()
 # The setup window's icon (title bar, task bar): the BMP built in as launcher_icon.inc
 if(PS2_LAUNCHER_ICON)

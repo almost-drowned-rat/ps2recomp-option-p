@@ -128,6 +128,38 @@ void RumbleNotice(const std::string& module) {
                          "passed on (porting guide 4c; host/src/dbc.cpp)\n", module.c_str());
 }
 
+/* A module's .iopmod version (16 bits, major << 8 | minor) from its ELF image; -1 when it has none. */
+int IopModVersion(const std::vector<u8>& image) {
+    auto at = [&](std::size_t o, std::size_t n) {
+        u32 v = 0;
+        if (o + n <= image.size()) std::memcpy(&v, &image[o], n);
+        return v;
+    };
+    if (at(0, 4) != 0x464C457Fu) return -1;
+    const u32 shoff = at(0x20, 4), shentsize = at(0x2E, 2), shnum = at(0x30, 2);
+    for (u32 i = 0; i < shnum; ++i) {
+        const std::size_t sh = shoff + std::size_t(i) * shentsize;
+        if (at(sh + 4, 4) == 0x70000080u && at(sh + 16, 4) + 0x1A <= image.size()) return int(at(at(sh + 16, 4) + 0x18, 2));
+    }
+    return -1;
+}
+
+/* dbcman, served by the host (dbc.cpp), answers libdbc's version check with the disc's module's own version:
+   God of War II's DBCMAN.IRX is 3.10 (libdbc 3.10 refuses 3.0), Burnout 3's 3.0. `image` empty: read from the disc. */
+void HostModule(const std::string& module, std::vector<u8> image) {
+    std::string upper = module;
+    for (char& ch : upper) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+    if (upper.find("DBCMAN") == std::string::npos && upper.find("DBC_MANAGER") == std::string::npos) return;
+    if (image.empty()) {
+        std::string disc_path = module;
+        const std::size_t colon = disc_path.find(':');
+        if (colon != std::string::npos) disc_path = disc_path.substr(colon + 1);
+        if (!GuestDisc().IsOpen() || !GuestDisc().ReadFile(disc_path, &image)) return;
+    }
+    const int version = IopModVersion(image);
+    if (version > 0) SetDbcmanVersion(u32(version));
+}
+
 std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
     static s32 next_id = 1;
     if (procedure == 0xFF) return std::vector<u8>(g_version, g_version + 4);
@@ -137,6 +169,7 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
         const s32 id = next_id++;
         RumbleNotice(path);
         if (iop::RunsModule(path)) return RunFromDisc(id, path, data);
+        HostModule(path, {});
         Note("module " + path, "IOP: module " + path + " loaded as " + std::to_string(id) +
                                    " (its services are the host's)");
         return Words(id, kResidentEnd);
@@ -167,6 +200,7 @@ std::vector<u8> LoadFile(u32 procedure, const std::vector<u8>& data) {
                 throw Unimplemented{"IOP: " + name + " is not a module the interpreter can load"};
             return Words(id, u32(result));
         }
+        HostModule(name, image);
         Note("module " + name, "IOP: module " + name +
                                    " from IOP memory at " + Hex(address) + " loaded as " +
                                    std::to_string(id) + " (its services are the host's)");

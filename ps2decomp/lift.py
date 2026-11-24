@@ -123,6 +123,46 @@ _UNALIGNED_STORES = {"swl": ("StoreLeft", 4), "swr": ("StoreRight", 4),
 
 def statement(ins) -> str:
     """The C++ for one non-control instruction."""
+    k = _IMMEDIATES.get(ins.addr)
+    if k is None:
+        return _statement(ins)
+    # A game's immediate a port sets at run time (use_immediates): the operand read through lifted::Immediate,
+    # the original's when unset.
+    m, rs, rt, imm = ins.mnemonic, ins.rs, ins.rt, ins.imm
+    a = _r(rs)
+    wrap = lambda text: "lifted::Immediate(%d, %s)" % (k, text)
+    if m in ("addiu", "addi"):
+        return _set(rt, "lifted::Sx32((u32)%s + (u32)%s)" % (a, wrap(_u32(imm))))
+    if m in ("daddiu", "daddi"):
+        return _set(rt, "%s + %s" % (a, wrap(_u64(imm))))
+    if m == "lui":
+        return _set(rt, wrap(_u64(_sx32((imm & 0xFFFF) << 16))))
+    if m in ("andi", "ori", "xori"):
+        op = {"andi": "&", "ori": "|", "xori": "^"}[m]
+        return _set(rt, "%s %s %s" % (a, op, wrap(_u64(imm & 0xFFFF))))
+    raise ValueError("immediate %d at 0x%08X: %s has no immediate a port can set" % (k, ins.addr, m))
+
+
+# Instructions whose immediate a port sets at run time: address -> its number (lifted::Immediate).
+_IMMEDIATES = {}
+
+
+def use_immediates(addresses) -> None:
+    """A game's "immediates" (game.json): each instruction's constant becomes lifted::Immediate(k, original), k
+    its place in the list. Their functions keep the plain form (tools/lift.py): the structured forms fold
+    constants."""
+    addresses = list(addresses)
+    if len(addresses) > 64:
+        raise ValueError("%d immediates: lifted::Immediate keeps 64" % len(addresses))
+    _IMMEDIATES.clear()
+    _IMMEDIATES.update({address: k for k, address in enumerate(addresses)})
+
+
+def immediates() -> dict:
+    return dict(_IMMEDIATES)
+
+
+def _statement(ins) -> str:
     m, rs, rt, rd, imm = ins.mnemonic, ins.rs, ins.rt, ins.rd, ins.imm
     a, b = _r(rs), _r(rt)
     address = "(u32)%s + %s" % (a, _u32(imm))

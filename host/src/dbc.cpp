@@ -55,7 +55,9 @@ namespace ps2host {
 
 namespace {
 
-constexpr u32 kVersion = 0x0300;    // dbcman 3.0, as libdbc 3.0 expects
+// The version 0x80001363 answers: the disc's DBCMAN.IRX's own (.iopmod, SetDbcmanVersion - God of War II's 3.10,
+// whose libdbc wants (version >> 4) == 0x31), else 3.0 as Burnout 3's libdbc expects.
+u32 g_version = 0x0300;
 constexpr u32 kDataBytes = 18, kProfileBytes = 5;
 
 struct Socket {
@@ -377,13 +379,25 @@ void PortRumble(u32 port, u8 large, u8 small) {
         if (Drives(port, d.id)) HostRumbleOf(d.id, large, small);
 }
 
+// PS2HOST_DBC_LOG=1: every dbcman call with its frame and first words, and each socket's written state when its
+// buttons change or a write is skipped (DbcFrame) - to see a game make, drop or move its sockets.
+bool DbcLog() {
+    static const bool on = std::getenv("PS2HOST_DBC_LOG") != nullptr;
+    return on;
+}
+
 std::vector<u8> Server(u32 procedure, const std::vector<u8>& request) {
     Dbc& d = D();
+    if (DbcLog())
+        std::fprintf(stderr, "[dbc] frame %llu: procedure 0x%08X, %zu bytes: %08X %08X %08X %08X | +24 %08X +28 %08X +2C %08X\n",
+                     (unsigned long long)g_frame, unsigned(procedure), request.size(), unsigned(At(request, 0)),
+                     unsigned(At(request, 4)), unsigned(At(request, 8)), unsigned(At(request, 0xC)),
+                     unsigned(At(request, 0x24)), unsigned(At(request, 0x28)), unsigned(At(request, 0x2C)));
     std::vector<u8> answer(request.size() < 0x30 ? 0x30 : request.size(), 0);
     std::copy(request.begin(), request.end(), answer.begin());
     switch (procedure) {
         case 0x80001363u:
-            Put(answer, 0, kVersion);
+            Put(answer, 0, g_version);
             return answer;
         case 0x80001304u:
             d.work = At(request, 4);
@@ -749,7 +763,12 @@ void DbcFrame() {
         const bool present = Present(s.port);
         if (d.work) m.Write(d.work + 4 * u32(id), present ? 1 : 0, 4);
         const u32 b = s.block[(s.counter + 1) & 1];
-        if (!b) continue;
+        if (!b) {
+            if (DbcLog() && g_frame % 300 == 0)
+                std::fprintf(stderr, "[dbc] frame %llu: socket %d port %u skipped: no block\n",
+                             (unsigned long long)g_frame, int(id), unsigned(s.port));
+            continue;
+        }
         if (!present) {                                 // an empty port: disconnected
             m.Write(b + 0, 0, 1);
             m.Write(b + 4, 0, 4);
@@ -758,6 +777,17 @@ void DbcFrame() {
         }
         u8 data[kDataBytes];
         PadData(s.port, data);
+        if (DbcLog()) {
+            static std::map<s32, u32> shown;
+            const u32 buttons = u32(data[0]) | u32(data[1]) << 8;
+            auto it = shown.find(id);
+            if (it == shown.end() || it->second != buttons || g_frame % 300 == 0) {
+                std::fprintf(stderr, "[dbc] frame %llu: socket %d port %u -> block 0x%08X counter %u, buttons %04X\n",
+                             (unsigned long long)g_frame, int(id), unsigned(s.port), unsigned(b), unsigned(s.counter + 1),
+                             unsigned(buttons));
+                shown[id] = buttons;
+            }
+        }
         m.Write(b + 0, 1, 1);                           // connected
         m.Write(b + 1, 0, 1);
         m.Write(b + 2, kDataBytes, 1);
@@ -776,8 +806,31 @@ void InstallDbc() {
     // their servers' ids are the procedures', and dbcman answers them alike.
     RegisterRpcServer(0x8000131Bu, Server);
     RegisterRpcServer(0x8000131Cu, Server);
+    // dbcman 3.1's two more (libdbc 3.10, God of War II 0x2B6DD8): a double-buffered send of up to 0x80 bytes,
+    // {+0, +4, +8 length, +0xC data}, called in turn on each. libdbc's init waits for both to be bound. What they
+    // carry is not known yet: each kind of call is noted with its first words, the answer is zeros.
+    for (u32 sid : {0x8000131Eu, 0x8000131Fu})
+        RegisterRpcServer(sid, [sid](u32 procedure, const std::vector<u8>& request) {
+            char text[192];
+            std::snprintf(text, sizeof text, "DBC: server 0x%08X procedure %u, %zu bytes: %08X %08X %08X %08X %08X %08X "
+                          "(not implemented, zeros)", unsigned(sid), unsigned(procedure), request.size(),
+                          unsigned(At(request, 0)), unsigned(At(request, 4)), unsigned(At(request, 8)),
+                          unsigned(At(request, 0xC)), unsigned(At(request, 0x10)), unsigned(At(request, 0x14)));
+            Note("dbc " + std::to_string(sid) + " " + std::to_string(procedure) + " " +
+                     std::to_string(request.size() > 0xC ? At(request, 8) : 0),
+                 text);
+            return std::vector<u8>(request.size() < 0x30 ? 0x30 : request.size(), 0);
+        });
     RegisterRpcServer(0x80000100u, Padman);
     RegisterRpcServer(0x80000101u, Padman);
+}
+
+void SetDbcmanVersion(u32 version) {
+    g_version = version;
+    char text[80];
+    std::snprintf(text, sizeof text, "DBC: dbcman answers version %u.%02X (the disc's DBCMAN.IRX)",
+                  unsigned(version >> 8), unsigned(version & 0xFF));
+    Note("dbcman version", text);
 }
 
 u16 PadButtonsHeld() { return g_held; }

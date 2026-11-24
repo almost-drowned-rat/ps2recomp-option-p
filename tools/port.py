@@ -344,6 +344,10 @@ def iop_module_files(game) -> list:
             disc = game.path(game.iso) if game.iso else ""
             if not disc or not os.path.exists(disc):
                 raise SystemExit("IOP module %s: not extracted and no disc image to take it from" % module)
+            if disc.lower().endswith(".chd"):
+                # (the host reads a CHD itself; this Python reader only an ISO: one made from it with chdman extractdvd)
+                raise SystemExit("IOP module %s: not extracted, and the disc is a CHD (%s) - extract the module from an ISO "
+                                 "made with `chdman extractdvd -i <chd> -o <iso>` (isotool.py extract)" % (module, disc))
             os.makedirs(os.path.dirname(path), exist_ok=True)
             with Iso9660.open(disc) as iso:
                 iso.extract_file(iso.find(module), path)

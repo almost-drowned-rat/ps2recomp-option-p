@@ -183,6 +183,10 @@ public:
     /* A transfer into local memory that Touch announced is done: its last
        pixel written (the GPU bridge patches what it holds newer then). */
     std::function<void()> on_transfer_done;
+    /* SIGNAL (0x60), FINISH (0x61) or LABEL (0x62) written, in the order the GS
+       takes its data: the events CSR and SIGLBLID show, and the GS interrupt
+       (devices.cpp). */
+    std::function<void(u32 address, u64 value)> on_event;
     /* The texture the primitive being drawn samples, decoded as the software
        rasteriser reads it (CLUT, TEXA): RGBA in memory, rows top-down. */
     void DecodeTexture(std::vector<u32>* pixels, u32* width, u32* height) const;

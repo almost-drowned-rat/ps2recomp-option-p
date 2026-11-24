@@ -42,6 +42,7 @@ DEFAULTS = {
     "overlay": None,
     "overlays": [],
     "iop_modules": [],
+    "immediates": [],
 }
 
 
@@ -67,6 +68,9 @@ class Game:
     # A game's: its IOP modules the host runs (paths on the disc, "MODULES/SND.IRX"), compiled ahead of time
     # (tools/ioprecomp.py) from the copies port.py extracts.
     iop_modules: list = dataclasses.field(default_factory=list)
+    # A game's: instructions whose immediate its port sets at run time (lifted::Immediate, k = the place in this
+    # list) - God of War II's 50 Hz constants for 60 Hz. Addresses; their functions keep the plain lifted form.
+    immediates: list = dataclasses.field(default_factory=list)
 
     def path(self, relative: str) -> str:
         return os.path.normpath(os.path.join(self.directory, relative))
@@ -119,7 +123,8 @@ def load(directory: str) -> Game:
                 vu_regions=[tuple(_number(v) for v in pair) for pair in values["vu_regions"]],
                 code_ranges=[tuple(_number(v) for v in pair)
                              for pair in (values["overlay"] or {}).get("code", [])],
-                base=base, overlays=list(values["overlays"]), iop_modules=list(values["iop_modules"]))
+                base=base, overlays=list(values["overlays"]), iop_modules=list(values["iop_modules"]),
+                immediates=[_number(v) for v in values["immediates"]])
     configure_layout(game)
     return game
 

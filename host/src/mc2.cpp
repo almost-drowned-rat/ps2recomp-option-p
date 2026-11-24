@@ -26,6 +26,7 @@ namespace fs = std::filesystem;
 
 constexpr u32 kFound = 0x81010011;        // EEXIST: the lookup's "here it is"
 constexpr u32 kNoEntry = 0x81010002;      // ENOENT
+constexpr u32 kNoDevice = 0x81010013;     // ENODEV: no card in the slot
 constexpr u32 kNotDirectory = 0x81010014; // ENOTDIR
 constexpr u32 kInvalid = 0x81010016;      // EINVAL
 constexpr u32 kNoSpace = 0x8101001C;      // ENOSPC
@@ -197,6 +198,14 @@ void SetCardDirectory(const std::string& directory) { Directory() = directory; }
 
 void GetInfo(lifted::Context& c) {
     const u32 info = u32(c.r[5]);
+    // One card, in slot 1 (socket 0): slot 2 answers as libmc2's own handler does with no card there,
+    // 0x81010013 and the info zeroed (God of War II 0x2B99C8 - it asks for both slots; before, slot 2 had one too).
+    if (u32(c.r[4]) != 0) {
+        if (info)
+            for (u32 o = 0; o < 12; o += 4) generated::Write32(info + o, 0);
+        c.r[2] = Result(kNoDevice);
+        return;
+    }
     std::error_code error;
     fs::create_directories(fs::u8path(Directory()), error);
     if (info) {

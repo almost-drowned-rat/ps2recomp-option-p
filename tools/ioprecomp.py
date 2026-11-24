@@ -306,7 +306,10 @@ FOOTER = """
 
 
 def module_symbol(name: str) -> str:
-    return "".join(ch if ch.isalnum() else "_" for ch in name)
+    # A C++ name must not start with a digit: God of War II's 989NOMID.IRX becomes m989NOMID_IRX (names that start
+    # with a letter, every module before it, stay as they were).
+    symbol = "".join(ch if ch.isalnum() else "_" for ch in name)
+    return "m" + symbol if symbol[:1].isdigit() else symbol
 
 
 def generate(modules: list, what: str, single: str = None) -> dict:

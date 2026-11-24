@@ -92,8 +92,16 @@ public:
     static u32 PatternSize(u32 pattern) { return pattern == 1 ? 2328 : pattern == 2 ? 2340 : kSectorSize; }
 
     /* Look a path up - "\\DATA\\CARS.BIN;1" as the SDK writes it; separators may
-       be either slash, the version suffix is optional, case does not matter. */
+       be either slash, the version suffix is optional, case does not matter.
+       Layer 0's file system first, then a dual-layer disc's layer 1 (its lsn
+       then counted from the disc's start, as the game reads it): God of War II
+       EU keeps PART2.PAK there, 4 GB, in layer 1's own volume. */
     bool Find(const std::string& path, File* out);
+    /* A dual-layer (PTP) DVD image's layer 1: the sector it starts at, or 0 for
+       a single layer. Layer 1's own primary volume descriptor lies at the sector
+       layer 0's volume size names; the layer starts 16 sectors before it
+       (PCSX2's rule; God of War II EU: 2,080,896). sceCdReadDvdDualInfo's answer. */
+    u32 Layer1Start();
     /* A whole file's bytes (a path as Find takes it); false if it is not there. */
     bool ReadFile(const std::string& path, std::vector<u8>* out);
     /* The executable the console boots: SYSTEM.CNF's BOOT2 line, as a path on
@@ -101,6 +109,7 @@ public:
     std::string BootPath();
 
 private:
+    bool FindIn(u32 volume, const std::string& path, File* out);  // the volume descriptor's sector
     void DetectFormat();
     bool ReadBytes(u64 offset, u64 length, u8* out);
     bool ReadOwn(u32 lsn, u32 count, u8* out);          // the image's own sectors

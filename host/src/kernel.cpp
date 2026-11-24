@@ -14,6 +14,7 @@
 #include <map>
 #include <string>
 
+#include "ps2host/disc.h"
 #include "ps2host/memory.h"
 #include "ps2host/run.h"
 #include "ps2host/settings.h"
@@ -33,16 +34,22 @@ int OsdLanguage(const std::string& value) {
     return -1;
 }
 
+// GsPutIMR's mask (bit 8 SIGNAL, 9 FINISH, 10 HSYNC, 11 VSYNC, 12 EDW: 1 masked), read by the GS's events on the
+// GS thread (devices.cpp). All masked until the program says otherwise, as after the console's reset.
+std::atomic<u32> g_gs_imr{0xFF00u};
+
 struct Kernel {
     u32 heap_end = 0;
     u32 stack_base = 0;
-    u64 gs_imr = 0;
+    u64 gs_imr = 0xFF00u;
     std::map<u32, u32> sif_registers;
     // The console's settings, as Get/SetOsdConfigParam pass them: bit 0 S/PDIF,
     // 1-2 screen (0 4:3), 3 video output, 4 non-Japanese language, 5-12 PS1
     // driver settings, 13-15 version, 16-20 language (1 English), 21-31 time
     // zone offset in minutes. A US console in English, at GMT.
     u32 osd_config = (1u << 4) | (1u << 13) | (1u << 16);
+    u8 osd_config2[16] = {};                         // Get/SetOsdConfigParam2's bytes
+    u32 vsync_flag = 0, vsync_csr = 0;               // SetVSyncFlag's, until the next blank
 };
 
 // The kernel's syscall table, in guest kernel RAM as on the console: SetSyscall
@@ -102,6 +109,19 @@ const Service kServices[] = {
 };
 
 }  // namespace
+
+void KernelVblank(u64 frame) {
+    Kernel& k = K();
+    if (k.vsync_flag) GuestMemory().Write(k.vsync_flag, 1, 4);
+    if (k.vsync_csr) {                               // FIELD (bit 13) by the frame, VSINT (bit 3) pending
+        const u64 csr = (u64(frame & 1) << 13) | (1u << 3);
+        GuestMemory().Write(k.vsync_csr, u32(csr), 4);
+        GuestMemory().Write(k.vsync_csr + 4, u32(csr >> 32), 4);
+    }
+    k.vsync_flag = k.vsync_csr = 0;
+}
+
+u32 KernelGsImr() { return g_gs_imr.load(std::memory_order_relaxed); }
 
 const char* SyscallName(s32 service) {
     const s32 number = service < 0 ? -service : service;
@@ -166,6 +186,23 @@ void KernelSyscall(lifted::Context& c) {
             return;
         case 0x3C: {                                 // SetupThread(gp, stack, size, args, root)
             const u32 stack = Arg(c, 1), size = Arg(c, 2);
+            // The program's argument area (crt0's: argc, argv[16], 256 bytes of strings): the console's kernel
+            // fills it with the path the program was started from - argc 1, argv[0] "cdrom0:\SCES_542.06;1" for
+            // a disc's BOOT2. God of War II (0x001873D8, its start-up) tells disc from a dev kit's host0 by
+            // argv[0]: with argc 0 it took itself for one - no IOPRP300 reboot, every module load refused
+            // (loadfile's version 2800, not 3000), its sound servers never there.
+            if (const u32 args = Arg(c, 3)) {
+                const std::string boot = GuestDisc().IsOpen() ? GuestDisc().BootPath() : std::string();
+                if (!boot.empty()) {
+                    Memory& m = GuestMemory();
+                    const std::string path = "cdrom0:" + boot;
+                    const u32 strings = args + 4 + 16 * 4;
+                    m.Write(args, 1, 4);
+                    m.Write(args + 4, strings, 4);
+                    for (std::size_t i = 0; i < path.size() && i < 255; ++i) m.Write(strings + u32(i), u8(path[i]), 1);
+                    m.Write(strings + u32(path.size() < 255 ? path.size() : 255), 0, 1);
+                }
+            }
             // A stack of -1 means "at the top of RAM"; the thread's stack pointer
             // is the top of its stack, less the kernel's argument area.
             const u32 base = stack == 0xFFFFFFFFu ? kRdramSize - size : stack;
@@ -187,6 +224,7 @@ void KernelSyscall(lifted::Context& c) {
             return;
         case 0x71:                                   // GsPutIMR(imr)
             k.gs_imr = Arg(c, 0);
+            g_gs_imr.store(u32(k.gs_imr), std::memory_order_relaxed);
             Return(c, 0);
             return;
         case 0x74:                                   // SetSyscall(service, handler)
@@ -247,6 +285,29 @@ void KernelSyscall(lifted::Context& c) {
             return;
         case 0x4A:                                   // SetOsdConfigParam(config*)
             k.osd_config = u32(GuestMemory().Read(Arg(c, 0), 4));
+            Return(c, 0);
+            return;
+        // The console's second settings block (version >= 1 in GetOsdConfigParam - the host's is 1): bytes a
+        // program reads or sets from an offset - date / time notation, summer time (God of War II's libscf,
+        // 0x002BEB70 / 0x002BEBD8, reads byte 1's bits 4 and 5; unanswered, it read what its stack held).
+        // All zero by default: year/month/day, 24-hour clock, no summer time.
+        case 0x6E:                                   // SetOsdConfigParam2(buffer*, size, offset)
+        case 0x6F: {                                 // GetOsdConfigParam2(buffer*, size, offset)
+            Memory& m = GuestMemory();
+            for (u32 i = 0; i < Arg(c, 1) && Arg(c, 2) + i < sizeof k.osd_config2; ++i) {
+                u8& b = k.osd_config2[Arg(c, 2) + i];
+                if (number == 0x6E) b = u8(m.Read(Arg(c, 0) + i, 1));
+                else m.Write(Arg(c, 0) + i, b, 1);
+            }
+            Return(c, 0);
+            return;
+        }
+        case 0x73:                                   // SetVSyncFlag(flag*, csr*)
+            // At the next vertical blank start the kernel writes 1 to *flag and the GS's CSR (64 bits) to *csr,
+            // once (KernelVblank). God of War II's libgraph (0x002CF7C0) waits on it and takes its field from
+            // CSR >> 13; unanswered, that was whatever its stack held.
+            k.vsync_flag = Arg(c, 0);
+            k.vsync_csr = Arg(c, 1);
             Return(c, 0);
             return;
         case 0x4B: {                                 // GetOsdConfigParam(config*)

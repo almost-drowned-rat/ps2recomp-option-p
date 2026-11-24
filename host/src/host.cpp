@@ -862,7 +862,7 @@ int Run(const Options& options) {
         if (!options.memcard.empty()) {
             where = std::filesystem::absolute(options.memcard).parent_path();
         } else {
-            where = ps2platform::ExeDir();
+            where = ps2platform::RootDir();
         }
         LoadSettings((where / "pc_settings.ini").string());
     }

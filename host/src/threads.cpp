@@ -355,6 +355,11 @@ std::atomic<u32> g_intc_stat{0};
 
 using ps2platform::SleepUntil;          // to a tenth of a millisecond or so (platform.h)
 bool g_paced = false;                   // SetPaced
+// LastVblankNs: the real-time timer's blank (steady clock), or with a virtual clock the blank's own time - frames
+// x NTSC's period, the same in a recording and its replay. Without it a virtual-time run (a recorded session)
+// read 0 forever: ZOE's Shows3d / SelectAllowed never true - SELECT's menu never opened, the HUD placed as a 2D
+// screen's (the maintainer 2026-11-24).
+std::atomic<u64> g_last_vblank_ns{0};
 
 // One frame's interrupts, delivered to the handlers registered for them.
 bool DeliverFrame() {
@@ -370,7 +375,9 @@ bool DeliverFrame() {
         if (next < now - std::chrono::milliseconds(100)) next = now;   // fell behind: no catching up
         SleepUntil(next);
     }
+    if (s.virtual_time) g_last_vblank_ns.store(u64(s.frames) * 16683334u, std::memory_order_relaxed);
     g_intc_stat.fetch_or((1u << kVblankStart) | (1u << kVblankEnd), std::memory_order_relaxed);
+    KernelVblank(s.frames);                    // SetVSyncFlag's words, with the blank's INTC bit
     if (s.virtual_time && g_real_time_from && s.frames >= g_real_time_from) StartRealTime();
     {
         Timed timed(Section::Iop);
@@ -504,7 +511,6 @@ void TimerTick() {
     g_timer_seq.fetch_add(1, std::memory_order_release);
     ps2platform::WakeAll(g_timer_seq);
 }
-std::atomic<u64> g_last_vblank_ns{0};       // LastVblankNs
 
 /* Whether a deadline may be waited for by spinning its last stretch (a
    sleep's wake-up can be late by a little): only with cores to spare - more
@@ -842,6 +848,10 @@ void LoopHead(lifted::Context& c, u32 address) {
     while (DeliverIopReply()) {
     }
     DeliverPendingDmac();
+    // PostIntc's causes (the GS's FINISH, the VIFs') at a loop head too, not only between threads: God of War II
+    // sets a flag, kicks its draw list and spins (0x18ABC8, no call, no device read) until its GS handler sets
+    // the flag again - between threads never came.
+    DeliverPostedIntc();
     // Returning from the interrupt, a thread its handler woke may run first.
     Thread* best = PickReady();
     if (best && best->priority < s.current->priority) {
@@ -935,6 +945,11 @@ void RaiseIntc(u32 cause) {
 void PostIntc(u32 cause) {
     g_intc_stat.fetch_or(1u << cause, std::memory_order_relaxed);     // INTC_STAT at once, the handlers later
     g_posted_intc.fetch_or(1u << cause, std::memory_order_release);
+    // In real time the running thread looks at its next loop head (as the timer thread pokes it), so a spin on
+    // the handler's flag ends soon. In virtual time at its slice's end (LoopHead), so the clock goes as before.
+    Scheduler& s = S();
+    if (s.realtime)
+        if (lifted::Context* c = s.running.load()) SpendBudget(*c);
 }
 
 u32 IntcStat() { return g_intc_stat.load(std::memory_order_relaxed); }

@@ -238,7 +238,10 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
     // (no filling writes), elements of whole words, none part-read - each
     // stored as WriteElement would, its address kept by counting rather than
     // dividing.
-    if (u.bytes.empty() && size % 4 == 0 && !u.masked && mode == 0 && vu &&
+    // PS2HOST_VIF_SLOW=1: every element the general way (Element, WriteElement) - the fast paths below checked
+    // against it on a game's own data (diagnosis only).
+    static const bool slow = std::getenv("PS2HOST_VIF_SLOW") != nullptr;
+    if (!slow && u.bytes.empty() && size % 4 == 0 && !u.masked && mode == 0 && vu &&
         Wl() <= Cl() && (u.format == 0xC || u.format == 0x8 || u.format == 0x4 ||
                                            u.format == 0x0 || u.format == 0xD || u.format == 0x5 ||
                                            u.format == 0xE)) {
@@ -312,7 +315,7 @@ void VifStream::UnpackRun(const std::uint32_t* words, std::uint32_t count) {
     // element's x, or - past this run - the next run's first (w_pending), or
     // 0 at the unpack's end. A third of ZOE's UNPACK words in its fight
     // (PS2HOST_VIF_STATS, 2026-11-18) - the byte path was ~8 % of a core.
-    if (u.format == 0x9 && !u.masked && mode == 0 && vu && Wl() <= Cl()) {
+    if (!slow && u.format == 0x9 && !u.masked && mode == 0 && vu && Wl() <= Cl()) {
         // leftover bytes of a part-read element first (at most two words make it whole again)
         while (!u.bytes.empty() && count) {
             UnpackData(*words++);

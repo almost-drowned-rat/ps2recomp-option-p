@@ -54,6 +54,7 @@ def _setup(game):
     image = elf.section_data(section)
     lift.use_sections(lift_tool._other_sections(elf, section))
     lift.use_function_starts(f["addr"] for f in database["functions"])
+    lift.use_immediates(game.immediates)
     functions = [f for f in database["functions"] if f["end"] > f["addr"]]
     strings = {entry["addr"]: entry["text"] for entry in database.get("strings", [])}
     return functions, image, section.addr, strings
@@ -124,6 +125,55 @@ def _worker_structure(job):
     return address, _structured(by_address[address], image, base, strings, form)
 
 
+def _have_multiprocessing() -> bool:
+    """Python for Android (python.org's package) has no _multiprocessing (Android has no POSIX named semaphores):
+    multiprocessing.Pool cannot start there."""
+    try:
+        import _multiprocessing  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _structure_forked(functions, image, base, strings, work, jobs: int) -> dict:
+    """The structuring in `jobs` forked children, without multiprocessing (agent L 2026-11-23, Android: the player's
+    first-start translation on the device, 189 s -> ~1/jobs). Each child inherits the analysis already loaded,
+    takes every jobs-th function (sizes mixed evenly) and sends its texts back through a pipe, pickled."""
+    import pickle
+    by_address = {f["addr"]: f for f in functions}
+    children = []
+    for k in range(jobs):
+        part = work[k::jobs]
+        read_fd, write_fd = os.pipe()
+        pid = os.fork()
+        if pid == 0:                                    # the child
+            os.close(read_fd)
+            code = 0
+            try:
+                out = {a: _structured(by_address[a], image, base, strings, form) for a, form in part}
+                with os.fdopen(write_fd, "wb") as pipe:
+                    pickle.dump(out, pipe, protocol=pickle.HIGHEST_PROTOCOL)
+            except BaseException as error:              # (reported by the parent: a missing part)
+                sys.stderr.write("translate: worker %d failed: %r\n" % (k, error))
+                code = 1
+            finally:
+                os._exit(code)
+        os.close(write_fd)
+        children.append((pid, read_fd, len(part)))
+    chosen, failed = {}, 0
+    for pid, read_fd, count in children:
+        with os.fdopen(read_fd, "rb") as pipe:
+            data = pipe.read()
+        _, status = os.waitpid(pid, 0)
+        if status != 0 or not data:
+            failed += 1
+            continue
+        chosen.update(pickle.loads(data))
+    if failed:
+        raise SystemExit("translate: %d of %d workers failed" % (failed, jobs))
+    return chosen
+
+
 def translate(game, forms_path: str, out_dir: str, jobs: int) -> dict:
     started = time.time()
     with open(forms_path, encoding="utf-8") as handle:
@@ -135,11 +185,13 @@ def translate(game, forms_path: str, out_dir: str, jobs: int) -> dict:
     stage = time.time()
     chosen = {a: plain[a] for a, form in forms.items() if form == "plain" and a in plain}
     work = sorted((a, form) for a, form in forms.items() if form != "plain")
-    if jobs > 1 and len(work) >= 200:      # (a few functions: one process, no workers' start-up)
+    if jobs > 1 and len(work) >= 200 and _have_multiprocessing():  # (a few functions: one process, no start-up)
         import multiprocessing
         with multiprocessing.Pool(jobs, _worker_init, (game.directory,)) as pool:
             for address, text in pool.imap_unordered(_worker_structure, work, chunksize=32):
                 chosen[address] = text
+    elif jobs > 1 and len(work) >= 200 and hasattr(os, "fork"):
+        chosen.update(_structure_forked(functions, image, base, strings, work, jobs))
     else:
         by_address = {f["addr"]: f for f in functions}
         for address, form in work:

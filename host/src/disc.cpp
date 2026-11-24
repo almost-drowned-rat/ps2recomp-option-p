@@ -304,12 +304,30 @@ bool Disc::ReadPattern(u32 lsn, u32 count, u32 pattern, u8* out) {
     return true;
 }
 
+u32 Disc::Layer1Start() {
+    std::vector<u8> pvd(kSectorSize);
+    if (!IsOpen() || !Read(16, 1, pvd.data()) || pvd[0] != 1 || std::memcmp(&pvd[1], "CD001", 5) != 0) return 0;
+    const u32 volume = Le32(&pvd[80]);                  // volume space size, the little-endian half
+    if (volume <= 16 || volume >= Sectors() || !Read(volume, 1, pvd.data()) || pvd[0] != 1 ||
+        std::memcmp(&pvd[1], "CD001", 5) != 0)
+        return 0;
+    return volume - 16;
+}
+
 bool Disc::Find(const std::string& path, File* out) {
-    // The primary volume descriptor, sector 16, holds the root directory's record.
+    if (FindIn(16, path, out)) return true;
+    const u32 layer1 = Layer1Start();
+    return layer1 && FindIn(layer1 + 16, path, out);
+}
+
+bool Disc::FindIn(u32 volume, const std::string& path, File* out) {
+    // The primary volume descriptor (sector 16 of its layer) holds the root directory's record; a layer's
+    // sector numbers count from the layer's start, the File's from the disc's.
     std::vector<u8> sector(kSectorSize);
-    if (!Read(16, 1, sector.data()) || sector[0] != 1 || std::memcmp(&sector[1], "CD001", 5) != 0)
+    if (!Read(volume, 1, sector.data()) || sector[0] != 1 || std::memcmp(&sector[1], "CD001", 5) != 0)
         return false;
-    File directory{Le32(&sector[156 + 2]), Le32(&sector[156 + 10])};
+    const u32 base = volume - 16;
+    File directory{base + Le32(&sector[156 + 2]), Le32(&sector[156 + 10])};
     std::string rest = path;
     for (char& ch : rest) if (ch == '/') ch = '\\';
     while (!rest.empty()) {
@@ -333,7 +351,7 @@ bool Disc::Find(const std::string& path, File* out) {
             const std::string name(reinterpret_cast<const char*>(&data[at + 33]), name_length);
             if (name_length > 1 || (name_length == 1 && name[0] > 1)) {
                 if (Bare(name) == part) {
-                    directory = File{Le32(&data[at + 2]), Le32(&data[at + 10])};
+                    directory = File{base + Le32(&data[at + 2]), Le32(&data[at + 10])};
                     found = true;
                     break;
                 }
@@ -464,18 +482,24 @@ std::vector<Disc::IsoFile> Disc::Files() {
         u32 lsn, size;
         std::string prefix;
         int depth;
+        u32 base;                                   // the layer's first sector: its own sector numbers count from it
     };
-    std::vector<Dir> todo{{Le32(&pvd[156 + 2]), Le32(&pvd[156 + 10]), "", 0}};
+    std::vector<Dir> todo{{Le32(&pvd[156 + 2]), Le32(&pvd[156 + 10]), "", 0, 0}};
+    // A dual-layer disc's layer 1 has a file system of its own (God of War II EU: PART2.PAK, 4 GB): its files too,
+    // so an unpacked disc has them by name, not only as sectors.
+    if (const u32 layer1 = Layer1Start(); layer1 && ReadOwn(layer1 + 16, 1, pvd.data()))
+        todo.push_back({Le32(&pvd[156 + 2]), Le32(&pvd[156 + 10]), "", 0, layer1});
     std::vector<std::pair<u32, u32>> seen;
     while (!todo.empty()) {
         const Dir d = todo.back();
         todo.pop_back();
-        if (d.depth > 16 || std::find(seen.begin(), seen.end(), std::make_pair(d.lsn, d.size)) != seen.end()) continue;
-        seen.push_back({d.lsn, d.size});
+        const u32 lsn = d.base + d.lsn;
+        if (d.depth > 16 || std::find(seen.begin(), seen.end(), std::make_pair(lsn, d.size)) != seen.end()) continue;
+        seen.push_back({lsn, d.size});
         const u32 sectors = (d.size + kSectorSize - 1) / kSectorSize;
-        if (!sectors || u64(d.lsn) + sectors > sectors_) continue;
+        if (!sectors || u64(lsn) + sectors > sectors_) continue;
         std::vector<u8> data(std::size_t(sectors) * kSectorSize);
-        if (!ReadOwn(d.lsn, sectors, data.data())) continue;
+        if (!ReadOwn(lsn, sectors, data.data())) continue;
         for (u32 at = 0; at < d.size;) {
             const u8 length = data[at];
             if (length == 0) {                      // records never cross a sector boundary
@@ -491,9 +515,10 @@ std::vector<Disc::IsoFile> Disc::Files() {
                 if (semicolon != std::string::npos) name.resize(semicolon);
                 if (!dir && !name.empty() && name.back() == '.') name.pop_back();
                 if (dir)
-                    todo.push_back({Le32(&data[at + 2]), Le32(&data[at + 10]), d.prefix + name + "/", d.depth + 1});
+                    todo.push_back({Le32(&data[at + 2]), Le32(&data[at + 10]), d.prefix + name + "/", d.depth + 1,
+                                    d.base});
                 else
-                    out.push_back({d.prefix + name, Le32(&data[at + 2]), Le32(&data[at + 10])});
+                    out.push_back({d.prefix + name, d.base + Le32(&data[at + 2]), Le32(&data[at + 10])});
             }
             at += length;
         }

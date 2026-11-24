@@ -77,9 +77,18 @@ int ProcessCores();
 bool HoldToCores(std::uint64_t mask);
 
 // ---- Files and the process.
-// The running executable's own path; its folder is where a port keeps its settings, saves, boot.mpg.
+// The running executable's own path; its folder holds what belongs to it (the .pdb, an -sse4 build).
 std::filesystem::path ExePath();
 inline std::filesystem::path ExeDir() { return ExePath().parent_path(); }
+// The port's root: where it keeps its settings, saves, game\, data\, boot.mpg. The executable's folder - or, when
+// that folder is named "data" (any case), its parent: a release's top folder holds only <game>_launcher, the game
+// <game> lives in data\ (the maintainer's rule 2026-11-21, all ports and platforms).
+inline std::filesystem::path RootDir() {
+    const std::filesystem::path dir = ExeDir();
+    std::string name = dir.filename().string();
+    for (char& ch : name) ch = char(ch >= 'A' && ch <= 'Z' ? ch + 32 : ch);
+    return name == "data" && dir.has_parent_path() ? dir.parent_path() : dir;
+}
 // Whether a file or folder is there.
 bool Exists(const std::string& path);
 // Case-insensitive ASCII compare (0: equal).

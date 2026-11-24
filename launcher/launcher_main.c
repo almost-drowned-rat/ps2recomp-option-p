@@ -30,6 +30,9 @@
 #define PS2_LAUNCHER_FILE_FILTER NULL
 #define PS2_LAUNCHER_FILE_NAME NULL
 #endif
+#ifndef PS2_LAUNCHER_OLD_EXES
+#define PS2_LAUNCHER_OLD_EXES NULL
+#endif
 
 #ifdef PS2_LAUNCHER_ICON_INC
 static const unsigned char k_icon[] = {     /* -DPS2_LAUNCHER_ICON=<a BMP>: the setup window's icon */
@@ -46,6 +49,7 @@ int main(int argc, char **argv)
         PS2_LAUNCHER_GAME, PS2_LAUNCHER_DISC, PS2_LAUNCHER_TITLE, PS2_LAUNCHER_GAME_EXE, PS2_LAUNCHER_ICON_DATA,
         PS2_LAUNCHER_EXTRA_DISC, PS2_LAUNCHER_EXTRA_KEY,
         PS2_LAUNCHER_FILE_LABEL, PS2_LAUNCHER_FILE_FILTER_NAME, PS2_LAUNCHER_FILE_FILTER, PS2_LAUNCHER_FILE_NAME,
+        PS2_LAUNCHER_OLD_EXES,
     };
     return ps_launcher_main(&cfg, argc, argv);
 }

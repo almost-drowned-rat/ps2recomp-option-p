@@ -442,6 +442,14 @@ void KeepWindowRect() {
 #endif
 }
 
+bool DeveloperBuild() {
+#ifdef PS2HOST_NO_DEBUG_PANEL
+    return false;
+#else
+    return true;
+#endif
+}
+
 bool PumpWindow() {
 #ifdef PS2HOST_VULKAN
     if (g_display) {
@@ -483,6 +491,25 @@ bool PumpWindow() {
             notice = true;
             notice_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         }
+        // F8 (the maintainer 2026-11-24, for debugging the HUD on the keyboard): ASPECT RATIO to the next of 4:3,
+        // 16:9, 16:10, 21:9 - as the settings page sets it (saved), said on the screen for two seconds. Developer
+        // builds only (with the F9 debug panel): never in a player's release.
+#ifndef PS2HOST_NO_DEBUG_PANEL
+        static bool f8_before = false;
+        const bool f8 = WindowFocused() && HostKeyDown(ps2platform::key::kF8);
+        if (f8 && !f8_before && !PcMenuOpen() && !SelectMenuOpen()) {
+            static const char* const kAspects[] = {"4:3", "16:9", "16:10", "21:9"};
+            const std::string now_aspect = Setting("aspect", "4:3");
+            int next = 0;
+            for (int i = 0; i < 4; ++i)
+                if (now_aspect == kAspects[i]) next = (i + 1) % 4;
+            SetWindowAspect(kAspects[next]);
+            SetWindowOverlay({std::string("ASPECT RATIO ") + kAspects[next] + "  (F8)"});
+            notice = true;
+            notice_until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        }
+        f8_before = f8;
+#endif
         if (notice && std::chrono::steady_clock::now() >= notice_until) {
             notice = false;
             if (!PcMenuOpen()) SetWindowOverlay({});

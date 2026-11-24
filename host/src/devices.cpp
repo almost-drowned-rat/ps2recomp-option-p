@@ -89,6 +89,9 @@ void SetDStat(u32 value) {
     *reinterpret_cast<u32*>(GuestMemory().Translate(kDStat, 4)) = value;
 }
 constexpr u32 kGsCsr = 0x12001000u;
+constexpr u32 kGsSiglblid = 0x12001080u;
+std::atomic<u32> g_gs_csr_events{0};    // CSR bit 0 SIGNAL, 1 FINISH: set by the GS thread, cleared by a CSR write
+std::atomic<u64> g_gs_siglblid{0};      // SIGLBLID: SIGNAL's ID (low word), LABEL's (high)
 constexpr u32 kGifStat = 0x10003020u;
 constexpr u32 kGifStatM3P = 1u << 1;
 constexpr u32 kGifStatFqcShift = 24, kGifStatFqc = 0x1Fu << kGifStatFqcShift;
@@ -1239,11 +1242,40 @@ void InstallDevices() {
     // PostDmac) - VIF1's from its worker too.
     Vif0().on_interrupt = [] { PostIntc(13); };
     Vif1().on_interrupt = [] { PostIntc(14); };
+    // The GS's events: SIGNAL (CSR bit 0) and FINISH (bit 1) set when the GS takes the register - on the GS
+    // thread, in order after the drawing before it - and the GS interrupt (INTC 0) raised unless GsPutIMR masks
+    // it (bit 8 SIGMSK, 9 FINISHMSK). God of War II sets a flag, kicks its draw list (FINISH at its end) and
+    // waits for its handler to see CSR.FINISH. SIGNAL and LABEL write SIGLBLID's ID under their mask. The GS
+    // does not stall on a second SIGNAL here.
+    gs::TheGs().on_event = [](u32 address, u64 value) {
+        const u64 id = value & 0xFFFFFFFFu, mask = value >> 32;
+        if (address == 0x62) {
+            const u64 old = g_gs_siglblid.load(std::memory_order_relaxed);
+            g_gs_siglblid.store((old & ~(mask << 32)) | ((id & mask) << 32), std::memory_order_relaxed);
+            return;
+        }
+        const u32 bit = address == 0x60 ? 1u : 2u;
+        if (address == 0x60) {
+            const u64 old = g_gs_siglblid.load(std::memory_order_relaxed);
+            g_gs_siglblid.store((old & ~mask) | (id & mask), std::memory_order_relaxed);
+        }
+        g_gs_csr_events.fetch_or(bit, std::memory_order_release);
+        if (!(KernelGsImr() & (bit << 8))) PostIntc(0);
+    };
+    // CSR read: the events pending, a vertical blank always (VSINT), FIELD alternating. The event bits are
+    // written 1 to clear (what a write left in memory is not read back as an event).
     m.OnRead(kGsCsr, [](u32, u64 stored) {
         static u64 field = 0;
         field ^= 1u << 13;                          // FIELD alternates each frame
-        return (stored & ~u64(1u << 13)) | field | (1u << 3);   // VSINT pending
+        return (stored & ~u64((1u << 13) | 0x1Fu)) | field | (1u << 3) |   // VSINT pending
+               g_gs_csr_events.load(std::memory_order_acquire);
     });
+    m.OnWrite(kGsCsr, [](u32, u64 value) { g_gs_csr_events.fetch_and(~(u32(value) & 3u), std::memory_order_acq_rel); });
+    for (u32 half : {0u, 4u})
+        m.OnRead(kGsSiglblid + half, [](u32 address, u64) {
+            const u64 value = g_gs_siglblid.load(std::memory_order_relaxed);
+            return address & 4 ? value >> 32 : value;
+        });
     m.OnRead(0x1000F000u, [](u32, u64) { return u64(IntcStat()); });     // INTC_STAT
     m.OnWrite(0x1000F000u, [](u32, u64 value) { ClearIntcStat(u32(value) & 0x7FFFu); });
     InstallTimers();

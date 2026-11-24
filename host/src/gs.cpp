@@ -364,6 +364,9 @@ void Gs::WriteRegister(u32 address, u64 value) {
             }
             break;
         case 0x54: Transfer(value, 0); break;          // HWREG: 64 bits
+        case 0x60: case 0x61: case 0x62:               // SIGNAL, FINISH, LABEL
+            if (on_event) on_event(address, value);
+            break;
         default: break;
     }
 }

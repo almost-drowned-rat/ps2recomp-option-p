@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #endif
 
 #define LP 1024
@@ -35,11 +36,13 @@
 
 typedef struct {
     const PsLauncherConfig *cfg;
-    /* root = the exe's folder (writable: the game, its settings and saves live here too); tools = data/tools,
+    /* root = the exe's folder (writable: the game's settings, saves, game/ live here too); tools = data/tools,
      * the payload unpacked; work = data/build/work, the translated sources; obj = data/build/obj */
     char root[LP], tools[LP], data[LP], build[LP], work[LP], obj[LP];
     char exe[LP];                           /* this exe (the payload trailer) */
-    char out[LP];                           /* the game: root/game_exe ({OUT}) */
+    char appimage[LP];                      /* Linux: the AppImage file started ("" none) - copied to a target folder */
+    char payload[LP];                       /* the file the payload trailer was found on (exe, or an older AppImage) */
+    char out[LP];                           /* the game: root/data/game_exe ({OUT}) */
     char iso[LP];                           /* the player's disc image */
     char lift_iso[LP];                      /* {ISO}: the image as the build's tools read it - a CHD's .iso copy */
     char release[33];
@@ -828,9 +831,20 @@ static int find_image(L *l, const char *image_arg)
 
 /* ── the payload ───────────────────────────────────────────────────────── */
 
+/* the trailer on this exe, or (Linux, an AppImage built before 2026-11-24) on the AppImage file: l->payload names
+ * the file it was found on */
+static int read_trailer_of(L *l, const char *file, Uint64 *offset);
+
 static int read_trailer(L *l, Uint64 *offset)
 {
-    SDL_IOStream *f = SDL_IOFromFile(l->exe, "rb");
+    if (read_trailer_of(l, l->exe, offset))
+        return 1;
+    return l->appimage[0] && read_trailer_of(l, l->appimage, offset);
+}
+
+static int read_trailer_of(L *l, const char *file, Uint64 *offset)
+{
+    SDL_IOStream *f = SDL_IOFromFile(file, "rb");
     unsigned char t[TRAILER_SIZE];
     Sint64 size;
     int ok = 0, i;
@@ -847,6 +861,8 @@ static int read_trailer(L *l, Uint64 *offset)
         ok = *offset < (Uint64)size;
     }
     SDL_CloseIO(f);
+    if (ok)
+        snprintf(l->payload, sizeof l->payload, "%s", file);
     return ok;
 }
 
@@ -900,7 +916,7 @@ static int unpack_job(L *l, void *a)
 {
     UnpackArg *u = (UnpackArg *)a;
     char zp[LP], marker[LP];
-    SDL_IOStream *in = SDL_IOFromFile(l->exe, "rb"), *out;
+    SDL_IOStream *in = SDL_IOFromFile(l->payload, "rb"), *out;
     Sint64 end;
     int bad = 0;
     void *buf;
@@ -1330,6 +1346,65 @@ static int link_job(L *l, void *a)
 
 /* ── the game ──────────────────────────────────────────────────────────── */
 
+/* the top folder's name of one exe (from a list's "a.exe,b.exe" part of k bytes), removed with its -sse4 build and its
+ * .pdb - never the launcher running (an older release's exe and ours can share a name: Windows' ZOE.exe = zoe.exe) */
+static void remove_top_exe(L *l, const char *name, size_t k)
+{
+    static const char *const suffix[] = { "", "-sse4", "" };
+#ifdef _WIN32
+    static const char *const ext[] = { ".exe", ".exe", ".pdb" };
+#endif
+    char stem[LP], f[LP], p[LP];
+    const char *self = l->exe, *image = l->appimage, *s;
+    int i;
+    if (k == 0 || k >= sizeof stem)
+        return;
+    memcpy(stem, name, k);
+    stem[k] = 0;
+    if (k > 4 && !SDL_strcasecmp(stem + k - 4, ".exe"))
+        stem[k - 4] = 0;
+    for (s = l->exe; *s; ++s)
+        if (*s == '/' || *s == '\\')
+            self = s + 1;
+    for (s = l->appimage; *s; ++s)              /* (Linux: nor the AppImage the player started) */
+        if (*s == '/')
+            image = s + 1;
+    for (i = 0; i < 3; ++i) {
+#ifdef _WIN32
+        snprintf(f, sizeof f, "%s%s%s", stem, suffix[i], ext[i]);
+#else
+        if (i == 2)
+            break;
+        snprintf(f, sizeof f, "%s%s", stem, suffix[i]);     /* Linux: the binary without an extension */
+#endif
+        if (!SDL_strcasecmp(f, self) || (image[0] && !SDL_strcasecmp(f, image)))
+            continue;
+        join(p, sizeof p, l->root, f);
+        if (is_file(p)) {
+            if (SDL_RemovePath(p))
+                lg(l, "removed the older layout's %s (the game is data/%s now)", p, l->cfg->game_exe);
+            else
+                lg(l, "cannot remove the older layout's %s", p);
+        }
+    }
+}
+
+/* the game built in data/: the top folder's game exe of the older layout (beside the launcher) and the port's older
+ * exe names (cfg->old_exes) go - one exe on top, the launcher (the maintainer's rule 2026-11-21) */
+static void remove_old_layout(L *l)
+{
+    const char *s = l->cfg->old_exes;
+    remove_top_exe(l, l->cfg->game_exe, strlen(l->cfg->game_exe));
+    while (s && *s) {
+        const char *e = strchr(s, ',');
+        size_t k = e ? (size_t)(e - s) : strlen(s);
+        while (k && (*s == ' '))
+            ++s, --k;
+        remove_top_exe(l, s, k);
+        s = e ? e + 1 : s + k;
+    }
+}
+
 static int start_game(L *l)
 {
     char *argv[] = { l->out, NULL };
@@ -1659,11 +1734,14 @@ static int move_to_target(L *l, const char *target, const char *extra, const cha
         xr_setup_ui_message(l->ui, 1, "The target folder cannot be made - choose another one.");
         return 0;
     }
-    join(exe_to, sizeof exe_to, target, base_name(l->exe));
-    memset(&c, 0, sizeof c);
-    c.from[0] = l->exe;
-    c.to[0] = exe_to;
-    c.total = file_size(l->exe);
+    {   /* the file the player has: the AppImage when one was started (this exe is inside its mount), else this exe */
+        const char *from = l->appimage[0] ? l->appimage : l->exe;
+        join(exe_to, sizeof exe_to, target, base_name(from));
+        memset(&c, 0, sizeof c);
+        c.from[0] = from;
+        c.to[0] = exe_to;
+        c.total = file_size(from);
+    }
     if (run_job(l, "Copying the game into the target folder", 0.0, 0.02, copy_job, &c, copy_frac)) {
         xr_setup_ui_message(l->ui, 1, "The game cannot be copied into the target folder - see data\\launcher.log.");
         return 0;
@@ -1721,6 +1799,11 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         else if (!strcmp(argv[i], "--copy")) copy = 2;
         else if (!strcmp(argv[i], "--extra") && i + 1 < argc) extra_arg = argv[++i];
         else if (!strcmp(argv[i], "--file") && i + 1 < argc) file_arg = argv[++i];
+        /* the same as one argument each (RecompLauncher passes an optional file so: the argument dropped whole when
+           the player picked none) */
+        else if (!strncmp(argv[i], "--image=", 8)) image = argv[i] + 8;
+        else if (!strncmp(argv[i], "--extra=", 8)) extra_arg = argv[i] + 8;
+        else if (!strncmp(argv[i], "--file=", 7)) file_arg = argv[i] + 7;
     }
     memset(&l, 0, sizeof l);
     l.cfg = cfg;
@@ -1736,25 +1819,41 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
         if (k > 0 && k < LP)
             WideCharToMultiByte(CP_UTF8, 0, w, -1, self, (int)sizeof self, NULL, NULL);
 #else
-        /* Linux: the AppImage is the one file the player has (the payload appended to it, as to the Windows exe) and
-         * its folder is the game's - the launcher itself runs from the AppImage's read-only mount */
-        const char *appimage = SDL_getenv("APPIMAGE");
-        if (appimage && *appimage) {
+        /* Linux - the root, the game's folder, in the three ways the launcher runs:
+         *   the AppImage started (its runtime sets an absolute APPIMAGE): the AppImage's folder - the launcher itself
+         *     runs from the AppImage's read-only mount;
+         *   the AppImage unpacked and its AppRun started without APPIMAGE (RecompLauncher does so: it unpacks the image
+         *     into the game's folder, deletes the file, starts AppRun with APPDIR = that folder; SDK guide part 1,
+         *     "AppImages"): an absolute APPDIR with this exe under it - as option-c's host_paths.c (5dc66ac);
+         *   the tar.gz's launcher started: its own folder (SDL_GetBasePath).
+         * The payload is on this exe itself (usr/bin/<game>-launcher in the AppDir, the tar.gz's launcher), so it is
+         * there in all three; an older AppImage carried it on the AppImage file instead (read_trailer tries both). */
+        const char *appimage = SDL_getenv("APPIMAGE"), *appdir = SDL_getenv("APPDIR");
+        char real[LP];
+        ssize_t n = readlink("/proc/self/exe", real, sizeof real - 1);
+        real[n > 0 ? n : 0] = 0;
+        snprintf(self, sizeof self, "%s", real[0] ? real : "/proc/self/exe");
+        if (appimage && appimage[0] == '/') {
             char *slash;
-            snprintf(self, sizeof self, "%s", appimage);
+            snprintf(l.appimage, sizeof l.appimage, "%s", appimage);
             snprintf(l.root, sizeof l.root, "%s", appimage);
             slash = strrchr(l.root, '/');
             if (slash)
                 slash[1] = 0;
             else
                 snprintf(l.root, sizeof l.root, "./");
-        } else {
-            snprintf(self, sizeof self, "/proc/self/exe");
+        } else if (appdir && appdir[0] == '/' && real[0]) {
+            size_t k = strlen(appdir);
+            while (k > 1 && appdir[k - 1] == '/')
+                --k;
+            if (!strncmp(real, appdir, k) && real[k] == '/')
+                snprintf(l.root, sizeof l.root, "%.*s/", (int)k, appdir);
         }
 #endif
         snprintf(l.exe, sizeof l.exe, "%s", exe_name && *exe_name ? exe_name : self);
     }
-    join(l.out, sizeof l.out, l.root, cfg->game_exe);
+    join(l.data, sizeof l.data, l.root, "data");
+    join(l.out, sizeof l.out, l.data, cfg->game_exe);   /* the game in data\: only the launcher on top (2026-11-21) */
 #ifdef _WIN32
     {   /* the linker names it .exe anyway: the stamp's check must look for that file */
         size_t k = strlen(l.out);
@@ -1762,7 +1861,6 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
             SDL_strlcat(l.out, ".exe", sizeof l.out);
     }
 #endif
-    join(l.data, sizeof l.data, l.root, "data");
     join(l.tools, sizeof l.tools, l.data, "tools");     /* in data since 2026-11-17 (the maintainer's folder layout) */
     join(l.build, sizeof l.build, l.data, "build");
     join(l.work, sizeof l.work, l.build, "work");
@@ -2040,6 +2138,7 @@ int ps_launcher_main(const PsLauncherConfig *cfg, int argc, char **argv)
     write_text(p, stamp_want);
     settings_set_disc(&l);
     lg(&l, "built %s", l.out);
+    remove_old_layout(&l);
     ok = no_start || start_game(&l);
 out:
     /* a CHD's .iso for the build: ours, gone with it (rm_tree keeps disc images - a player's own - so by name) */

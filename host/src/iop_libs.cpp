@@ -753,6 +753,31 @@ Outcome Strtoul(Vm& vm, Context& c) {
     return Ret(c, u32(value));
 }
 
+// strtok(s, delimiters) (sysclib #35): God of War II's SMPD.IRX splits its start arguments with it. The C library's
+// own: from s (or, s null, where the last call stopped) past the delimiters, the token ended by a 0 written over the
+// next delimiter; null when none is left. One saved place for the whole IOP, as the module library has.
+Outcome Strtok(Vm& vm, Context& c) {
+    static u32 next = 0;
+    u32 s = A(vm, c, 0);
+    if (!s) s = next;
+    if (!s) return Ret(c, 0);
+    const std::string delimiters = vm.String(A(vm, c, 1), 1u << 16);
+    const std::string text = vm.String(s, 1u << 20);
+    const std::size_t begin = text.find_first_not_of(delimiters);
+    if (begin == std::string::npos) {
+        next = 0;
+        return Ret(c, 0);
+    }
+    const std::size_t end = text.find_first_of(delimiters, begin);
+    if (end == std::string::npos) {
+        next = 0;
+    } else {
+        vm.Write(s + u32(end), 0, 1);
+        next = s + u32(end) + 1;
+    }
+    return Ret(c, s + u32(begin));
+}
+
 Outcome Strstr(Vm& vm, Context& c) {
     const u32 s = A(vm, c, 0);
     const std::string text = vm.String(s, 1u << 20);
@@ -1000,6 +1025,80 @@ Outcome CdReadWithCallback(Vm& vm, Context& c) {
 }
 Outcome CdBreak(Vm&, Context& c) { return Ret(c, 1); }
 Outcome CdMmode(Vm&, Context& c) { return Ret(c, 1); }
+Outcome CdStop(Vm&, Context& c) { return Ret(c, 1); }             // sceCdStop: nothing spins here
+
+// ---------------------------------------------------------------- ioman
+// A module's own files (God of War II's SMPD.IRX reads GODOFWAR.TOC and its .VAG streams, 989NOMID its banks,
+// 2026-11-24): open / close / read / lseek on the disc ("cdrom0:\\GODOFWAR.TOC;1", "cdrom:..."), read-only, from
+// the user's image - both layers of a dual-layer one (Disc::Find). Any other device is not there (-ENOENT).
+// Reads finish at once. The EE's own file I/O is fileio.cpp's; the two have descriptors of their own.
+
+struct IoFile {
+    Disc::File file;
+    u32 position = 0;
+};
+
+std::map<s32, IoFile>& IoFiles() {
+    static std::map<s32, IoFile> files;
+    return files;
+}
+
+constexpr s32 kIoNoEntry = -2, kIoBadDescriptor = -9, kIoError = -5, kIoNoSpace = -24;
+
+// open(path, flags[, mode]) -> a descriptor (>= 0), or < 0.
+Outcome IoOpen(Vm& vm, Context& c) {
+    const std::string path = vm.String(A(vm, c, 0), 1024);
+    const u32 flags = A(vm, c, 1);
+    const std::size_t colon = path.find(':');
+    const std::string device = colon == std::string::npos ? "" : path.substr(0, colon);
+    Disc::File file;
+    if (device.rfind("cdrom", 0) != 0 || !GuestDisc().IsOpen() || !GuestDisc().Find(path.substr(colon + 1), &file)) {
+        Note("iop open " + path, "IOP: ioman open " + path + " (not found)");
+        return Ret(c, u32(kIoNoEntry));
+    }
+    if ((flags & 3) != 1) Note("iop open write " + path, "IOP: ioman open " + path + " for writing (read only here)");
+    s32 fd = 0;
+    while (IoFiles().count(fd)) ++fd;
+    if (fd >= 32) return Ret(c, u32(kIoNoSpace));       // ioman's table holds 32
+    IoFiles()[fd] = IoFile{file, 0};
+    Note("iop open " + path, "IOP: ioman open " + path);
+    return Ret(c, u32(fd));
+}
+
+Outcome IoClose(Vm& vm, Context& c) {
+    return Ret(c, IoFiles().erase(s32(A(vm, c, 0))) ? 0 : u32(kIoBadDescriptor));
+}
+
+// read(fd, buffer, size) -> bytes read: whole sectors from the disc, the bytes asked for out of them.
+Outcome IoRead(Vm& vm, Context& c) {
+    auto found = IoFiles().find(s32(A(vm, c, 0)));
+    if (found == IoFiles().end()) return Ret(c, u32(kIoBadDescriptor));
+    IoFile& f = found->second;
+    const u32 buffer = A(vm, c, 1);
+    const u32 size = std::min(A(vm, c, 2), f.file.size > f.position ? f.file.size - f.position : 0u);
+    if (!size) return Ret(c, 0);
+    const u32 first = f.position / kSectorSize, last = u32((u64(f.position) + size + kSectorSize - 1) / kSectorSize);
+    std::vector<u8> sectors(std::size_t(last - first) * kSectorSize);
+    if (!GuestDisc().Read(f.file.lsn + first, last - first, sectors.data())) return Ret(c, u32(kIoError));
+    std::memcpy(vm.At(buffer, size), sectors.data() + (f.position - first * kSectorSize), size);
+    f.position += size;
+    return Ret(c, size);
+}
+
+// lseek(fd, offset, whence: 0 set, 1 current, 2 end) -> the new position.
+Outcome IoLseek(Vm& vm, Context& c) {
+    auto found = IoFiles().find(s32(A(vm, c, 0)));
+    if (found == IoFiles().end()) return Ret(c, u32(kIoBadDescriptor));
+    IoFile& f = found->second;
+    const s32 offset = s32(A(vm, c, 1));
+    const u32 whence = A(vm, c, 2);
+    if (whence > 2) return Ret(c, u32(-22));            // EINVAL
+    const s64 base = whence == 0 ? 0 : whence == 1 ? s64(f.position) : s64(f.file.size);
+    const s64 position = base + offset;
+    if (position < 0) return Ret(c, u32(-22));
+    f.position = u32(std::min<s64>(position, 0xFFFFFFFFll));
+    return Ret(c, f.position);
+}
 
 Outcome FlushDcache(Vm&, Context& c) { return Ret(c, 0); }
 // RegisterLibraryEntries(table): a module offers its functions to the modules
@@ -1285,7 +1384,8 @@ const Map& Table() {
         {{"sysclib", 17}, Bzero}, {{"sysclib", 19}, Sprintf}, {{"sysclib", 20}, Strcat},
         {{"sysclib", 21}, Strchr}, {{"sysclib", 22}, Strcmp}, {{"sysclib", 23}, Strcpy},
         {{"sysclib", 27}, Strlen}, {{"sysclib", 29}, Strncmp}, {{"sysclib", 30}, Strncpy},
-        {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 36}, Strtol},
+        {{"sysclib", 32}, Strrchr}, {{"sysclib", 34}, Strstr}, {{"sysclib", 35}, Strtok},
+        {{"sysclib", 36}, Strtol},
         {{"sysclib", 38}, Strtoul}, {{"sysclib", 42}, Vsprintf},
         {{"intrman", 4}, RegisterIntrHandler}, {{"intrman", 5}, ReleaseIntrHandler}, {{"intrman", 6}, Succeed},
         {{"intrman", 7}, Succeed}, {{"intrman", 8}, Succeed}, {{"intrman", 9}, Succeed},
@@ -1326,6 +1426,8 @@ const Map& Table() {
         {{"cdvdman", 11}, CdSync}, {{"cdvdman", 12}, CdGetDiskType}, {{"cdvdman", 13}, CdDiskReady},
         {{"cdvdman", 10}, CdSearchFile}, {{"cdvdman", 24}, CdReadClock}, {{"cdvdman", 28}, CdStatus},
         {{"cdvdman", 37}, CdCallback}, {{"cdvdman", 39}, CdBreak}, {{"cdvdman", 75}, CdMmode},
+        {{"cdvdman", 15}, CdStop},
+        {{"ioman", 4}, IoOpen}, {{"ioman", 5}, IoClose}, {{"ioman", 6}, IoRead}, {{"ioman", 8}, IoLseek},
         {{"loadcore", 5}, FlushDcache}, {{"loadcore", 6}, RegisterLibraryEntries},
         {{"thmsgbx", 4}, CreateMbx}, {{"thmsgbx", 5}, DeleteMbx},
         {{"thmsgbx", 6}, SendMbx}, {{"thmsgbx", 7}, SendMbx},

@@ -92,7 +92,7 @@ std::string PickDisc() {
 std::vector<std::string> PlayArguments(const char* self) {
 #ifdef PS2HOST_GAME_EXECUTABLE
     const std::filesystem::path exe = ps2platform::ExePath();
-    const std::filesystem::path here = exe.parent_path();
+    const std::filesystem::path here = ps2platform::RootDir();     // the exe's folder, or its parent for data\<game>
     ps2host::LoadSettings((here / "pc_settings.ini").string());     // where --memcard puts them
     std::string disc = ps2host::Setting("disc");
     // None chosen yet, or gone (moved): an image of the game's disc beside the executable or in its "game"
@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "[unpack] %s -> %s: %s\n", image.c_str(), folder.c_str(), ok ? "done" : "FAILED");
             return ok ? 0 : 1;
         }
-        const std::filesystem::path here = ps2platform::ExePath().parent_path();
+        const std::filesystem::path here = ps2platform::RootDir();
         ps2host::LoadSettings((here / "pc_settings.ini").string());
         for (int i = 4; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--disc" && !ps2host::GuestDisc().Open(argv[i + 1])) {
